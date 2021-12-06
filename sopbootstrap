@@ -1,0 +1,3326 @@
+#!/bin/bash
+# This script is used to do th einitial configuration of an sop at nordea
+# It's located at the yum server and are fetched using a curl command to the
+# first node in the cluster
+# 1.0.0   2018-04-24 asger.solvang@nordea.com     Initial version started form exvootstrap.sh
+# 1.0.1   2018-08-17 asger.solvang@nordea.com     Version that more or less handles the most needed stuff
+# 1.0.2   2018-08-21 asger.solvang@nordea.com     Updated to 18.3
+# 1.0.3   2018-10-04 asger.solvang@nordea.com     Added a few extra directories
+# 1.0.4   2018-10-24 asger.solvang@nordea.com     Added emagent memory configuration
+# 1.0.5   2018-11-22 asger.solvang@nordea.com     Added protect listener - as good as it goes
+# 1.0.6   2019-01-16 asger.solvang@nordea.com     Updated with sqlnet.ora settings for old clients
+# 1.0.7   2019-01-24 asger.solvang@nordea.com     Changed the iptables sql*net stup to allow 40/s and 80/s burts and 200/s totals pr listener
+# 1.0.8   2019-01-24 asger.solvang@nordea.com     Added more tuning parameter in /etc/sysctl.conf
+# 1.0.9   2019-02-19 asger.solvang@nordea.com     Added emagent limits in /etc/security/limits.conf
+# 1.0.10  2019-03-06 asger.solvang@nordea.com     Added crypto configuration
+# 1.0.11  2019-04-29 asger.solvang@nordea.com     Added setup ogg
+# 1.0.12  2019-08-30 asger.solvang@nordea.com     Added setup uc4oracleproxy
+# 1.0.13  2019-09-27 asger.solvang@nordea.com     Added that emagent is put in asmadmingroup to be able to read diag data - shoul be redone somehow
+# 1.0.14  2019-10-21 asger.solvang@nordea.com     Handle mgmtdb
+# 1.0.15  2019-10-21 asger.solvang@nordea.com     Only use exadata_nordea repository when updating reinstalling
+# 1.0.16  2020-02-07 asger.solvang@nordea.com     Added a way o set some default ASM parameters - max_dump_file_size
+# 1.0.17  2020-02-25 asger.solvang@nordea.com     Update grid home 19.6.0.0
+# 1.0.18  2020-02-27 asger.solvang@nordea.com     Changed ssh call
+# 1.0.19  2020-03-10 asger.solvang@nordea.com     Added --availabilityLevel
+# 1.0.20  2020-03-17 asger.solvang@nordea.com     Fixing logind.conf silently
+# 1.0.21  2020-03-20 asger.solvang@nordea.com     added way to add routes for backup networks mostly
+# 1.0.22  2020-09-02 asger.solvang@nordea.com     Checking for 2 extra packages
+# 1.0.23  2020-09-28 asger.solvang@nordea.com     Added calculate min_free_kbytes and function to set mtu on lo (configurenetwork)
+# 1.0.24  2020-10-20 asger.solvang@nordea.com     Added ahf install/deinstall
+# 1.0.25  2020-10-21 asger.solvang@nordea.com     Changed automount to configure and added that some directories are in /usr/lib/tmpfiles.d/tmp.conf. Added ipfrag_high_thresh adn ipfrag_low_thresh to configure_sysctl
+# 1.0.26  2020-11-03 asger.solvang@nordea.com     Changed the way locking the .bash_profile etc works
+# 1.0.27  2020-11-03 asger.solvang@nordea.com     Now asks for GRID_HOME when preparing /u01
+# 1.0.28  2020-11-04 asger.solvang@nordea.com     Updated parameters for em agent MaxInComingConnections MaxThreads 
+# 1.0.29  2020-11-05 asger.solvang@nordea.com     Updated the way sysctl parameters are updated in configure_memory to handel that entries are not there in the first place 
+# 1.0.30  2020-11-24 asger.solvang@nordea.com     Changed clusteshare size to 20G  
+# 1.0.31  2020-11-26 asger.solvang@nordea.com     Added creation of /var/crash  
+# 1.0.32  2020-11-26 asger.solvang@nordea.com     Changed timeout to 20  
+
+
+SVERSION="1.0.32"
+# Used for makeing backup of files and timestamping in general
+NOW_STRING=`date  +%F_%H.%M.%S`
+echo "    INFO: Script version $SVERSION (${NOW_STRING})"
+# name of the script
+script_name=${0##*/}
+# Short host name
+local_short_hostname=${HOSTNAME%%.*}
+# regex that will extract clustername from hostname
+cluster_regex="db-(.*[0-9]+[^0123456789].)[0-9][0-9]+(.*)"
+# SCan listener regex
+scan_regex="(db-.*[0-9]*[^0123456789].)[0-9][0-9]+(.*)"
+# regex that will extract the asm disk name
+asm_regex=".*/(.*)p1"
+# Extract clustername or fail
+[[ $local_short_hostname =~ $cluster_regex ]] || { echo "   ERROR: Cluster name can't be extraced from hostname"; exit 1; }
+cluster_name="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+#echo "   DEBUG: cluster_name=$cluster_name"
+# Used for timestamps in files etc
+# Extract Scanname or fail
+[[ $local_short_hostname =~ $scan_regex ]] || { echo "   ERROR: Scan name can't be extraced from hostname"; exit 1; }
+scan_name="${BASH_REMATCH[1]}${BASH_REMATCH[2]}-scan"
+#echo "   DEBUG: scan_name=$scan_name"
+# Used for timestamps in files etc
+now=$(date +"%F_%T")
+# File for various log stuff
+log_file="sopbootstrap_${now}.log"
+# Nordea packages to install/deinstal
+NORDEA_PACKAGES="nordea-env-configuration nordea-sudo-configuration"
+# Nordea environment file
+NORDEA_ENVIRONMENT_FILE="/etc/nordea_environment.conf"
+# Percent of memory to allocate as hugepages
+HUGE_PAGES_TO_ALLOCATE_PERCENT=72
+# The user running the script
+CURRENT_USER=$(id -u -n)
+# Current short host name
+SHORT_HOST_NAME=${HOSTNAME%%.*}
+# Domain name from hostname
+EXTRACTED_DOMAIN_NAME=$(hostname -d)
+if [ "$EXTRACTED_DOMAIN_NAME" = "" ]
+then
+  EXTRACTED_DOMAIN_NAME=${HOSTNAME#*.}
+fi
+if [ "$EXTRACTED_DOMAIN_NAME" = "" ]
+then
+  echo "   ERROR: Can find domainname for server, script wont work"
+  exit 1
+fi
+# The following is the interface names of the two private interfaces
+# We look default up the ip addresses using these names
+ETH_PRIV1="eth-priv1"
+ETH_PRIV2="eth-priv2"
+# The sqllite schema creation sql, used for creating the schema
+SAN_SQL_SCHEMA_SQL="CREATE TABLE maps (
+    node_name TEXT NOT NULL,
+    disk_name TEXT NOT NULL,
+    disk_wwid TEXT NOT NULL,
+    disk_device_name TEXT NOT NULL,
+    disk_size TEXT NOT NULL
+);
+CREATE UNIQUE INDEX primary_maps on maps (node_name,disk_wwid ASC);
+CREATE TABLE paths (
+    node_name TEXT NOT NULL,
+    disk_wwid TEXT NOT NULL,
+    disk_device_name TEXT NOT NULL,
+    device_status TEXT NOT NULL
+);
+CREATE UNIQUE INDEX primary_paths on paths (node_name,disk_wwid,disk_device_name ASC);
+CREATE VIEW mpathinfo AS select  node_name,disk_size,disk_name,disk_wwid, mulitpath_device_name,device_names, substr(device_names,1,INSTR(device_names,',')-1)  'selected_device'
+from
+(select m.node_name, m.disk_wwid,m.disk_name, m.disk_size,m.disk_device_name 'mulitpath_device_name' ,group_concat(p.disk_device_name ) 'device_names'
+from maps m,paths p
+where p.node_name=m.node_name
+  and p.disk_wwid=m.disk_wwid
+group by  m.disk_wwid,m.node_name
+)
+order by node_name, disk_size,disk_wwid;
+"
+# The sqllite load data is put in this file during analyze and then loaded into schema
+DATA_FILE="${script_name}-Data.sql"
+# The sqllite database used
+DB=${script_name}.sql3
+# Nordea packages to install/deinstal
+nordea_packages="nordea-env-configuration nordea-ndtnsctl nordea-nddbctl"
+# Memory pr node set aside for diag when creating clustered acfs file system
+# Because of typical fewer disks on Exadatas with smaller number of nodes we we can't keep
+# them alike (especially for Exadta 1/8 witch we don't detect properly. Should probably
+# look at storage instead but..
+if [ $EXTRACTED_DOMAIN_NAME = "leva.dk" ]
+then
+  GB_diag_pr_node_1_2_nodes=2   # For test keep very low
+  GB_diag_pr_node_3_4_nodes=2   # For test keep very low
+  GB_diag_pr_node=2             # For test keep very low
+  GB_clustershare=2             # For test keep very low
+else
+  GB_diag_pr_node_1_2_nodes=20  # Exadata 1/8 and 1/4 - used for dev, keep it low
+  GB_diag_pr_node_3_4_nodes=100 # Exadata 1/2 
+  GB_diag_pr_node=100           # Exadata 1 and further
+  GB_clustershare=20            # Initial low size
+fi
+
+stop_all_databases()
+{
+  set_grid_home
+  all_databases=$(sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/srvctl config database")
+  for database in $all_databases
+  do
+    echo "    INFO: stopping database ${database}"
+    sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/srvctl stop database -d $database"
+  done
+}
+
+start_all_databases()
+{
+  set_grid_home
+  all_databases=$(sudo su - $GRID_OWNER -c "export ORACLE_SID=$GRID_ORACLE_SID; $GRID_ORACLE_HOME/bin/srvctl config database")
+  for database in $all_databases
+  do
+    echo "    INFO: starting database ${database}"
+    sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/srvctl start database -d $database"
+  done
+}
+
+restore_diag()
+{
+  set_grid_home
+  nodes_in_cluster=$( get_nodes )  
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: restoring /u01/app/oracle/diag on $node: "
+    sudo_execute_remote $node "cd /u01/app/oracle/diag; tar zxvf /u01/diag_backup/${node}.tar.gz" >>${log_file} 2>&1 || { echo "   ERROR: Can't restore diag on ${node}"; exit 1; } && echo  "      OK: restored files from /u01/diag_backup/${node}.tar.gz"  
+  done   
+}
+
+remove_diag()
+{
+  set_grid_home
+  nodes_in_cluster=$( get_nodes )  
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: deleting files in /u01/app/oracle/diag on $node: "
+    sudo_execute_remote $node "rm -rf /u01/app/oracle/diag/*" >>${log_file} 2>&1 || { echo "   ERROR: Can't remove diag on ${node}"; exit 1; } && echo  "      OK: Removed files in /u01/app/oracle/diag"  
+  done   
+}
+
+backup_diag()
+{
+  local tar_return_code
+  set_grid_home
+  nodes_in_cluster=$( get_nodes )  
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: backing up /u01/app/oracle/diag on $node: "
+    #echo "mkdir -p /u01/diag_backup; cd /u01/app/oracle/diag; tar zcvf /u01/diag_backup/${node}.tar.gz *"
+    sudo_execute_remote $node "set -x; mkdir -p /u01/diag_backup; cd /u01/app/oracle/diag; tar  -zcvf /u01/diag_backup/${node}.tar.gz *" >>${log_file} 2>&1
+    tar_return_code=$?  
+    sudo_execute_remote $node "set -x; chown -R oracle:oinstall /u01/diag_backup" >>${log_file} 2>&1
+    # Error 1 means some files were changed - we can live with that
+    if  [ "$tar_return_code" != "2" ] && [ "$tar_return_code" != "1" ] && [ "$tar_return_code" != "0" ]
+    then
+      echo "   ERROR: Can't backup diag on ${node}"
+      exit $tar_return_code
+    else
+      echo "      OK: backed up to /u01/diag_backup/${node}.tar.gz"
+    fi
+  done   
+}
+
+drop_diag()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local number_of_nodes
+  number_of_nodes=$(get_count_of_nodes)
+  echo "    INFO: Dropping shared diag"
+  # First we need to stop all databases
+  stop_all_databases
+  backup_diag
+  drop_acfs_file_system "/u01/app/oracle/diag" 
+  restore_diag
+  start_all_databases
+}
+
+create_diag()
+{
+  #set -x
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local disk_group_match="$1"
+  local number_of_nodes
+  number_of_nodes=$(get_count_of_nodes)
+  local GB_for_diag
+  local disk_group_match="$1"
+  case $number_of_nodes in
+    1|2)
+      GB_for_diag=$((GB_diag_pr_node_1_2_nodes*number_of_nodes));;
+    3|4)
+      GB_for_diag=$((GB_diag_pr_node_3_4_nodes*number_of_nodes));;
+    *)
+      GB_for_diag=$((GB_diag_pr_node*number_of_nodes));;
+  esac
+  echo "    INFO: Creating shared diag of the size ${GB_for_diag}GB"
+  # First we need to stop all databases
+  stop_all_databases
+  backup_diag
+  remove_diag
+  create_acfs_file_system "$disk_group_match" "DIAG_VOL" "/u01/app/oracle/diag" "${GB_for_diag}G" "Mount point used for sharing database diagnostic data in an Oracle Cluster"
+  restore_diag
+  start_all_databases
+}
+
+
+
+create_empty_sqlite_database()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  rm -f $DB || { echo "  ERROR: Can't rm -f $DB"; return 1; }
+  rm -f $DATA_FILE || { echo "  ERROR: Can't rm -f $DATA_FILE"; return 1; }
+  sqlite3 $DB <<< $SAN_SQL_SCHEMA_SQL
+  if [ $? -ne 0 ]
+  then
+    echo "  ERROR: Can't create sqlite3 database $DB"
+    return 1
+  fi
+}
+
+#
+# trim
+#
+# Purpose: Remove space arround some text
+#
+# Parameters:
+#          string to be trimed
+# Text output
+#          trimmed string
+trim()
+{
+  local var="$*"
+  var1="${var%%[![:space:]]*}"   # remove leading whitespace characters
+  var="${var#${var1}}"   # remove leading whitespace characters
+  var1="${var##*[![:space:]]}"   # remove trailing whitespace characters
+  var="${var%${var1}}"   # remove trailing whitespace characters
+  echo -n "$var"
+}
+
+#
+# set_grid_home
+#
+# Purpose: Will find the GRID home of the cluster
+#
+# Environment output
+#          GRID_ORACLE_HOME
+set_grid_home()
+{
+  # Where is the file that tells us where the oracle inventory is 
+  local ORAINST_LOC="/etc/oraInst.loc"
+  # If the file is there we can try to find the ASM home
+  if sudo [ -f $ORAINST_LOC ]
+  then
+    # Look up the oracle inventory location
+    local ORAINVENTORY_LOCATION=`sudo cat $ORAINST_LOC 2>>/dev/null | sed -n -e 's/inventory_loc=\(.*\)/\1/p' 2>>/dev/null`
+    if [ "$ORAINVENTORY_LOCATION" != "" ]
+    then
+      # If we wound the oracle inventory location look for grid home by looking for OraGI name 
+      GRID_ORACLE_HOME=`sudo grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null | sed -n -e '/<HOME NAME=.*CRS="true"/s/.*LOC=\"\([^\"]*\)\".*CRS="true".*/\1/p' 2>>/dev/null`
+    fi
+  fi
+  # If GRID_ORACLE_HOME found do various stuff
+  if [ "$GRID_ORACLE_HOME" != "" ]
+  then
+    # Find grid owner
+    GRID_OWNER=`sudo stat -c "%U" "${GRID_ORACLE_HOME}/network/admin/listener.ora"`
+  fi
+}
+
+
+
+#
+# get_nodes
+#
+# Purpose: Return a list of nodes in the cluster. Typicaly
+#          called in a sub shell like: nodes=$(get_nodes)
+#
+# Text output
+#          All nodes in the cluster - one on each line
+get_nodes()
+{
+  if [ "$runon_forcelocalnode" == "YES" ]
+  then
+    echo "${local_short_hostname}"
+  else
+    set_grid_home
+    sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/olsnodes"
+  fi
+}
+
+#
+# get_count_of_nodes
+#
+# Purpose: Return the number of nodes in the cluster. Typicaly
+#          called in a sub shell like: nodes=$(get_count_of_nodes)
+#
+# Text output
+#          Numer of nodes in the cluster
+get_count_of_nodes()
+{
+  if [ "$runon_forcelocalnode" == "YES" ]
+  then
+    echo "1"
+  else
+    set_grid_home
+    sudo su - $GRID_OWNER -c "export ORACLE_SID=$GRID_ORACLE_SID; $GRID_ORACLE_HOME/bin/olsnodes | wc -l"
+  fi
+}
+
+# Execute a command remote using sudo
+sudo_execute_remote()
+{
+  local node=$1
+  local command=$2
+  echo "$command" | ssh -o 'StrictHostKeyChecking no' ${node} "cat > command.sh; chmod 777 command.sh; sudo $HOME/command.sh"
+}
+
+# Copy to a user remotely using sudo
+sudo_cp_remote()
+{
+  local node=$1
+  local localfile=$2
+  local remote_file=$3
+  scp $localfile $node:temp.file
+  sudo_execute_remote $node "mv temp.file $remote_file"
+}
+
+
+
+#
+# set_environment
+#
+# Purpose: Will record environment information in the file ${NORDEA_ENVIRONMENT_FILE}
+#          Will update if it exists
+# Parameters:
+#          environment type
+#          cluster_nodes
+# Environment input
+#          NORDEA_ENVIRONMENT_FILE 
+set_environment()
+{
+  local nordea_environment_type=$1
+  local nordea_availability_level=$2
+  local nodes_in_cluster=$3
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: Setting environment to \"$nordea_environment_type\" and availability level to \"$nordea_availability_level\"  on node $node"
+    # Update or add to configuration file
+    sudo_execute_remote ${node} "grep \"^nordea_environment_type=\" ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    if [ $? -eq 0 ] 
+    then
+      sudo_execute_remote ${node} "sed -i \"s/^nordea_environment_type.*/nordea_environment_type=${nordea_environment_type}/\" ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    else
+      sudo_execute_remote ${node} "echo \"nordea_environment_type=${nordea_environment_type}\" >> ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    fi
+    # Update or add to configuration file
+    sudo_execute_remote ${node} "grep \"^nordea_availability_level=\" ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    if [ $? -eq 0 ] 
+    then
+      sudo_execute_remote ${node} "sed -i \"s/^nordea_availability_level.*/nordea_availability_level=${nordea_availability_level}/\" ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    else
+      sudo_execute_remote ${node} "echo \"nordea_availability_level=${nordea_availability_level}\" >> ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    fi
+
+  done  
+}
+
+#
+# unset_environment
+#
+# Purpose: Will clear environment information in the file ${NORDEA_ENVIRONMENT_FILE}
+#
+# Environment input
+#          NORDEA_ENVIRONMENT_FILE 
+#          cluster_nodes
+unset_environment()
+{
+  local nodes_in_cluster=$1  
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: Deleting environment information on node $node"
+    # Update or add to configuration file
+    sudo_execute_remote ${node} "sed -i \"/^nordea_environment_type.*/d\" ${NORDEA_ENVIRONMENT_FILE}"  >>${log_file} 2>&1
+    sudo_execute_remote ${node} "sed -i \"/^nordea_availability_level.*/d\" ${NORDEA_ENVIRONMENT_FILE}"  >>${log_file} 2>&1
+  done
+}
+
+#
+# set_cluster_nodes
+#
+# Purpose: Will record cluster nodes information in the file ${NORDEA_ENVIRONMENT_FILE}
+#          Will update if it exists
+# Parameters:
+#          cluster nodes
+# Environment input
+#          NORDEA_ENVIRONMENT_FILE 
+set_cluster_nodes()
+{
+  local nordea_cluster_nodes
+  nordea_cluster_nodes=$1
+  for node in $nordea_cluster_nodes
+  do  
+    echo "    INFO: Setting nordea_cluster_nodes to \"$nordea_cluster_nodes\" on node $node"
+    # Update or add to configuration file
+    sudo_execute_remote ${node} "grep \"^nordea_cluster_nodes=\" ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    if [ $? -eq 0 ] 
+    then
+      sudo_execute_remote ${node} "sed -i \"s/^nordea_cluster_nodes.*/nordea_cluster_nodes=\\\"${nordea_cluster_nodes}\\\"/\" ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    else
+      sudo_execute_remote ${node} "echo \"nordea_cluster_nodes=\\\"${nordea_cluster_nodes}\\\"\" >> ${NORDEA_ENVIRONMENT_FILE}" >>${log_file} 2>&1
+    fi
+  done
+}
+
+#
+# unset_cluster_nodes
+#
+# Purpose: Will clear environment information in the file ${NORDEA_ENVIRONMENT_FILE}
+#
+# Environment input
+#          NORDEA_ENVIRONMENT_FILE 
+unset_cluster_nodes()
+{
+  local nodes_in_cluster=$1  
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: Deleting cluster nodes information on node $node"
+    # Update or add to configuration file
+    sudo_execute_remote ${node} "sed -i \"/^nordea_cluster_nodes.*/d\" ${NORDEA_ENVIRONMENT_FILE}"  >>${log_file} 2>&1  
+  done
+}
+
+
+
+#
+# configure_ssh
+#
+# Purpose: Is used for setting up user equivalency for the user running the script 
+#
+configure_ssh()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  echo "" > /tmp/authorized_keys
+  local homedir=$( getent passwd "$CURRENT_USER" | cut -d: -f6 )
+  for node in $nodes_in_cluster
+  do  
+    ssh -o "StrictHostKeyChecking no" ${CURRENT_USER}@$node "rm -f ${homedir}/.ssh/known_hosts ${homedir}/.ssh/authorized_keys ${homedir}/.ssh/id_rsa ${homedir}/.ssh/id_rsa.pub; ssh-keygen -q -f ${homedir}/.ssh/id_rsa -t rsa -N '' ; cat ${homedir}/.ssh/id_rsa.pub " >> /tmp/authorized_keys
+  done
+  # Change ownership
+  chmod 0600 /tmp/authorized_keys
+  # Now distribute the file
+  for node in $nodes_in_cluster
+  do  
+    scp /tmp/authorized_keys ${node}:${homedir}/.ssh/
+  done
+  # now do a check all around
+  verify_ssh "$nodes_in_cluster"
+  # We need to update /etc/nordea_environment.conf with the cluster nodes information
+  set_cluster_nodes "$nodes_in_cluster"
+  #Remove temporary file
+  rm /tmp/authorized_keys
+}
+
+
+#
+# unconfigure_ssh
+#
+# Purpose: Is used for removing user equivalency for the user running the script 
+#
+unconfigure_ssh()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  local homedir=$( getent passwd "$CURRENT_USER" | cut -d: -f6 )
+  unset_cluster_nodes "$nodes_in_cluster"
+  for node in $nodes_in_cluster
+  do
+    if [ "$node" != "$SHORT_HOST_NAME" ]
+    then
+      ssh -o "StrictHostKeyChecking no" ${CURRENT_USER}@$node "rm -f ${homedir}/.ssh/authorized_keys  ${homedir}/.ssh/id_rsa ${homedir}/.ssh/id_rsa.pub ${homedir}/.ssh/authorized_keys"
+    fi
+  done
+  ssh -o 'StrictHostKeyChecking no' ${CURRENT_USER}@$SHORT_HOST_NAME "rm -f ${homedir}/.ssh/authorized_keys ${homedir}/.ssh/id_rsa ${homedir}/.ssh/id_rsa.pub ${homedir}/.ssh/authorized_keys"
+}
+
+
+#
+# check_rootssh
+#
+# Purpose: Used for a simple check om ssh euivalency is working from this node for the logged in user
+#          Maybe extend to also check from the other nodes (e.g. all can reach al)
+#
+#          Will exit error if it fails
+check_ssh()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: testing ssh connectivity to ${node}: "
+    timeout 20 ssh -o 'StrictHostKeyChecking no' ${node} date >>${log_file} 2>&1
+    if [ $? -ne 0 ]
+    then
+      echo -e "\n ERROR: Failed contacting host ${node} using ssh"
+      exit 1
+    else
+      echo "OK"
+    fi
+  done
+}
+
+
+#
+# verify_ssh
+#
+# Purpose: Used for an adavnced check om ssh euivalency is working from this node
+#          Maybe extend to also check from the other nodes (e.g. all can reach al)
+#
+#          Will exit error if it fails
+verify_ssh()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  local ssh_user=$2
+  if [ "$ssh_user" = "" ]
+  then
+    ssh_user="$CURRENT_USER"
+  fi
+  # Make the known hosts work in the future
+  for node in $nodes_in_cluster
+  do
+    for node1 in $nodes_in_cluster
+    do
+      echo -n "    INFO: testing ssh connectivity for user to $ssh_user ${node1} via ${node1} "
+      sudo_execute_remote ${node} "su - $ssh_user -c \"timeout 20 ssh -o \\\"StrictHostKeyChecking no\\\" ${node1} date\"" >>${log_file} 2>&1
+      if [ $? -ne 0 ]
+      then
+        echo -e "\n ERROR: Failed contacting host as user $ssh_user ${node1} via ${node} using ssh"
+        exit 1
+      else
+        echo "OK"
+      fi
+    done
+  done  
+  
+}
+
+# Find DBFS DG
+find_matching_disk_group()
+{
+  #echo "   DEBUG: Entered function: $FUNCNAME"
+  local dg_pattern_to_find
+  dg_pattern_to_find="$1"
+  grep_pattern_to_find=${1//%/.*}
+  set_grid_home
+  # First check if we have more than one match
+  matches_found=$(sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/asmcmd lsdg  --suppressheader ${dg_pattern_to_find} | awk '{print \$14}'| wc -l") 
+  sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/asmcmd lsdg  --suppressheader ${dg_pattern_to_find} | awk '{print \$14}'"
+  case $matches_found in
+    0)
+      return 1;;
+    1)
+      return 0;;
+    *) 
+      return 2;;
+  esac
+}
+
+
+# Find Volume device
+find_volume_device()
+{
+  #set -x
+  #echo "   DEBUG: Entered function: $FUNCNAME"
+  local disk_group_to_find
+  local volume_to_find
+  disk_group_to_find="$1"
+  volume_to_find="$2"
+  set_grid_home
+  sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/asmcmd volinfo -G ${disk_group_to_find} ${volume_to_find} | sed -n -e \"s/[[:blank:]]*Volume[[:blank:]]*Device:*[[:blank:]]*\(.*\)/\1/p\""
+}
+
+# Find device given mount point
+find_mountpoint_device()
+{
+  local mount_point
+  mount_point=$1  
+  sudo /sbin/acfsutil registry  -l ${mount_point} | sed -n -e "s/Device[[:space:]]*:[[:space:]]*\([^ :]*\)[ :].*/\1/p"
+}
+
+# Find volume given mount point
+find_mountpoint_volume()
+{
+  local mount_point
+  mount_point=$1  
+  sudo /sbin/acfsutil registry  -l ${mount_point} | sed -n -e "s/.*Volume[[:space:]]*:[[:space:]]*\([^ :]*\)[ :].*/\1/p"
+}
+
+# Find group given mount point
+find_mountpoint_group()
+{
+  local mount_point
+  mount_point=$1  
+  sudo /sbin/acfsutil registry  -l ${mount_point} | sed -n -e "s/.*Disk[[:space:]]*Group[[:space:]]*:[[:space:]]*\([^ :]*\).*/\1/p"
+}
+
+
+add_filesystem_to_cluster()
+{
+  local filesystem_device
+  filesystem_device=$1
+  local mount_point
+  mount_point=$2
+  local description
+  description=$3
+  sudo su - -c "$GRID_ORACLE_HOME/bin/srvctl add filesystem -d ${filesystem_device} -m ${mount_point} -u oracle -fstype ACFS -description '${description}' -autostart ALWAYS"
+  sudo su - -c "$GRID_ORACLE_HOME/bin/srvctl start filesystem -d ${filesystem_device}"  
+}
+
+drop_filesystem_from_cluster()
+{
+  local filesystem_device
+  filesystem_device=$1
+  local filesystem_volume
+  filesystem_volume=$2  
+  local filesystem_group
+  filesystem_group=$3  
+  sudo su - -c "export ORACLE_SID=$GRID_ORACLE_SID; $GRID_ORACLE_HOME/bin/srvctl stop filesystem -d ${filesystem_device}"  
+  sudo su - -c "export ORACLE_SID=$GRID_ORACLE_SID; $GRID_ORACLE_HOME/bin/srvctl remove filesystem -d ${filesystem_device}"
+  sudo su - $GRID_OWNER -c "export ORACLE_SID=$GRID_ORACLE_SID; $GRID_ORACLE_HOME/bin/asmcmd voldisable -G ${filesystem_group} ${filesystem_volume}"
+  sudo su - $GRID_OWNER -c "export ORACLE_SID=$GRID_ORACLE_SID; $GRID_ORACLE_HOME/bin/asmcmd voldelete -G ${filesystem_group} ${filesystem_volume}"
+  #/sbin/acfsutil rmfs -b ${filesystem_device}
+}
+
+drop_acfs_file_system()
+{
+  #set -x
+  local mount_point
+  mount_point=$1
+  local filesystem_device
+  local filesystem_volume
+  local filesystem_group
+  set_grid_home
+  file_system_device=$(find_mountpoint_device ${mount_point})  
+  file_system_volume=$(find_mountpoint_volume ${mount_point})  
+  file_system_group=$(find_mountpoint_group ${mount_point})
+  drop_filesystem_from_cluster "${file_system_device}" "${file_system_volume}" "${file_system_group}" 
+}
+
+create_acfs_file_system()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local match_disk_group
+  match_disk_group=$1
+  local volume_name
+  volume_name=$2
+  local mount_point
+  mount_point=$3
+  local size
+  size=$4
+  local description
+  description=$5
+  set_grid_home
+  matched_dg=$( find_matching_disk_group "${match_disk_group}")
+  case $? in
+    0)
+      echo "    INFO: Found disk group $matched_dg"      ;;
+    1)
+      echo "   ERROR: Can't find disk group matching criteria $match_disk_group"
+      exit 1;;
+    *) 
+      echo "   ERROR: To many disk groups matching $match_disk_group"
+      echo "$matched_dg"
+      exit 1;;
+  esac
+  # Remove / from end
+  matched_dg=${matched_dg%%/*}
+  echo "matched_dg=${matched_dg}"
+  sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/asmcmd volcreate -G ${matched_dg} -s ${size} --redundancy mirror ${volume_name}"
+  if [ $? -ne 0 ]
+  then
+    # No mirroring try with unprotected
+    echo "  WARNING: No mirroring possible, we will try with unprotected - OK on SOP as we run disk mirroring on HW on this platform"
+    sudo su - $GRID_OWNER -c "$GRID_ORACLE_HOME/bin/asmcmd volcreate -G ${matched_dg} -s ${size} --redundancy unprotected ${volume_name}"
+    if [ $? -ne 0 ]
+    then
+      echo "   ERROR: Not possible to create ACFS volume"
+      exit 1
+    fi
+  fi
+  find_clustershare_device=$( find_volume_device "${matched_dg}" "${volume_name}" )
+  echo "find_clustershare_device=${find_clustershare_device}"
+  sudo /sbin/mkfs -t acfs ${find_clustershare_device} >>${log_file} 2>&1
+  add_filesystem_to_cluster "${find_clustershare_device}" "${mount_point}" "${description}"
+}
+
+
+create_clustershare()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local disk_group_match="$1"  
+  create_acfs_file_system "$disk_group_match" "CLUSTER_VOL" "/clustershare" "${GB_clustershare}G" "Mount point used for sharing configuration data / utilities in an Oracle cluster"
+  sudo mkdir -p /clustershare/network/admin
+  sudo mkdir -p /clustershare/dbfs/add_resource
+  sudo mkdir -p /clustershare/dbfs/conf
+  sudo mkdir -p /clustershare/dbfs/tns
+  sudo mkdir -p /clustershare/dbfs/tns/admin
+  sudo mkdir -p /clustershare/dbfs/wallet
+  sudo mkdir -p /clustershare/dbfs/action_scripts
+  sudo mkdir -p /clustershare/dcli/group
+  sudo mkdir -p /clustershare/ndfinctl/upload
+  sudo mkdir -p /clustershare/ndfinctl/conf
+  # TO be able to create files directly. We will fix owner afterwards
+  sudo chown -R sopsetup /clustershare
+  echo "# Nordea people - Do not use this file for adding custom tns entries!" > /clustershare/network/admin/tnsnames.ora
+  echo "# This file is primaryly edited by ndtnsctl and dbca." >>/clustershare/network/admin/tnsnames.ora
+  echo "# Instead use the file called nordea_tnsnames.ora for adding custom entries" >> /clustershare/network/admin/tnsnames.ora
+  echo "IFILE=/clustershare/network/admin/nordea_tnsnames.ora" >> /clustershare/network/admin/tnsnames.ora
+  echo "# Nordea people - Use this file for adding custom tns entries" > /clustershare/network/admin/nordea_tnsnames.ora
+  echo "#" >> /clustershare/network/admin/nordea_tnsnames.ora
+  echo "# sqlnet.ora created for Nordea clustered environment" >/clustershare/network/admin/sqlnet.ora
+  echo "" >>/clustershare/network/admin/sqlnet.ora
+  echo "NAMES.DIRECTORY_PATH=(TNSNAMES,EZCONNECT)" >>/clustershare/network/admin/sqlnet.ora
+  echo "" >>/clustershare/network/admin/sqlnet.ora
+  echo "SQLNET.EXPIRE_TIME=10" >>/clustershare/network/admin/sqlnet.ora
+  echo "SQLNET.EXPIRE_TIME=10" > /clustershare/dbfs/tns/admin/sqlnet.ora
+  echo "WALLET_LOCATION = (SOURCE = (METHOD = FILE) (METHOD_DATA = (DIRECTORY = /clustershare/dbfs/wallet) ) )">> /clustershare/dbfs/tns/admin/sqlnet.ora
+  echo "SQLNET.WALLET_OVERRIDE = TRUE" >> /clustershare/dbfs/tns/admin/sqlnet.ora
+  sudo chown -R oracle:oinstall /clustershare
+  sudo chmod 775 /clustershare
+  sudo chmod -R 700 /clustershare/ndfinctl
+}
+
+drop_clustershare()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  #local number_of_nodes
+  #number_of_nodes=$(get_count_of_nodes)
+  echo "    INFO: Dropping shared cluster file system"
+  drop_acfs_file_system "/clustershare"
+}
+
+
+
+# This is used for sending helper procedures to remote node using ssh
+# Is imbedded in a HERE document later
+memory_procedures_to_send_to_remote()
+{
+  cat << EOF
+configure_memory_load_old()
+{
+  OLD_GRID_HARD_MEMLOCK=\$(sed -n -e "s/^grid.*hard.*memlock[[:space:]]*\(.*\)/\1/p" /etc/security/limits.conf)
+  OLD_GRID_SOFT_MEMLOCK=\$(sed -n -e "s/^grid.*soft.*memlock[[:space:]]*\(.*\)/\1/p" /etc/security/limits.conf)
+  OLD_ORACLE_HARD_MEMLOCK=\$(sed -n -e "s/^oracle.*hard.*memlock[[:space:]]*\(.*\)/\1/p" /etc/security/limits.conf)
+  OLD_ORACLE_SOFT_MEMLOCK=\$(sed -n -e "s/^oracle.*soft.*memlock[[:space:]]*\(.*\)/\1/p" /etc/security/limits.conf)
+  OLD_EMAGENT_HARD_MEMLOCK=\$(sed -n -e "s/^emagent.*hard.*memlock[[:space:]]*\(.*\)/\1/p" /etc/security/limits.conf)
+  OLD_EMAGENT_SOFT_MEMLOCK=\$(sed -n -e "s/^emagent.*soft.*memlock[[:space:]]*\(.*\)/\1/p" /etc/security/limits.conf)
+  OLD_SHM_ALL=\$(sed -n -e "s/^kernel.shmall.*=\(.*\)/\1/p" /etc/sysctl.conf)
+  OLD_SHM_MAX=\$(sed -n -e "s/^kernel.shmmax.*=\(.*\)/\1/p" /etc/sysctl.conf)
+  OLD_HUGE_PAGES=\$(sed -n -e "s/^vm.nr_hugepages.*=\(.*\)/\1/p" /etc/sysctl.conf)
+  # Some new additions to handle min_free_kbytes
+  OLD_MIN_FREE_KBYTES=\$(sed -n -e "s/^vm.min_free_kbytes.*=\(.*\)/\1/p" /etc/sysctl.conf)
+}
+
+
+configure_memory_calculate()
+{
+  HUGE_PAGE_SIZE_KB=\$(sed -n "s/Hugepagesize:[[:space:]]*\([0-9]*\).*/\1/p" /proc/meminfo)
+  MEMORY_TOTAL_KB=\$(sed -n "s/MemTotal:[[:space:]]*\([0-9]*\).*/\1/p" /proc/meminfo)
+  #grep MemTotal /proc/meminfo
+  PAGE_SIZE=`/sbin/sysctl kernel.shmmni | sed -n "s/kernel.shmmni.*=[[:blank:]]*\(.*\)/\1/p"`
+  # Calculate
+  NEW_HUGEPAGES=\$(( HUGE_PAGES_TO_ALLOCATE_PERCENT * MEMORY_TOTAL_KB / HUGE_PAGE_SIZE_KB / 100 ))
+  NEW_SHM_ALL=\$(( HUGE_PAGES_TO_ALLOCATE_PERCENT * MEMORY_TOTAL_KB * 1024 / PAGE_SIZE / 100 ))
+  NEW_SHM_MAX=\$(( HUGE_PAGES_TO_ALLOCATE_PERCENT * MEMORY_TOTAL_KB * 1024 / 100 ))
+  # Calculate limits.conf values
+  NEW_GRID_HARD_MEMLOCK=\$((MEMORY_TOTAL_KB*90/100))
+  NEW_GRID_SOFT_MEMLOCK=\$((MEMORY_TOTAL_KB*90/100))
+  NEW_ORACLE_HARD_MEMLOCK=\$((MEMORY_TOTAL_KB*90/100))
+  NEW_ORACLE_SOFT_MEMLOCK=\$((MEMORY_TOTAL_KB*90/100))
+  NEW_EMAGENT_HARD_MEMLOCK=\$((MEMORY_TOTAL_KB*90/100))
+  NEW_EMAGENT_SOFT_MEMLOCK=\$((MEMORY_TOTAL_KB*90/100))
+  # Some new additions to calculate min_free_kbytes
+  NUMA_COUNT=\$(lscpu | awk '/^NUMA node\(s\)(.*)/{print \$3 }')
+  NEW_MIN_FREE_KBYTES=\$(( NUMA_COUNT * MEMORY_TOTAL_KB * 4 / 1000 ))
+}
+EOF
+}
+
+configure_memory()
+{
+  local huge_pages_percent=$1
+  local nodes_in_cluster=$2
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Configure memory for node $node"
+    sudo_execute_remote $node "$(memory_procedures_to_send_to_remote)
+$(sysctl_procedures_to_send_to_remote)
+backup_file /etc/sysctl.conf $now
+#set -x
+HUGE_PAGES_TO_ALLOCATE_PERCENT=${huge_pages_percent}
+now=${now}
+configure_memory_calculate
+# Change sysctl parameters and make the change to memory parameters
+# Use new method
+upd_conf_parm /etc/sysctl.conf kernel.shmall \"\$NEW_SHM_ALL\"
+upd_conf_parm /etc/sysctl.conf kernel.shmmax \"\$NEW_SHM_MAX\"
+upd_conf_parm /etc/sysctl.conf vm.nr_hugepages \"\$NEW_HUGEPAGES\"
+upd_conf_parm /etc/sysctl.conf vm.min_free_kbytes \"\$NEW_MIN_FREE_KBYTES\"
+#sed -i_\${now} -e \"s/^.*kernel.shmall.*=\(.*\)/kernel.shmall = \$NEW_SHM_ALL/\" \
+#    -e \"s/^.*kernel.shmmax.*=\(.*\)/kernel.shmmax = \$NEW_SHM_MAX/\" \
+#    -e \"s/^vm.nr_hugepages.*=\(.*\)/vm.nr_hugepages = \$NEW_HUGEPAGES/\" \
+#    -e \"s/^.*vm.min_free_kbytes.*=\(.*\)/vm.min_free_kbytes = \$NEW_MIN_FREE_KBYTES/\" /etc/sysctl.conf
+# Check if sysctl parameters are there or add them
+#grep \"^vm.nr_hugepages.*=\" /etc/sysctl.conf 2>>/dev/null || echo \"vm.nr_hugepages = \$NEW_HUGEPAGES\" >>/etc/sysctl.conf
+# Reload /etc/sysctl.conf
+sysctl -q -p
+# Update limits.conf
+sed -i_\${now} -e \"s/\(^grid.*hard.*memlock[[:space:]]*\).*/\1\$NEW_GRID_HARD_MEMLOCK/\" \
+    -e \"s/\(^grid.*soft.*memlock[[:space:]]*\).*/\1\$NEW_GRID_SOFT_MEMLOCK/\" \
+    -e \"s/\(^oracle.*hard.*memlock[[:space:]]*\).*/\1\$NEW_ORACLE_HARD_MEMLOCK/\" \
+    -e \"s/\(^oracle.*soft.*memlock[[:space:]]*\).*/\1\$NEW_ORACLE_SOFT_MEMLOCK/\" \
+    -e \"s/\(^emagent.*hard.*memlock[[:space:]]*\).*/\1\$NEW_EMAGENT_HARD_MEMLOCK/\" \
+    -e \"s/\(^emagent.*soft.*memlock[[:space:]]*\).*/\1\$NEW_EMAGENT_SOFT_MEMLOCK/\" /etc/security/limits.conf  
+"
+  done
+}
+
+setup_uc4oracleproxy()
+{
+  local nodes_in_cluster=$( get_nodes )  
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: Setting up uc4oracleproxy user on $node: "
+    sudo_execute_remote $node "/usr/sbin/useradd -u 5004 -g users -m -s /bin/bash -c \"Oracle UC4 Proxy Owner\" uc4oracleproxy -p \\\$5\\\$22v6QjiOE\\\$5h0RTGco.wQk2og040ylMx5.eKoPtSCGWH1ZHXc6CF2"  && echo -n "uc4oracleproxy " || { echo -e "\n ERROR: Can't create user uc4oracleproxy on ${node}"; exit 1; }
+    sudo_execute_remote $node "chage -E -1 -m -1 -M -1 -W -1 uc4oracleproxy" && echo -n "newer expire " || { echo -e "\n ERROR: Can't set newer expire on uc4oracleproxy on ${node}"; exit 1; }
+    sudo_execute_remote $node "mkdir -p /u01/app/uc4oracleproxy; chown uc4oracleproxy:oinstall /u01/app/uc4oracleproxy" && echo -n "/u01/app/uc4oracleproxy" || { echo -e "\n ERROR: Can't create directory /u01/app/uc4oracleproxy on ${node}"; exit 1; }
+  done
+}
+
+setup_ogg()
+{
+  local nodes_in_cluster=$( get_nodes )  
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: Setting up ogg user on $node: "
+    sudo_execute_remote $node "/usr/sbin/useradd -u 1673 -g oinstall -m -s /bin/bash -c \"Oracle GoldenGate Owner\" ogg -p \\\$5\\\$22v6QjiOE\\\$5h0RTGco.wQk2og040ylMx5.eKoPtSCGWH1ZHXc6CF2"  && echo -n "ogg " || { echo -e "\n ERROR: Can't create user ogg on ${node}"; exit 1; }
+    sudo_execute_remote $node "mkdir -p /u01/app/ogg; chown ogg:oinstall /u01/app/ogg" && echo -n "/u01/app/ogg" || { echo -e "\n ERROR: Can't create directory /u01/app/ogg on ${node}"; exit 1; }
+    echo ""
+    echo "    INFO: Configure limits.conf for ogg user on for node $node"
+    sudo_execute_remote $node "set -x
+now=${now}       
+sed -i_\${now} -e \"/^ogg.*soft.*nproc.*/d\" \
+    -e \"/^ogg.*hard.*nproc.*/d\" \
+    -e \"/^ogg.*soft.*nofile.*/d\" \
+    -e \"/^ogg.*hard.*nofile.*/d\"  /etc/security/limits.conf
+echo \"ogg      soft     nproc 8096\" >> /etc/security/limits.conf
+echo \"ogg      hard     nproc 8096\" >> /etc/security/limits.conf
+echo \"ogg      soft     nofile 8096\" >> /etc/security/limits.conf
+echo \"ogg      hard     nofile 8096\" >> /etc/security/limits.conf
+"
+  done
+}
+
+
+add_route()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local input_device
+  local input_network_address
+  local escaped_input_network_address
+  local input_gateway
+  local found_table
+  local found_gateway
+  local nodes_in_cluster
+  nodes_in_cluster="$1"
+  input_device="$2"
+  input_network_address="$3"
+  input_gateway="$4"
+  #echo "input_device=$input_device"
+  #echo "input_network_address=$input_network_address"
+  #echo "input_gateway=$input_gateway"
+  escaped_input_network_address="${input_network_address//./\.}"
+  escaped_input_network_address="${escaped_input_network_address//\//\\\/}"
+  #echo "escaped_input_network_address=$escaped_input_network_address"
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Add route on $node"   
+    # First check for route file, if not there bang out
+    sudo_execute_remote ${node} "test -f  /etc/sysconfig/network-scripts/route-${input_device}"
+    if [ $? -ne 0 ]
+    then
+      # Ouch route file is not there
+      echo "   ERROR: Can't find route file /etc/sysconfig/network-scripts/route-${input_device} on node ${node} - is policy routing enabled or is the wrong interface specified"
+      exit 1
+    fi
+    sudo_execute_remote ${node} "test -f  /etc/sysconfig/network-scripts/rule-${input_device}"
+    if [ $? -ne 0 ]
+    then
+      # Ouch route file is not there
+      echo "   ERROR: Can't find rule file /etc/sysconfig/network-scripts/rule-${input_device} on node ${node} - is policy routing enabled or is the wrong interface specified"
+      exit 1
+    fi
+    # We probably don't nned this
+    found_table=$(sudo_execute_remote ${node} "cat /etc/sysconfig/network-scripts/route-${input_device} | sed -e \"s/.*table[[:blank:]]*\(.*\)/\1/\"| head -1")
+    if [ "$found_table" = "" ]
+    then
+      # Ouch can't find table
+      echo "   ERROR: Can't find routing table in file /etc/sysconfig/network-scripts/route-${input_device} on node ${node} - is policy routing enabled"
+      exit 1
+    fi
+    echo "found_table=$found_table"
+    if [ "$input_gateway" = "" ]
+    then
+      # Try to dig out gateway from existing file
+      found_gateway=$(sudo_execute_remote ${node} "cat /etc/sysconfig/network-scripts/route-${input_device} | sed -n -e \"s/default[[:blank:]]*via[[:blank:]]\+\(.*\)[[:blank:]]\+dev[[:blank:]]*.*/\1/p\"| head -1")
+      if [ "$found_gateway" = "" ]
+      then
+        # Ouch can't find gateway
+        echo "   ERROR: Can't find gateway in routing table in file /etc/sysconfig/network-scripts/route-${input_device} on node ${node} - is policy routing enabled"
+        exit 1
+      fi
+      echo "found_gateway=$found_gateway"
+    else
+      found_gateway=$input_gateway
+    fi
+    # Delete matching line in /etc/sysconfig/network-scripts/route-${input_device}  
+    #echo "sed -i_${now} -e \"/^${escaped_input_network_address}./d\" /etc/sysconfig/network-scripts/route-${input_device}"
+    sudo_execute_remote ${node} "sed -i_${now} -e \"/^${escaped_input_network_address}./d\" /etc/sysconfig/network-scripts/route-${input_device}"
+    # Add new lines to /etc/sysctl
+    sudo_execute_remote ${node} "echo \"${input_network_address} via ${found_gateway} dev ${input_device}\" >> /etc/sysconfig/network-scripts/route-${input_device}"
+    # Add route manually
+    sudo_execute_remote ${node} "ip route add ${input_network_address} via ${found_gateway} dev ${input_device}"
+  done
+}
+
+
+configure_network()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster
+  nodes_in_cluster="$1"
+  #echo "input_device=$input_device"
+  #echo "input_network_address=$input_network_address"
+  #echo "input_gateway=$input_gateway"
+  escaped_input_network_address="${input_network_address//./\.}"
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Change MTU on lo on $node"  
+    # ifconfig lo mtu 16384
+    # Delete matching line in /etc/sysconfig/network-scripts/ifcfg-lo 
+    sudo_execute_remote ${node} "sed -i_${now} -e \"/^MTU=16436.*/d\" /etc/sysconfig/network-scripts/ifcfg-lo"
+    # Add coorect line to icfg-lo
+    sudo_execute_remote ${node} "echo \"MTU=16436\" >> /etc/sysconfig/network-scripts/ifcfg-lo"
+    # set it also on the current configuration
+    sudo_execute_remote ${node} "ip link set dev lo mtu 16436"
+  done
+}
+
+configure_crash()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster
+  nodes_in_cluster="$1"
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: check that no file system is already mounted on /var/crash on $node"
+    # Is something mounted already then - skip
+    sudo_execute_remote ${node} "mountpoint /var/crash" >>${log_file} 2>&1
+    if [ $? -ne 0 ]
+    then
+      # There is not a mounted file system on /var/crash
+      # Now create the logical volume etc and mount it
+      echo "    INFO: /var/crash is not mounted - creating"
+      sudo_execute_remote ${node} "lvcreate -L 30G --name crashvol rootvg" >>${log_file} 2>&1 || { echo "   ERROR: Can't create logical volume crashvol"; exit 1; }
+      sudo_execute_remote ${node} "mkfs.xfs /dev/mapper/rootvg-crashvol" >>${log_file} 2>&1 || { echo "   ERROR: Can't create file sysetm on volume crashvol"; exit 1; }
+      # Remove entry in /etc/fstab if it's in there already
+      sudo_execute_remote ${node} "grep  /var/crash /etc/fstab" >>${log_file} 2>&1
+      if [ $? -eq 0 ]
+      then
+        # There is an entry delete it
+        sudo_execute_remote ${node} "sed -i_${NOW_STRING} -e '/.* \/var\/crash/d' /etc/fstab"  
+      fi
+      sudo_execute_remote ${node} "echo \"/dev/mapper/rootvg-crashvol /var/crash            xfs     defaults        0 0\" >>/etc/fstab"
+      sudo_execute_remote ${node} "rm -rf /var/crash/*"
+      sudo_execute_remote ${node} "mount /var/crash"
+    else
+      echo "    INFO: /var/crash is already mounted - skipping"
+    fi
+  done
+}
+
+
+show_memory()
+{
+  local huge_pages_percent=$1
+  local nodes_in_cluster=$2
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Show memory for node $node"
+    sudo_execute_remote $node "$(memory_procedures_to_send_to_remote)
+#set -x
+HUGE_PAGES_TO_ALLOCATE_PERCENT=${huge_pages_percent}
+configure_memory_calculate
+configure_memory_load_old
+echo \"    INFO: Calcualted new values for /etc/sysctl.conf\"
+echo \"         vm.nr_hugepages=\$NEW_HUGEPAGES (old value is \$OLD_HUGE_PAGES)\"
+echo \"      vm.min_free_kbytes=\$NEW_MIN_FREE_KBYTES (old value is \$OLD_MIN_FREE_KBYTES)\"
+echo \"           kernel.shmall=\$NEW_SHM_ALL (old value is \$OLD_SHM_ALL)\"
+echo \"           kernel.shmmax=\$NEW_SHM_MAX (old value is \$OLD_SHM_MAX)\"
+echo \"    INFO: Calculated new values for /etc/security/limits.conf\"
+echo \"grid    soft     memlock \$NEW_GRID_HARD_MEMLOCK (old value is \$OLD_GRID_HARD_MEMLOCK)\"
+echo \"grid    hard     memlock \$NEW_GRID_SOFT_MEMLOCK (old value is \$OLD_GRID_SOFT_MEMLOCK)\"
+echo \"oracle  soft     memlock \$NEW_ORACLE_SOFT_MEMLOCK (old value is \$OLD_ORACLE_HARD_MEMLOCK)\"
+echo \"oracle  hard     memlock \$NEW_ORACLE_HARD_MEMLOCK (old value is \$OLD_ORACLE_SOFT_MEMLOCK)\"
+echo \"emagent soft     memlock \$NEW_EMAGENT_SOFT_MEMLOCK (old value is \$OLD_EMAGENT_HARD_MEMLOCK)\"
+echo \"emagent hard     memlock \$NEW_EMAGENT_HARD_MEMLOCK (old value is \$OLD_EMAGENT_SOFT_MEMLOCK)\"
+"
+ done
+}
+
+
+configure_userssh()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local username=$1
+  local userid=$(id -gn $username)
+  local nodes_in_cluster=$2
+  local errors_found=0
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: Checking if user exists on $node"
+    # Update or add to configuration file
+    sudo_execute_remote ${node} "id $username" >>${log_file} 2>&1
+    if [ $? -ne 0 ]
+    then
+      echo "   ERROR: User $username does not exist on $node"
+      ((errors_found++))
+    fi
+  done  
+  if [ $errors_found -gt 0 ]
+  then
+    exit 1
+  fi
+  local homedir=$( getent passwd "$username" | cut -d: -f6 )
+  #echo "username=$username"
+  #echo "homedir=$homedir"
+  echo -n "" >/tmp/authorized_keys
+  for node in $nodes_in_cluster
+  do
+    echo "node=$node"
+    # First remove existing configuration - if any
+    sudo_execute_remote ${node} "sudo -u ${username} rm -f ${homedir}/.ssh/known_hosts ${homedir}/.ssh/id_rsa ${homedir}/.ssh/id_rsa.pub; mkdir -p ${homedir}/.ssh; chmod 700 ${homedir}/.ssh; ssh-keygen -f ${homedir}/.ssh/id_rsa -t rsa -N ''"
+    # Collect keys
+    sudo_execute_remote ${node} "cat ${homedir}/.ssh/id_rsa.pub" >> /tmp/authorized_keys
+  done  
+  # Now distribute the file
+  for node in $nodes_in_cluster
+  do
+    sudo_cp_remote $node /tmp/authorized_keys ${homedir}/.ssh/authorized_keys
+    sudo_execute_remote $node "chown -R $username:$userid ${homedir}/.ssh"
+  done  
+  rm /tmp/authorized_keys
+  verify_ssh "$nodes_in_cluster" "$username"
+}
+
+configure_tmpfs()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: ensuring tmpfs is in fstab on $node"
+    #tmpfs                   /dev/shm                tmpfs   defaults 0
+    sudo_execute_remote ${node} "cp -p /etc/fstab /etc/fstab_${NOW_STRING}"
+    sudo_execute_remote ${node} "grep \"tmpfs.*/dev/shm\" /etc/fstab" >>${log_file} 2>&1
+    if [ $? -eq 0 ] 
+    then
+      sudo_execute_remote ${node} "sed -i \"/tmpfs.*/dev/shm.*/c\\tmpfs                   /dev/shm                tmpfs   defaults 0\" /etc/fstab" >>${log_file} 2>&1
+    else
+      sudo_execute_remote ${node} "echo \"tmpfs                   /dev/shm                tmpfs   defaults 0\" >> /etc/fstab" >>${log_file} 2>&1
+    fi   
+  done
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: ensuring correct values in /usr/lib/tmpfiles.d/tmp.conf on $node"
+    #tmpfs                   /dev/shm                tmpfs   defaults 0
+    sudo_execute_remote ${node} "cp -p /usr/lib/tmpfiles.d/tmp.conf /usr/lib/tmpfiles.d/tmp.conf_${NOW_STRING}"
+    sudo_execute_remote ${node} "grep \"x /tmp/.oracle*\" /usr/lib/tmpfiles.d/tmp.conf" >>${log_file} 2>&1
+    if [ $? -ne 0 ] 
+    then
+      sudo_execute_remote ${node} "echo \"x /tmp/.oracle*\" >> /usr/lib/tmpfiles.d/tmp.conf" >>${log_file} 2>&1
+    fi   
+    sudo_execute_remote ${node} "grep \"x /var/tmp/.oracle*\" /usr/lib/tmpfiles.d/tmp.conf" >>${log_file} 2>&1
+    if [ $? -ne 0 ] 
+    then
+      sudo_execute_remote ${node} "echo \"x /var/tmp/.oracle*\" >> /usr/lib/tmpfiles.d/tmp.conf" >>${log_file} 2>&1
+    fi   
+    sudo_execute_remote ${node} "grep \"x /usr/tmp/.oracle*\" /usr/lib/tmpfiles.d/tmp.conf" >>${log_file} 2>&1
+    if [ $? -ne 0 ] 
+    then
+      sudo_execute_remote ${node} "echo \"x /usr/tmp/.oracle*\" >> /usr/lib/tmpfiles.d/tmp.conf" >>${log_file} 2>&1
+    fi   
+  done
+  #/usr/lib/tmpfiles.d/tmp.conf  
+  #x /tmp/.oracle*
+  #x /var/tmp/.oracle*
+  #x /usr/tmp/.oracle*  
+  #  
+}
+
+
+check_linux()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: Checking nessecary packages are installed on $node - no news is good news"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet binutils.x86_64                  || echo "   ERROR: binutils.x86_64            is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet compat-libcap1.x86_64            || echo "   ERROR: compat-libcap1.x86_64      is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet compat-libstdc++-33.i686         || echo "   ERROR: compat-libstdc++-33.i686   is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet compat-libstdc++-33.x86_64       || echo "   ERROR: compat-libstdc++-33.x86_64 is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet glibc.i686                       || echo "   ERROR: glibc.i686                 is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet glibc.x86_64                     || echo "   ERROR: glibc.x86_64               is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet glibc-devel.i686                 || echo "   ERROR: glibc-devel.i686           is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet glibc-devel.x86_64               || echo "   ERROR: glibc-devel.x86_64         is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet ksh.x86_64                       || echo "   ERROR: ksh.x86_64                 is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libX11.i686                      || echo "   ERROR: libX11.i686                is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libX11.x86_64                    || echo "   ERROR: libX11.x86_64              is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libXau.i686                      || echo "   ERROR: libXau.i686                is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libXau.x86_64                    || echo "   ERROR: libXau.x86_64              is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libXi.i686                       || echo "   ERROR: libXi.i686                 is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libXi.x86_64                     || echo "   ERROR: libXi.x86_64               is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libXtst.i686                     || echo "   ERROR: libXtst.i686               is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libXtst.x86_64                   || echo "   ERROR: libXtst.x86_64             is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libaio.i686                      || echo "   ERROR: libaio.i686                is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libaio.x86_64                    || echo "   ERROR: libaio.x86_64              is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libaio-devel.i686                || echo "   ERROR: libaio-devel.i686          is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libaio-devel.x86_64              || echo "   ERROR: libaio-devel.x86_64        is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libgcc.i686                      || echo "   ERROR: libgcc.i686                is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libgcc.x86_64                    || echo "   ERROR: libgcc.x86_64              is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libstdc++.i686                   || echo "   ERROR: libstdc++.i686             is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libstdc++.x86_64                 || echo "   ERROR: libstdc++.x86_64           is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libstdc++-devel.i686             || echo "   ERROR: libstdc++-devel.i686       is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libstdc++-devel.x86_64           || echo "   ERROR: libstdc++-devel.x86_64     is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libxcb.i686                      || echo "   ERROR: libxcb.i686                is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libxcb.x86_64                    || echo "   ERROR: libxcb.x86_64              is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet make.x86_64                      || echo "   ERROR: make.x86_64                is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet net-tools.x86_64                 || echo "   ERROR: net-tools.x86_64           is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet nfs-utils.x86_64                 || echo "   ERROR: nfs-utils.x86_64           is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet smartmontools.x86_64             || echo "   ERROR: smartmontools.x86_64       is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet sysstat.x86_64                   || echo "   ERROR: sysstat.x86_64             is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet nscd.x86_64                      || echo "   ERROR: nscd.x86_64                is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet unzip.x86_64                     || echo "   ERROR: unzip.x86_64               is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet fuse.x86_64                      || echo "   ERROR: fuse.x86_64                is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet fuse-libs.x86_64                 || echo "   ERROR: fuse-libs.x86_64           is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet fuse-devel.x86_64                || echo "   ERROR: fuse-devel.x86_64          is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet kernel-devel.x86_64              || echo "   ERROR: kernel-devel.x86_64        is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet xorg-x11-xauth.x86_64            || echo "   ERROR: xorg-x11-xauth.x86_64      is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libvirt-devel.x86_64             || echo "   ERROR: libvirt-devel.x86_64       is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libvirt-libs.x86_64              || echo "   ERROR: libvirt-libs.x86_64        is not installed"
+    ssh -o 'StrictHostKeyChecking no' $node rpm -q --quiet libXrender.x86_64                || echo "   ERROR: libXrender.x86_64          is not installed"
+    echo "    INFO: Checking /etc/resolv.conf on $node - no news is good news"
+    ssh -o 'StrictHostKeyChecking no' $node grep -q "^domain" /etc/resolv.conf && echo "   ERROR: domain is set in /etc/resolv.conf - only use search entry"
+    ssh -o 'StrictHostKeyChecking no' $node grep -q "^search.*$EXTRACTED_DOMAIN_NAME" /etc/resolv.conf || echo "   ERROR: $EXTRACTED_DOMAIN_NAME is set not set in search in /etc/resolv.conf"
+    echo "    INFO: Checking /etc/systemd/logind.conf on $node - no news is good news"
+    ssh -o 'StrictHostKeyChecking no' $node grep -i -q "^RemoveIPC=yes" /etc/systemd/logind.conf 
+    if [ $? -eq 0 ]
+    then
+      echo "   ERROR: RemoveIPC=yes is set in /etc/systemd/logind.conf - should be RemoveIPC=no - will fix it"
+    fi
+    # Just silently fix nomatter what
+    ssh -o 'StrictHostKeyChecking no' $node sudo sed -i -e "\\\$aRemoveIPC=no" -e "/^RemoveIPC=.*/d" /etc/systemd/logind.conf
+  done
+}  
+
+update_line_in_hosts_file()
+{
+  local node=$1
+  local fq_hostname=$2
+  local new_string=$3
+  sudo_execute_remote ${node} "grep \"${fq_hostname}\" /etc/hosts" >>${log_file} 2>&1
+  if [ $? -eq 0 ] 
+  then
+    sudo_execute_remote ${node} "sed -i \"/.*${fq_hostname}.*/c\\${new_string}\" /etc/hosts" >>${log_file} 2>&1
+  else
+    sudo_execute_remote ${node} "echo \"${new_string}\" >> /etc/hosts" >>${log_file} 2>&1
+  fi
+}
+load_found_data()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  sqlite3 $DB < $DATA_FILE
+  if [ $? -ne 0 ]
+  then
+    echo "  ERROR: Can't load data from $DATA_FILE into database $DB"
+    return 1
+  fi
+}
+
+load_multipath_information()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: load multipath information on $node"
+    maps=$(sudo_execute_remote ${node} "/sbin/multipathd -k <<< \"show maps format \\\"insert into maps (node_name,disk_name,disk_wwid,disk_device_name,disk_size) values ('$node',trim('%n'),trim('%w'),trim('%d'),trim('%S'));\\\"\"")
+    echo "$maps" | grep -v "multipathd>" | tail -n +2 >> $DATA_FILE
+    paths=$(sudo_execute_remote ${node} "/sbin/multipathd -k <<< \"show paths format \\\"insert into paths (node_name,disk_wwid,disk_device_name,device_status) values ('$node',trim('%w'),trim('%d'),trim('%o'));\\\"\"")
+    echo "$paths" | grep -v "multipathd>" | tail -n +2 | sed -e "/trim('[[:space:]]*'),trim/d">> $DATA_FILE
+  done
+}
+
+label_asmdisks()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  local oracle_home=$2
+  if [ ! -f ${oracle_home}/bin/asmcmd  ]
+  then
+    echo "   ERROR: ${oracle_home}/bin/asmcmd does not exist can not label disk"
+    exit 1
+  fi  
+  # label asmdisks
+  # We assume that disks that have been partitioned and that matches
+  # the name /dev/mapper/<clustername>_(data|reco|ocrs)<Disk Number>p1
+  # are candidates for labeling
+  # we will label them like belov
+  # <clustername>__(data|reco|ocrs)<Disk Number>
+  # Maybe for unlabel
+  #(export ORACLE_HOME=/u01/app/12.2.0.1/grid
+  #export ORACLE_BASE=/tmp
+  #$ORACLE_HOME/bin/asmcmd afd_deconfigure)
+  for asm_partition in $(sudo find  /dev/mapper -regextype sed -regex ".*/s[0-9]*\(oe\|cb\|hh\)[stdp]_\(data\|reco\|ocrs\).*p1" | sort)
+  do
+    #echo "$asm_partition"
+    # Extract asm disk name
+    [[ $asm_partition =~ $asm_regex ]] || { echo "   ERROR: ASM disk name can't be extraced from device name"; exit 1; }
+    asm_disk_name="${BASH_REMATCH[1]}"
+    #echo "asm_disk_name=$asm_disk_name"
+    sudo bash -c "export ORACLE_HOME=${oracle_home}; export ORACLE_BASE=/tmp; ${oracle_home}/bin/asmcmd afd_unlabel ${asm_partition}  --init" 
+    sudo bash -c "export ORACLE_HOME=${oracle_home}; export ORACLE_BASE=/tmp; ${oracle_home}/bin/asmcmd afd_label ${asm_disk_name} ${asm_partition}  --init" 
+  done
+}
+
+partition_asmdisks()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local ocrssize=$1
+  local datasize=$2
+  local recosize=$3
+  local forcerepartition=$4
+  local nodes_in_cluster=$5
+  echo "   DEBUG: ocrssize=$ocrssize"
+  echo "   DEBUG: datasize=$datasize"
+  echo "   DEBUG: recosize=$recosize"
+  echo "   DEBUG: forcerepartition=$forcerepartition"
+  # Check if sizes are different
+  [ "$ocrssize" = "$datasize" -o "$ocrssize" = "$recosize" -o "$recosize" = "$datasize" ] &&  { echo "  ERROR: ocrs,data and reco disk size can not be the same"; exit 1; }
+  load_multipath_information "$nodes_in_cluster"
+  load_found_data || { echo "    ERROR: Can't load data"; exit 1; }
+  # Now we should check if we have disks that matches the size
+  # We assume that all disks have been verified to be on all nodes, so will only check on one
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: asmdisks on $node"
+    number_of_ocrs_found=$(sqlite3 $DB "select count(mulitpath_device_name) from mpathinfo where node_name='${node}' and disk_size='$ocrssize';")  || { echo "    ERROR: Can't execute select count(mulitpath_device_name) from mpathinfo where node_name='${node}'and disk_size='$ocrssize';"; exit 1; }
+    number_of_data_found=$(sqlite3 $DB "select count(mulitpath_device_name) from mpathinfo where node_name='${node}' and disk_size='$datasize';")  || { echo "    ERROR: Can't execute select count(mulitpath_device_name) from mpathinfo where node_name='${node}'and disk_size='$datasize';"; exit 1; }
+    number_of_reco_found=$(sqlite3 $DB "select count(mulitpath_device_name) from mpathinfo where node_name='${node}' and disk_size='$recosize';")  || { echo "    ERROR: Can't execute select count(mulitpath_device_name) from mpathinfo where node_name='${node}'and disk_size='$recosize';"; exit 1; }
+    [ $number_of_ocrs_found -eq 0 ] && { echo "    ERROR: No ocrs disk with size $ocrssize found"; exit 1; }
+    [ $number_of_data_found -eq 0 ] && { echo "    ERROR: No data disk with size $datasize found"; exit 1; }
+    [ $number_of_reco_found -eq 0 ] && { echo "    ERROR: No reco disk with size $recosize found"; exit 1; }
+  done
+  # OK Now we should be pretty sure we know we can (re)partition the disk
+  # we run this on only one node (the local node)
+  mapper_devices_to_fdisk=$(sqlite3 $DB "select disk_name from mpathinfo where node_name='${local_short_hostname}' and ( disk_size='$ocrssize' or disk_size='$datasize' or disk_size='$recosize') order by disk_wwid;")  || { echo "    ERROR: Can't execute select disk_wwid,selected_device from mpathinfo where node_name='${local_short_hostname}' and ( disk_size='$ocrssize' or disk_size='$datasize' or disk_size='$recosize')  order by disk_wwid;"; exit 1; }
+  for mapper_device in $mapper_devices_to_fdisk
+  do
+    # Build device string
+    device=/dev/mapper/$mapper_device
+    # Check if there is a partition table, if there is we will skip it unless force is given
+    if [ "$(sudo /sbin/sfdisk -d $device)" = "" ]
+    then
+      # Disk is not partitioned, do a check for no lvm on the disk, just to be sure. We should already have filtered them out
+      udevadm info $device | grep ID_FS_VERSION 2>&1
+      if [ $? -eq 0 ]
+      then
+        # Ouch it's an LVM volume
+        echo " WARNING: It's an LVM device - skiping partitioning of $device"
+      else
+        echo "    INFO: It's not a partitioned or LVM device - let's partition $device"
+        sudo parted $device -a optimal --script -- mklabel gpt mkpart primary ext4 0% 100%
+      fi
+    else
+      if [ "$forcerepartition" = "YES" ]
+      then
+        echo "    INFO: It's partitioned - but we will re partition $device"
+        sudo dd if=/dev/zero of=$device bs=512 count=10000
+        sudo parted $device -a optimal --script -- mklabel gpt mkpart primary ext4 0% 100%
+        # Had problems - seems to help
+        sleep 1s
+      else
+        echo "    INFO: It's partitioned - and we will not touch $device"
+      fi
+    fi
+  done
+  # So now update /etc/multipath.conf
+  new_defaults_section="defaults {
+	user_friendly_names no 
+	find_multipaths yes
+	polling_interval 5	
+}
+"
+  new_devices_section="devices {
+	device {
+		vendor \\\"IBM\\\"
+		product \\\"^2145\\\"
+		path_grouping_policy \\\"multibus\\\"
+		path_selector \\\"round-robin 0\\\"
+		path_checker \\\"tur\\\"
+		features \\\"0\\\"
+		hardware_handler \\\"0\\\"
+		prio \\\"alua\\\"
+		failback immediate
+		rr_weight \\\"uniform\\\"
+		no_path_retry \\\"fail\\\"
+		rr_min_io_rq 1
+		fast_io_fail_tmo 3
+		dev_loss_tmo 5
+		max_sectors_kb 4096
+	}
+}"
+  new_blacklist_section="blacklist {
+}
+"
+  generate_multipaths_sql="select group_concat(multipaths,\"\")
+from
+(
+select \"00000\" lineorder, \"multipaths {\" multipaths
+union
+select \"1\"||substr(\"0000\"||cnt,-4,4) lineorder, \"
+	multipath {
+		wwid			\"||disk_wwid||\"
+		alias			${cluster_name}_ocrs\"||substr(\"0000\"||cnt,-4,4) ||\"
+	}\" multipaths
+from
+(select distinct mo.disk_wwid,(select count(distinct mi.disk_wwid) from maps mi where mo.disk_wwid >= mi.disk_wwid and mi.disk_size='${ocrssize}') as cnt 
+from maps mo
+where disk_size='${ocrssize}'
+order by disk_wwid
+)
+union
+select \"2\"||substr(\"0000\"||cnt,-4,4) lineorder,\"
+	multipath {
+		wwid			\"||disk_wwid||\"
+		alias			${cluster_name}_data\"||substr(\"0000\"||cnt,-4,4) ||\"
+	}\" multipaths
+from
+(select distinct mo.disk_wwid,(select count(distinct mi.disk_wwid) from maps mi where mo.disk_wwid >= mi.disk_wwid and mi.disk_size='${datasize}') as cnt 
+from maps mo
+where disk_size='${datasize}'
+order by disk_wwid
+)
+union
+select \"3\"||substr(\"0000\"||cnt,-4,4) lineorder,\"
+	multipath {
+		wwid			\"||disk_wwid||\"
+		alias			${cluster_name}_reco\"||substr(\"0000\"||cnt,-4,4) ||\"
+	}\" multipaths
+from
+(select distinct mo.disk_wwid,(select count(distinct mi.disk_wwid) from maps mi where mo.disk_wwid >= mi.disk_wwid and mi.disk_size='${recosize}') as cnt 
+from maps mo
+where disk_size='${recosize}'
+order by disk_wwid
+)
+union
+select \"99999\" lineorder, \"
+}\" multipaths
+)
+order by lineorder;  
+"
+  new_multipaths_section=$(sqlite3 $DB "${generate_multipaths_sql}")
+  #echo "$new_multipaths_section"    
+  # Now on each host update the /etc/multipath.conf file by replacing the multipaths section
+  for node in $nodes_in_cluster
+  do
+    # First backup file
+    sudo_execute_remote ${node} "cp -p /etc/multipath.conf /etc/multipath.conf_${NOW_STRING}"
+    # Then delete old sections - don't work, we create a new one instead
+    # sudo_execute_remote ${node} "sed -i -e ':again;\$!N;\$!b again;  s/\ndefaults.*\n}//g; t' -e ':again;\$!N;\$!b again;  s/\ndevices.*\n}//g; t' -e ':again;\$!N;\$!b again;  s/\nmultipaths.*\n}//g; t' /etc/multipath.conf"
+    # Then add the new multipaths sections
+    sudo_execute_remote ${node} "echo \"${new_defaults_section}\" > /etc/multipath.conf"
+    sudo_execute_remote ${node} "echo \"${new_devices_section}\" >> /etc/multipath.conf"
+    sudo_execute_remote ${node} "echo \"${new_blacklist_section}\" >> /etc/multipath.conf"
+    sudo_execute_remote ${node} "echo \"${new_multipaths_section}\" >> /etc/multipath.conf"
+    # Then reload, may I should flush multipath, but we don't typically have anything running
+    sudo_execute_remote ${node} "service multipathd reload"
+    # Make sure the max_sector_size_kb is set to 4096 or grid install will fail
+    sudo_execute_remote ${node} "multipath -ll | grep \" sd\" | cut -b 15-19| sed \"s/\([^ ]*\)/echo 4096 >\/sys\/block\/\1\/queue\/max_sectors_kb/\" > /tmp/setsector.sh ;chmod +x /tmp/setsector.sh; /tmp/setsector.sh; rm /tmp/setsector.sh"
+  done
+}
+#
+# SQL That finds a device given the wwid
+#
+#select  node_name,disk_size,disk_wwid, device_names, substr(device_names,1,INSTR(device_names,',')-1)  'selected_device'
+#from
+#(select m.node_name, m.disk_wwid,m.disk_size,m.disk_device_name 'mulitpath_device_name' ,group_concat(p.disk_device_name ) 'device_names'
+#from maps m,paths p
+#where p.node_name=m.node_name
+#  and p.disk_wwid=m.disk_wwid
+#group by  m.disk_wwid,m.node_name
+#)
+#order by node_name, disk_size,disk_wwid
+
+
+
+show_diskreport()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  load_multipath_information "$nodes_in_cluster"
+  load_found_data || { echo "  ERROR: Can't load data"; exit 1; }
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: disks on $node"
+    sqlite3 $DB << END
+.separator "\t"
+.header on
+.mode column
+.width 20 0 0 
+select node_name 'Node name',disk_size 'Disk Size',count(mulitpath_device_name) 'Number of disks'
+from mpathinfo
+where node_name='${node}'
+group by node_name, disk_size;
+END
+    echo ""    
+  done
+}
+
+update_hostfile()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local ifpriv1name=$1
+  local ifpriv2name=$2
+  local nodes_in_cluster=$3
+  local ignore_adm=$4
+  # Check that DNS round robin for scan listener is ok
+  local fq_scan_name="${scan_name}.${EXTRACTED_DOMAIN_NAME}"
+  count_scan_ips=$(dig +noall +answer ${fq_scan_name} | wc -l )
+  [ "$count_scan_ips" != "3" ] && { echo "   ERROR: Have no found 3 scan ip's (number found=$count_scan_ips) for dns $fq_scan_name"; exit 1; }
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: update /etc/host on $node"
+    sudo_execute_remote ${node} "cp -p /etc/hosts /etc/hosts_${NOW_STRING}"
+    #update_line_in_hosts_file "$node" "asger.qaoneadr.local" "128.0.0.1 asger asger.qaoneadr.local"
+    for mq_node in $nodes_in_cluster
+    do
+      nq_host=${mq_node%%.*}
+      fq_host=${nq_host}.${EXTRACTED_DOMAIN_NAME}
+      ip_host=$(dig +short ${fq_host})
+      [ "$ip_host" = "" ] && { echo "   ERROR: ip for host ${fq_host} could not be looked up in DNS"; exit 1; }
+      nq_vip_host=${nq_host}-vip
+      fq_vip_host=${nq_host}-vip.${EXTRACTED_DOMAIN_NAME}
+      ip_vip_host=$(dig +short ${fq_vip_host})
+      [ "$ip_vip_host" = "" ] && { echo "   ERROR: ip for host ${fq_vip_host} could not be looked up in DNS"; exit 1; }
+      if [ "$ignore_adm" != "YES" ]
+      then
+        nq_adm_host=${nq_host}-adm
+        fq_adm_host=${nq_host}-adm.${EXTRACTED_DOMAIN_NAME}
+        ip_adm_host=$(dig +short ${fq_adm_host})
+        [ "$ip_adm_host" = "" ] && { echo "   ERROR: ip for host ${fq_adm_host} could not be looked up in DNS"; exit 1; }
+      fi
+      nq_backup_host=${nq_host}-backup
+      fq_backup_host=${nq_host}-backup.${EXTRACTED_DOMAIN_NAME}
+      ip_backup_host=$(dig +short ${fq_backup_host})
+      [ "$ip_backup_host" = "" ] && { echo "   ERROR: ip for host ${fq_backup_host} could not be looked up in DNS"; exit 1; }
+      nq_priv1_host=${nq_host}-priv1
+      fq_priv1_host=${nq_host}-priv1.${EXTRACTED_DOMAIN_NAME}
+      ip_priv1_host=$(sudo_execute_remote "$mq_node" "ip -4 address show dev ${ifpriv1name} | awk \"/inet .*${ifpriv1name}\$/ {gsub(/\/.*/,\\\"\\\",\\\$2); print \\\$2}\"")
+      [ "$ip_priv1_host" = "" ] && { echo "   ERROR: ip for host ${fq_priv1_host} could not be looked up using interface name $ifpriv1name"; exit 1; }
+      nq_priv2_host=${nq_host}-priv2
+      fq_priv2_host=${nq_host}-priv2.${EXTRACTED_DOMAIN_NAME}
+      ip_priv2_host=$(sudo_execute_remote "$mq_node" "ip -4 address show dev ${ifpriv2name} | awk \"/inet .*${ifpriv2name}\$/ {gsub(/\/.*/,\\\"\\\",\\\$2); print \\\$2}\"")
+      [ "$ip_priv2_host" = "" ] && { echo "   ERROR: ip for host ${fq_priv2_host} could not be looked up using interface name $ifpriv2name"; exit 1; }
+      update_line_in_hosts_file "$node" "${fq_host}" "${ip_host}	${nq_host}	${fq_host}"
+      update_line_in_hosts_file "$node" "${fq_vip_host}" "${ip_vip_host}	${nq_vip_host}	${fq_vip_host}"
+      if [ "$ignore_adm" != "YES" ]
+      then
+        update_line_in_hosts_file "$node" "${fq_adm_host}" "${ip_adm_host}	${nq_adm_host}	${fq_adm_host}"
+      fi
+      update_line_in_hosts_file "$node" "${fq_backup_host}" "${ip_backup_host}	${nq_backup_host}	${fq_backup_host}"
+      update_line_in_hosts_file "$node" "${fq_priv1_host}" "${ip_priv1_host}	${nq_priv1_host}	${fq_priv1_host}"
+      update_line_in_hosts_file "$node" "${fq_priv2_host}" "${ip_priv2_host}	${nq_priv2_host}	${fq_priv2_host}"
+    done
+  done
+}
+
+
+install_securitylimits()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  security_limits_conf="* hard maxlogins 1000
+* hard core 0
+* soft stack 10240
+
+grid     soft     core unlimited
+grid     hard     core unlimited
+grid     soft     nproc 400000
+grid     hard     nproc 400000
+grid     soft     nofile 400000
+grid     hard     nofile 400000
+grid     soft     memlock 1426281608
+grid     hard     memlock 1426281608
+
+oracle   soft     core unlimited
+oracle   hard     core unlimited
+oracle   soft     nproc 400000
+oracle   hard     nproc 400000
+oracle   soft     nofile 400000
+oracle   hard     nofile 400000
+oracle   soft     memlock 1426281608
+oracle   hard     memlock 1426281608
+
+emagent  soft     core unlimited
+emagent  hard     core unlimited
+emagent  soft     nproc 400000
+emagent  hard     nproc 400000
+emagent  soft     nofile 400000
+emagent  hard     nofile 400000
+emagent  soft     memlock 1426281608
+emagent  hard     memlock 1426281608
+"    
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: replace /etc/security/limits.conf on $node"
+    # update /etc/security/limits.conf
+    sudo_execute_remote ${node} "cp -p /etc/security/limits.conf /etc/security/limits.conf_${NOW_STRING}"
+    sudo_execute_remote $node "echo \"$security_limits_conf\" >/etc/security/limits.conf"    
+  done
+}
+
+lock_bashprofile()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  bash_profile="# .bash_profile
+
+# Get the aliases and functions
+if [ -f ~/.bashrc ]; then
+        . ~/.bashrc
+fi
+
+# User specific environment and startup programs
+
+PATH=$PATH:$HOME/.local/bin:$HOME/bin
+
+export PATH
+"
+  bash_rc="# .bashrc
+
+# Source global definitions
+if [ -f /etc/bashrc ]; then
+        . /etc/bashrc
+fi
+
+# Uncomment the following line if you don't like systemctl's auto-paging feature:
+# export SYSTEMD_PAGER=
+
+# User specific aliases and functions
+"
+  for node in $nodes_in_cluster
+  do  
+    echo "    INFO: replace /home/oracle/.bash_profile on $node"
+    # Ensure oracle account has been used at least once
+    sudo_execute_remote ${node} "su - oracle -c exit" 
+    sudo_execute_remote ${node} "chattr -i /home/oracle/.bash_profile " 
+    sudo_execute_remote ${node} "echo \"$bash_profile\" >/home/oracle/.bash_profile"    
+    sudo_execute_remote ${node} "chattr -i /home/oracle/.bash_profile " 
+    echo "    INFO: replace /home/oracle/.bashrc on $node"
+    sudo_execute_remote ${node} "chattr -i /home/oracle/.bashrc " 
+    sudo_execute_remote ${node} "echo \"$bash_rc\" >/home/oracle/.bashrc"    
+    sudo_execute_remote ${node} "chattr -i /home/oracle/.bashrc " 
+  done
+}
+
+install_ahf()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  if [ "$EXTRACTED_DOMAIN_NAME" = "leva.dk" ]
+  then
+    nordea_yum_server="soptools.leva.dk"
+  else
+    case $nordea_environment_type in
+      prod)
+        nordea_yum_server="isl-olpr1p.oneadr.net"
+        ;;
+      preprod)
+        nordea_yum_server="isl-olpr1t.oneadr.net"
+        ;;
+      test)
+        nordea_yum_server="isl-olpr1t.oneadr.net"
+        ;;
+      dev)
+        nordea_yum_server="isl-olpr1t.oneadr.net"
+        ;;
+      *)
+        echo "   ERROR: environment should be one of prod, test or dev";exit 1;;
+    esac
+  fi
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: installing ahf on $node: "
+    sudo_execute_remote $node "cd /tmp/;curl -O http://${nordea_yum_server}/software/goldimages/ahf/latest" >>${log_file} 2>&1 || { echo -e "\n ERROR: Can't fetch AHF (latest)"; exit 1; } && echo -n "AHF Fetched "  
+    sudo_execute_remote $node "cd /tmp/;unzip -o latest" >>${log_file} 2>&1 || { echo -e "\n ERROR: Can't unzip latest"; exit 1; }  && echo -n "AHF unpacked "
+    sudo_execute_remote $node "chmod +x /tmp/latest;" >>${log_file} 2>&1 || { echo -e "\n ERROR: Can't chmod +x latest"; exit 1; }  && echo -n "AHF install made executable "    
+    sudo_execute_remote $node "cd /tmp/;./ahf_setup -data_dir /u01/app/grid -silent -local" >>${log_file} 2>&1 || { echo -e "\n ERROR: Can't Install AHF"; exit 1; }  && echo -n "AHF installed "
+    sudo_execute_remote $node "orachk -autostart" >>${log_file} 2>&1 || { echo -e "\n ERROR: orachk -autostart failed"; exit 1; }  && echo -n "orachk -autostart "
+    sudo_execute_remote $node "cd /tmp/; rm latest README.txt ahf_setup" >>${log_file} 2>&1 || { echo -e "\n ERROR: Can't remove AHF install files"; exit 1; }  && echo -n "AHF files cleanup done "
+    echo ""
+  done  
+}
+
+deinstall_ahf()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: deinstalling ahf on $node: "
+    sudo_execute_remote $node "tfactl uninstall -silent -deleterepo -local" >>${log_file} 2>&1 || { echo -e "\n ERROR: tfactl uninstall -silent -deleterepo failed"; exit 1; }  && echo -n "AHF deinstalled "
+    echo ""
+  done  
+}
+
+
+configure_yum()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  if [ "$EXTRACTED_DOMAIN_NAME" = "leva.dk" ]
+  then
+    nordea_yum_server="soptools.leva.dk"
+  else
+    case $nordea_environment_type in
+      prod)
+        nordea_yum_server="isl-olpr1p.oneadr.net"
+        ;;
+      preprod)
+        nordea_yum_server="isl-olpr1t.oneadr.net"
+        ;;
+      test)
+        nordea_yum_server="isl-olpr1t.oneadr.net"
+        ;;
+      dev)
+        nordea_yum_server="isl-olpr1t.oneadr.net"
+        ;;
+      *)
+        echo "   ERROR: environment should be one of prod, test or dev";exit 1;;
+    esac
+  fi
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: Inserting /etc/yum.repos.d files on $node: "
+    sudo_execute_remote $node "cd /etc/yum.repos.d;curl -O http://${nordea_yum_server}/exabootstrap/Nordea-Exadata.repo" >>${log_file} 2>&1 || { echo -e "\n ERROR: Can't fetch Nordea-Exadata.repo"; exit 1; } && echo -n "Nordea-Exadata.repo"  
+    sudo_execute_remote $node "cd /etc/yum.repos.d;chmod 444 Nordea-Exadata.repo;" >>${log_file} 2>&1 || { echo -e "\n ERROR: Can't chmod 444 Nordea-Exadata.repo"; exit 1; }  
+    echo ""
+  done  
+}
+
+
+
+prepare_u01()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  local oracle_home=$2 
+  # We actually checked this initially but I need to get part ofthe path
+  if ! [[ "$INPUT_ORACLE_HOME" =~ (^/u01/app/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/grid$ ]]
+  then
+    echo "   ERROR: --oraclehome needs to be something like /u01/app/<number>.<number>.<number>.<number>/grid"
+    exit 1
+  fi
+  local oracle_home_minus_grid=${BASH_REMATCH[1]}
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: preparing /u01 on $node: "
+    sudo_execute_remote $node "# Prepare file system for Grid
+mkdir -p /u01/app || exit 1
+mkdir -p ${oracle_home_minus_grid} || exit 2
+mkdir -p ${oracle_home} || exit 3
+mkdir -p /u01/app/grid || exit 4
+chown grid.oinstall /u01 /u01/app /u01/app/grid ${oracle_home_minus_grid} ${oracle_home} || exit 5
+# Oracle Software as root
+mkdir  -p /u01/app/oracle || exit 6
+chmod g+wrx /u01/app/oracle || exit 7
+chown  oracle:oinstall /u01/app/oracle || exit 8
+# Oracle Software as root
+mkdir  -p /u01/software || echo \"/u01/software was there - skipping creation\" 
+chown --recursive oracle:oinstall /u01/software || exit 10
+chmod --recursive g+rwx /u01/software || exit 11
+# Oracle Agent directories
+mkdir -p /u01/app/emagent || exit 12
+chown emagent:oinstall /u01/app/emagent || exit 13
+# Orainventory
+mkdir -p /u01/app/oraInventory || exit 14
+chown grid:oinstall /u01/app/oraInventory || exit 15
+chmod g+rwx /u01/app/oraInventory || exit 16 
+mkdir -p /dbfs || exit 17
+chown  oracle:oinstall /dbfs || exit 18 ">>${log_file} 2>&1 || { echo -e "\n ERROR: prepare u01 returned $? probably the command have already been run"; exit 1; } && echo -n  "       OK "  
+    echo ""
+  done  
+}
+
+sysctl_procedures_to_send_to_remote()
+{
+  cat << EOF
+backup_file()
+{
+  local_file="\$1"
+  backup_extension="\$2"
+  if [ "\$backup_extension" = "" ]
+  then
+    backup_extension="_\$(date +'%F_%T')"
+  else
+    backup_extension="_\$backup_extension"
+  fi
+  cp -p "\$local_file" "\${local_file}\${backup_extension}"
+}
+
+
+del_conf_parm()
+{
+  local file="\$1"
+  local parameter="\$2"
+  sed -i "/^\${parameter}[[:space:]]*=.*/d" \${file}     
+}
+
+upd_conf_parm()
+{
+  local file="\$1"
+  local parameter="\$2"
+  local value="\$3"
+  grep "^\${parameter}[[:space:]]*=" \${file} >>/dev/null 2>&1 && sed -i "s/^\${parameter}.*/\${parameter} = \${value//\//\\/}/" \${file} || echo "\${parameter} = \${value}" >> \${file}     
+}
+
+get_conf_parm()
+{
+  local file="\$1"
+  local parameter="\$2"
+  grep "^\${parameter}[[:space:]]*=" \${file} >>/dev/null 2>&1 && sed -n "s/^\${parameter}[[:space:]]*=[[:space:]]*\(.*\)/\1/p" \${file} || echo ""     
+}  
+EOF
+}
+
+
+#
+# protect_listener
+#
+# Purpose: Will enable firewall and firewall rules that are suppoesed to protect the listener
+#          against connection storms and "bad guys"
+protect_listener()
+{
+  set_grid_home
+  #nodes_in_cluster=$( get_nodes )
+  local nodes_in_cluster=$1   
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  for node in $nodes_in_cluster
+  do  
+    # First ensure that listener.ora contains "CONNECTION_RATE_LISTENER=200"
+    echo "    INFO: Updating $GRID_ORACLE_HOME/network/admin/listener.ora on node ${node}"
+    # Delete matching line in listener.ora
+    sudo_execute_remote ${node} "sed -i_${now} -e \"/CONNECTION_RATE_LISTENER[[:space:]]*=.*/d\"  $GRID_ORACLE_HOME/network/admin/listener.ora"
+    # Add new line in listener.ora
+    sudo_execute_remote ${node} "sed -i -e \"1 i\\\CONNECTION_RATE_LISTENER=200\" $GRID_ORACLE_HOME/network/admin/listener.ora"
+    # Restart listener - reload is "not enough"
+    sudo_execute_remote ${node} "su - $GRID_OWNER -c \"export ORACLE_HOME=$GRID_ORACLE_HOME;$GRID_ORACLE_HOME/bin/lsnrctl stop\""
+    sudo_execute_remote ${node} "su - $GRID_OWNER -c \"export ORACLE_HOME=$GRID_ORACLE_HOME;$GRID_ORACLE_HOME/bin/lsnrctl start\""
+    # Wait for listener to have everything registred again to avoid having HA problems
+    echo "   INFO: Will wait for 75 seconds before reloading next listener"
+    sleep 75
+    # Install iptables-services as we don't do firewall.d
+    sudo_execute_remote ${node} "yum install iptables-services -y"
+    # Add firewall rules and make sure firewall is tated and that rules are used when rebooting
+    # 1 Clear firewall rules - just in case
+    sudo_execute_remote ${node} "systemctl stop iptables"
+    # 2 Add firewall rules
+    # Add new chain
+    sudo_execute_remote ${node} "iptables -N SQL_NET_LIMIT"
+    # Log when chain is used but limit logging to 5/s
+    sudo_execute_remote ${node} "iptables -A SQL_NET_LIMIT -m limit --limit 5/min -j LOG --log-prefix \"Limit SQL*Net connections: \""
+    # Reject packages that are violating
+    sudo_execute_remote ${node} "iptables -A SQL_NET_LIMIT -j DROP"
+    # This rule will trigger when to many connects from an individual IP is happening. Will transfer control to the SQL_NET_LIMIT chain 
+    sudo_execute_remote ${node} "iptables -A INPUT -p tcp --dport 1521 -m state --state NEW -m hashlimit --hashlimit-name SQLNET --hashlimit-above 40/sec --hashlimit-burst 80  --hashlimit-mode srcip --hashlimit-htable-expire 300000  -j SQL_NET_LIMIT"  
+    # 3 Save firewall rules - so they will be used on reboot
+    sudo_execute_remote ${node} "service iptables save"
+    # 4 Enable iptables to run at startup
+    sudo_execute_remote ${node} "systemctl enable iptables"
+    # 5 Start iptables
+    sudo_execute_remote ${node} "systemctl start iptables"
+  done      
+}
+
+configure_sqlnetora()
+{
+  set_grid_home
+  #nodes_in_cluster=$( get_nodes )
+  local nodes_in_cluster=$1   
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  for node in $nodes_in_cluster
+  do  
+    # First ensure that sql.ora contains 
+    #SQLNET.ALLOWED_LOGON_VERSION_SERVER=10 
+    #SQLNET.ALLOWED_LOGON_VERSION_CLIENT=10
+    #SQLNET.ENCRYPTION_SERVER=requested
+    #SQLNET.ENCRYPTION_TYPES_SERVER=(AES256,AES192,3DES168)
+    #SQLNET.CRYPTO_CHECKSUM_SERVER=requested
+    #SQLNET.CRYPTO_CHECKSUM_TYPES_SERVER=(SHA512,SHA1,MD5)
+    
+    echo "    INFO: Updating $GRID_ORACLE_HOME/network/admin/sqlnet.ora on node ${node}"
+    # Delete matchings lines in sqlnet.ora
+    sudo_execute_remote ${node} "sed -i_${now} -e \"/SQLNET.ALLOWED_LOGON_VERSION_SERVER[[:space:]]*=.*/Id\"  $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.ALLOWED_LOGON_VERSION_CLIENT[[:space:]]*=.*/Id\"  $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.ENCRYPTION_SERVER[[:space:]]*=.*/Id\"  $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.ENCRYPTION_TYPES_SERVER[[:space:]]*=.*/Id\"  $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.CRYPTO_CHECKSUM_SERVER[[:space:]]*=.*/Id\"  $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.CRYPTO_CHECKSUM_TYPES_SERVER[[:space:]]*=.*/Id\"  $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    # Add new lines in sqlnet.ora - dont work on listener for many parameters
+    #sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.ALLOWED_LOGON_VERSION_SERVER=9\" $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    #sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.ALLOWED_LOGON_VERSION_CLIENT=9\" $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    #sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.ENCRYPTION_SERVER=requested\" $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    #sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.ENCRYPTION_TYPES_SERVER=(AES256,AES192,3DES168)\" $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    #sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.CRYPTO_CHECKSUM_SERVER=requested\" $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    #sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.CRYPTO_CHECKSUM_TYPES_SERVER=(SHA512,SHA1,MD5)\" $GRID_ORACLE_HOME/network/admin/sqlnet.ora"
+    echo "    INFO: Updating /clustershare/network/admin/sqlnet.ora on node ${node}"
+    # Delete matchings lines in sqlnet.ora
+    sudo_execute_remote ${node} "sed -i_${now} -e \"/SQLNET.ALLOWED_LOGON_VERSION_SERVER[[:space:]]*=.*/Id\"  /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.ALLOWED_LOGON_VERSION_CLIENT[[:space:]]*=.*/Id\"  /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.ENCRYPTION_SERVER[[:space:]]*=.*/Id\"  /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.ENCRYPTION_TYPES_SERVER[[:space:]]*=.*/Id\"  /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.CRYPTO_CHECKSUM_SERVER[[:space:]]*=.*/Id\"  /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"/SQLNET.CRYPTO_CHECKSUM_TYPES_SERVER[[:space:]]*=.*/Id\"  /clustershare/network/admin/sqlnet.ora"
+    # Add new lines in sqlnet.ora
+    sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.ALLOWED_LOGON_VERSION_SERVER=9\" /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.ALLOWED_LOGON_VERSION_CLIENT=9\" /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.ENCRYPTION_SERVER=requested\" /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.ENCRYPTION_TYPES_SERVER=(AES256,AES192,3DES168)\" /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.CRYPTO_CHECKSUM_SERVER=requested\" /clustershare/network/admin/sqlnet.ora"
+    sudo_execute_remote ${node} "sed -i -e \"1 i\\\SQLNET.CRYPTO_CHECKSUM_TYPES_SERVER=(SHA512,SHA1,MD5)\" /clustershare/network/admin/sqlnet.ora"
+    # Restart listener - reload is "not enough"
+    sudo_execute_remote ${node} "su - $GRID_OWNER -c \"export ORACLE_HOME=$GRID_ORACLE_HOME;$GRID_ORACLE_HOME/bin/lsnrctl stop\""
+    sudo_execute_remote ${node} "su - $GRID_OWNER -c \"export ORACLE_HOME=$GRID_ORACLE_HOME;$GRID_ORACLE_HOME/bin/lsnrctl start\""
+    # Wait for listener to have everything registred again to avoid having HA problems
+    echo "   INFO: Will wait for 75 seconds before reloading next listener"
+    sleep 75    
+  done
+}
+
+
+
+configure_sysctl()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: configuring sysctl on $node: "
+    # Need a lot more error checking here TBD
+    sudo_execute_remote $node "$(sysctl_procedures_to_send_to_remote)
+backup_file /etc/sysctl.conf $now
+upd_conf_parm /etc/sysctl.conf fs.file-max \"6815744\"
+upd_conf_parm /etc/sysctl.conf kernel.sem \"1024 60000 1024 256\"
+upd_conf_parm /etc/sysctl.conf kernel.shmmni \"4096\"
+#Depends on memeory - moved
+#upd_conf_parm /etc/sysctl.conf kernel.shmall \"1073741824\"
+#upd_conf_parm /etc/sysctl.conf kernel.shmmax \"4398046511104\"
+upd_conf_parm /etc/sysctl.conf kernel.panic_on_oops \"1\"
+upd_conf_parm /etc/sysctl.conf net.core.rmem_default \"262144\"
+upd_conf_parm /etc/sysctl.conf net.core.rmem_max \"4194304\"
+upd_conf_parm /etc/sysctl.conf net.core.wmem_default \"262144\"
+upd_conf_parm /etc/sysctl.conf net.core.wmem_max \"1048576\"
+upd_conf_parm /etc/sysctl.conf net.ipv4.conf.${ETH_PRIV1}.rp_filter \"2\"
+upd_conf_parm /etc/sysctl.conf net.ipv4.conf.${ETH_PRIV2}.rp_filter \"2\"
+upd_conf_parm /etc/sysctl.conf net.ipv4.ip_local_port_range \"9000 65500\"
+upd_conf_parm /etc/sysctl.conf vm.max_map_count \"250000\"
+#Depends on memeory - moved
+#upd_conf_parm /etc/sysctl.conf vm.min_free_kbytes \"2097152\"
+upd_conf_parm /etc/sysctl.conf net.ipv4.ipfrag_high_thresh \"16777216\"
+upd_conf_parm /etc/sysctl.conf net.ipv4.ipfrag_low_thresh \"15728640\"
+upd_conf_parm /etc/sysctl.conf net.core.somaxconn \"65535\"
+upd_conf_parm /etc/sysctl.conf fs.file-max \"13631488\"
+upd_conf_parm /etc/sysctl.conf fs.aio-max-nr \"50000000\"
+upd_conf_parm /etc/sysctl.conf kernel.pid_max \"400000\"
+"
+    sudo_execute_remote $node "sysctl -p" >>${log_file} 2>&1 || { echo -e "\n ERROR: Can't sysctl -p"; exit 1; } && echo -n "       OK: "  
+    echo ""
+  done  
+}
+
+
+
+install_cvuqdisk()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  local oracle_home=$2 
+  #echo "oracle_home=$oracle_home"  
+  # Install grid home
+  rpm_file_found=$(find ${oracle_home} -name "cvuqdisk*.rpm" -print -quit)
+  if [ "$rpm_file_found" = "" ]
+  then
+    echo "   ERROR: Could not find cvuqdisk*.rpm in {oracle_home}"
+  fi
+  #echo "rpm_file_found=$rpm_file_found"
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: TBD Installing cvuqdisk on $node: "
+    sudo_cp_remote $node $rpm_file_found /tmp/cvu_temp.rpm
+    sudo_execute_remote $node "CVUQDISK_GRP=oinstall; export CVUQDISK_GRP; yum -y localinstall /tmp/cvu_temp.rpm" || { echo "   ERROR: Failed installing cvu package on ${node}"; exit 1; }
+    sudo_execute_remote $node "rm -f /tmp/cvu_temp.rpm"
+  done
+}
+
+setup_gridhome()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  echo "Not done yet"
+  exit 99
+  local nodes_in_cluster=$1 
+  local oracle_home=$2 
+  #echo "oracle_home=$oracle_home"
+  # Install grid home
+  if [ ! -f ${oracle_home}/gridSetup.sh ]
+  then
+    echo "   ERROR: ${oracle_home}/gridSetup.sh does not exist can not install"
+    exit 1
+  fi
+  sudo su - grid -c "${oracle_home}/gridSetup.sh \
+    -silent \
+    -waitForCompletion \
+    oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v12.2.0 \
+    INVENTORY_LOCATION=/u01/app/oraInventory \
+    oracle.install.option=CRS_CONFIG \
+    ORACLE_BASE=/u01/app/grid \
+    oracle.install.asm.OSDBA=asmdba \
+    oracle.install.asm.OSOPER=asmoper \
+    oracle.install.asm.OSASM=asmadmin \
+    oracle.install.crs.config.gpnp.scanName=db-s002hhd-scan \
+    oracle.install.crs.config.gpnp.scanPort=1521 \
+    oracle.install.crs.config.ClusterConfiguration=STANDALONE \
+    oracle.install.crs.config.configureAsExtendedCluster=false \
+    oracle.install.crs.config.clusterName=db-s002hhd-clu \
+    oracle.install.crs.config.gpnp.configureGNS=false \
+    oracle.install.crs.config.clusterNodes=db-s002hh01d.qaoneadr.local:db-s002hh01d-vip.qaoneadr.local:HUB,db-s002hh02d.qaoneadr.local:db-s002hh02d-vip.qaoneadr.local:HUB,db-s002hh03d.qaoneadr.local:db-s002hh03d-vip.qaoneadr.local:HUB,db-s002hh04d.qaoneadr.local:db-s002hh04d-vip.qaoneadr.local:HUB \
+    oracle.install.crs.config.networkInterfaceList=eth-priv1:192.168.1.0:5,eth-priv2:192.168.1.0:5,bond-backup.35:10.96.32.0:3,bond-cl.33:10.96.30.0:3,bond-cl.34:10.96.31.0:1 \
+    oracle.install.asm.configureGIMRDataDG=false \
+    oracle.install.crs.config.useIPMI=true \
+    oracle.install.crs.config.ipmi.bmcUsername=ipmi \
+    oracle.install.crs.config.ipmi.bmcPassword= \
+    oracle.install.asm.storageOption=ASM \
+    oracle.install.asm.SYSASMPassword= \
+    oracle.install.asm.diskGroup.redundancy=NORMAL \
+    oracle.install.asm.diskGroup.AUSize=4 \
+    oracle.install.asm.diskGroup.disksWithFailureGroupNames=/dev/mapper/s002hhd_ocrs0001p1,,/dev/mapper/s002hhd_ocrs0002p1,,/dev/mapper/s002hhd_ocrs0003p1,,/dev/mapper/s002hhd_ocrs0004p1, \
+    oracle.install.asm.diskGroup.disks=/dev/mapper/s002hhd_ocrs0001p1,/dev/mapper/s002hhd_ocrs0002p1,/dev/mapper/s002hhd_ocrs0003p1,/dev/mapper/s002hhd_ocrs0004p1 \
+    oracle.install.asm.diskGroup.diskDiscoveryString=/dev/mapper/* \
+    oracle.install.asm.monitorPassword= \
+    oracle.install.asm.configureAFD=true \
+    oracle.install.crs.configureRHPS=false \
+    oracle.install.config.managementOption=NONE \
+    oracle.install.crs.rootconfig.executeRootScript=false"
+  # Should i do this
+  sudo su - grid -c "${oracle_home}/oui/bin/runInstaller -silent -updateNodeList ORACLE_HOME=${oracle_home} -defaultHomeName CLUSTER_NODES=\"${nordea_cluster_nodes_comma}\" CRS=TRUE"
+  #for node in $nodes_in_cluster
+  #do
+  #  echo "    INFO: Running commands as root on $node: "
+  #  sudo_execute_remote $node "/u01/app/oraInventory/orainstRoot.sh" || { echo "   ERROR: /u01/app/oraInventory/orainstRoot.sh failed on ${node}"; exit 1; }
+  #  sudo_execute_remote $node "${oracle_home}/root.sh" || { echo "   ERROR: /u01/app/12.2.0.1/grid/root.sh failed on ${node}"; exit 1; }
+  #done
+}
+
+
+install_gridhome()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  local oracle_home=$2 
+  #echo "oracle_home=$oracle_home"
+  # Install grid home
+  if [ ! -f ${oracle_home}/gridSetup.sh ]
+  then
+    echo "   ERROR: ${oracle_home}/gridSetup.sh does not exist can not install"
+    exit 1
+  fi
+  sudo su - grid -c "${oracle_home}/gridSetup.sh \
+   -silent \
+   -waitForCompletion \
+   oracle.install.option=CRS_SWONLY \
+   ORACLE_BASE=/u01/app/grid \
+   INVENTORY_LOCATION=/u01/app/oraInventory \
+   oracle.install.crs.config.clusterNodes=${nordea_cluster_nodes_comma} \
+   oracle.install.asm.OSDBA=asmdba \
+   oracle.install.asm.OSOPER=asmoper \
+   oracle.install.asm.OSASM=asmadmin"
+  # Should i do this
+  sudo su - grid -c "${oracle_home}/oui/bin/runInstaller -silent -updateNodeList ORACLE_HOME=${oracle_home} -defaultHomeName CLUSTER_NODES=\"${nordea_cluster_nodes_comma}\" CRS=TRUE"
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Running commands as root on $node: "
+    sudo_execute_remote $node "/u01/app/oraInventory/orainstRoot.sh" || { echo "   ERROR: /u01/app/oraInventory/orainstRoot.sh failed on ${node}"; exit 1; }
+    # Do that later after configuring
+    #sudo_execute_remote $node "${oracle_home}/root.sh" || { echo "   ERROR: /u01/app/12.2.0.1/grid/root.sh failed on ${node}"; exit 1; }
+  done
+}
+
+install_nordeapackages()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  nordea_packages=$2
+  # Install yum pacakges
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Installing nordea packages on $node: "
+    sudo_execute_remote $node "yum --disablerepo=* --enablerepo=exadata_nordea -y install ${nordea_packages}" || { echo "   ERROR: Failed installing nordea packages on ${node}"; exit 1; }
+  done
+}
+
+deinstall_nordeapackages()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  nordea_packages=$2
+  # Deinstall yum packages
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Deinstalling nordea packages on $node: "
+    sudo_execute_remote $node "yum --disablerepo=* --enablerepo=exadata_nordea clean all" || { echo "   ERROR: Failed cleaning yum on ${node}"; exit 1; }
+    sudo_execute_remote $node "yum --disablerepo=* --enablerepo=exadata_nordea -y remove ${nordea_packages}" || { echo "   ERROR: Failed deinstalling nordea packages on ${node}"; exit 1; }
+  done
+}
+
+update_nordeapackages()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  nordea_packages=$2
+  # Install yum packages
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Updating nordea packages on $node: "
+    sudo_execute_remote $node "yum --disablerepo=* --enablerepo=exadata_nordea clean all" || { echo "   ERROR: Failed cleaning yum on ${node}"; exit 1; }
+    sudo_execute_remote $node "yum --disablerepo=* --enablerepo=exadata_nordea -y update ${nordea_packages}" || { echo "   ERROR: Failed updating nordea packages on ${node}"; exit 1; }
+  done
+}
+
+reinstall_nordeapackages()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  nordea_packages=$2
+  # Install yum packages
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Renstalling nordea packages on $node: "
+    sudo_execute_remote $node "yum --disablerepo=* --enablerepo=exadata_nordea clean all" || { echo "   ERROR: Failed cleaning yum on ${node}"; exit 1; }
+    sudo_execute_remote $node "yum --disablerepo=* --enablerepo=exadata_nordea -y reinstall ${nordea_packages}" || { echo "   ERROR: Failed reinstalling nordea packages on ${node}"; exit 1; }
+  done
+}
+
+# Find Grid Home - complicated as we can't assume in the future /etc/oratab will have an ASM entry
+find_grid_home()
+{
+  # Where is the file that tells us where the oracle inventory is 
+  local ORAINST_LOC="/etc/oraInst.loc"
+  # If the file is there we can try to find the ASM home
+  if [ -f $ORAINST_LOC ]
+  then
+    # Look up the oracle inventory location
+    local ORAINVENTORY_LOCATION=`cat $ORAINST_LOC 2>>/dev/null | sed -n -e 's/inventory_loc=\(.*\)/\1/p' 2>>/dev/null`
+    if [ "$ORAINVENTORY_LOCATION" != "" ]
+    then
+      # If we wound the oracle inventory location look for grid home by looking for OraGI name 
+      GRID_HOME=`grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null | sed -n -e '/<HOME NAME=.*CRS="true"/s/.*LOC=\"\([^\"]*\)\".*CRS="true".*/\1/p' 2>>/dev/null`
+    fi
+  fi
+  if [ "$GRID_HOME" != "" ]
+  then
+    echo "$GRID_HOME"
+  fi
+}
+
+
+find_mgmtdb_run_node()
+{
+  local grid_home=$(find_grid_home)
+  # Now find owner of grid home
+  local LISTENER_ORA_OWNER=`stat -c "%U" "${grid_home}/network/admin/listener.ora"`
+  if [ "$USER" == "$LISTENER_ORA_OWNER" ]
+  then
+    # We are using the same userj ust do the stuff
+    node_selected=$(export ORACLE_HOME=$grid_home;$grid_home/bin/srvctl status mgmtdb  | sed -n "s/^Instance.*is running.*on node \(.*\)/\1/p"| head -1)
+  else
+    # If another user - then use sudo
+    node_selected=$(sudo su -  $LISTENER_ORA_OWNER -c "$grid_home/bin/srvctl status mgmtdb" | sed -n "s/^Instance.*is running.*on node \(.*\)/\1/p"| head -1)
+  fi
+  # First find a first node where it exists
+  echo "$node_selected"
+}
+
+find_mgmtdb_run_sid()
+{
+  local grid_home=$(find_grid_home)
+  # Now find owner of grid home
+  local LISTENER_ORA_OWNER=`stat -c "%U" "${grid_home}/network/admin/listener.ora"`
+  if [ "$USER" == "$LISTENER_ORA_OWNER" ]
+  then
+    # We are using the same userj ust do the stuff
+    # First find a first node where it exists
+    sid_selected=$(export ORACLE_HOME=$grid_home;$grid_home/bin/srvctl status mgmtdb  | sed -n "s/^Instance \(.*\) is running.*/\1/p"| head -1)
+  else
+    # If another user - then use sudo
+    sid_selected=$(sudo su - $LISTENER_ORA_OWNER -c "$grid_home/bin/srvctl status mgmtdb" | sed -n "s/^Instance \(.*\) is running.*/\1/p"| head -1)
+  fi
+  echo "$sid_selected"
+}
+
+find_asm_run_node()
+{
+  local grid_home=$(find_grid_home)
+  # Now find owner of grid home
+  local LISTENER_ORA_OWNER=`stat -c "%U" "${grid_home}/network/admin/listener.ora"`
+  # First find a first node where it exists
+  node_selected=$(sudo su - $LISTENER_ORA_OWNER -c "export ORACLE_HOME=$grid_home;$grid_home/bin/srvctl status asm -detail "  | sed -n "s/^ASM instance \([^ ]*\) is running on node \(.*\)/\2/p"| head -1)
+  echo "$node_selected"
+}
+
+find_asm_run_sid()
+{
+  local grid_home=$(find_grid_home)
+  # Now find owner of grid home
+  local LISTENER_ORA_OWNER=`stat -c "%U" "${grid_home}/network/admin/listener.ora"`
+  # First find a first node where it exists
+  sid_selected=$(sudo su - $LISTENER_ORA_OWNER -c "export ORACLE_HOME=$grid_home;$grid_home/bin/srvctl status asm -detail "  | sed -n "s/^ASM instance \([^ ]*\) is running on node \(.*\)/\1/p"| head -1)
+  echo "$sid_selected"
+}
+
+
+resize_datafiles_mgmtdb_sql="alter session set container=GIMR_DSCREP_10;
+set serveroutput on
+BEGIN
+  for r_fix_datafile in ( SELECT 'alter database datafile '''||file_name||'''   resize 16G' fix_sql
+    FROM dba_data_files 
+    WHERE tablespace_name = 'SYSMGMTDATACHAFIX'
+    union
+    SELECT 'alter database datafile '''||file_name||'''   resize 8G' fix_sql
+    FROM dba_data_files 
+    WHERE tablespace_name = 'SYSMGMTDATA'
+    union
+    SELECT 'alter database datafile '''||file_name||'''   resize 24G' fix_sql
+    FROM dba_data_files 
+    WHERE tablespace_name = 'SYSMGMTDATADB')
+loop
+  dbms_output.put_line('Line to execute:'||r_fix_datafile.fix_sql);
+  DECLARE
+    data_beyond_resize EXCEPTION;
+    PRAGMA EXCEPTION_INIT(data_beyond_resize, -3297);
+  begin
+    execute immediate r_fix_datafile.fix_sql;
+  exception
+    when data_beyond_resize THEN
+      -- Ignore
+      NULL;
+  end;
+end loop;
+END;
+/
+"
+
+
+configure_mgmtdb()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  local mgmtdb_run_node=""
+  local mgmtdb_run_sid="" 
+  local txtresult=""
+  mgmtdb_run_node=$(find_mgmtdb_run_node)
+  mgmtdb_run_sid=$(find_mgmtdb_run_sid)
+  local grid_home=$(find_grid_home)
+  # Now find owner of grid home
+  local LISTENER_ORA_OWNER=`stat -c "%U" "${grid_home}/network/admin/listener.ora"`
+  txtresult=$(ssh -o 'StrictHostKeyChecking no' $mgmtdb_run_node "sudo su - $LISTENER_ORA_OWNER -c \"export ORACLE_HOME=$grid_home;export ORACLE_SID=$mgmtdb_run_sid; echo \\\"${resize_datafiles_mgmtdb_sql}\\\" | $grid_home/bin/sqlplus -S / as sysdba\"")
+  echo "$txtresult"
+}
+
+
+asm_configure_sql="set serveroutput on
+alter system set max_dump_file_size=\\\\\\\"1G\\\\\\\" scope=both;
+"
+
+configure_asm()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1
+  local asm_run_node=""
+  local asm_run_sid="" 
+  local txtresult=""
+  asm_run_node=$(find_asm_run_node)
+  asm_run_sid=$(find_asm_run_sid)
+  local grid_home=$(find_grid_home)
+  # Now find owner of grid home
+  local LISTENER_ORA_OWNER=`stat -c "%U" "${grid_home}/network/admin/listener.ora"`
+  echo "asm_run_node=$asm_run_node"
+  echo "asm_run_sid=$asm_run_sid"
+  txtresult=$(ssh -o 'StrictHostKeyChecking no' $asm_run_node "sudo su - $LISTENER_ORA_OWNER -c \"export ORACLE_HOME=$grid_home;export ORACLE_SID=$asm_run_sid; echo \\\"${asm_configure_sql}\\\" | $grid_home/bin/sqlplus -S / as sysasm\"")
+  echo "$txtresult"
+}
+
+
+configure_emagent()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  local nodes_in_cluster=$1 
+  # Loop over hosts
+  for node in $nodes_in_cluster
+  do
+    echo "    INFO: Configuring Enterprise Manager agent on $node: "
+    # Get list of agent homes 
+    GC_HOME_LIST=$(sudo_execute_remote $node "cat /etc/oragchomelist | sed -e \"s/.*:\(.*\)/\1/\"") || { echo "   ERROR: Failed finding Agent Homes on ${node}"; exit 1; }
+    for gc_home in $GC_HOME_LIST
+    do
+      # Change memory setting
+      sudo_execute_remote $node "su - emagent -c \"${gc_home}/bin/emctl setproperty agent -name 'agentJavaDefines' -value '-Xmx1024M -XX:MaxPermSize=128M' \"" || { echo "   ERROR: Failed changing  agentJavaDefines in ${gc_home} on ${node}"; exit 1; }
+      # Change MaxInComingConnections (Doc ID 1546529.1)
+      sudo_execute_remote $node "su - emagent -c \"${gc_home}/bin/emctl setproperty agent -allow_new -name 'MaxInComingConnections' -value '150' \"" || { echo "   ERROR: Failed changing MaxInComingConnections in ${gc_home} on ${node}"; exit 1; }
+      # Change MaxInComingConnections (Doc ID 2006195.1)
+      sudo_execute_remote $node "su - emagent -c \"${gc_home}/bin/emctl setproperty agent -name 'MaxThreads' -value '250' \"" || { echo "   ERROR: Failed changing MaxThreads in ${gc_home} on ${node}"; exit 1; }
+      # skip this as I'm not sure emctl setproperty agent -allow_new -name _cancelThread  -value 210
+      # Restart agent
+      sudo_execute_remote $node "su - emagent -c \"${gc_home}/bin/emctl stop agent\"" || { echo "   ERROR: Failed stoping agent in ${gc_home} on ${node}"; exit 1; }
+      sudo_execute_remote $node "su - emagent -c \"${gc_home}/bin/emctl start agent\"" || { echo "   ERROR: Failed starting agent in ${gc_home} on ${node}"; exit 1; }
+    done
+    echo "    INFO: Modify emagent user on $node to be able to read diag data: "
+    sudo_execute_remote $node "usermod -a -G asmadmin emagent"  && echo -n "asmadmin_grant " || { echo -e "\n ERROR: Can't modify emagent user on ${node} to be able to read diag data."; exit 1; }
+  done
+}
+
+write_usage()
+{
+  echo "$0 is reponsible for the very initial bootstraping of an Exadata"
+  echo "\"$0 configure ssh\" should be first command to run as that registers"
+  echo "the nodes in the cluster."
+  echo "The second command to run should be remaining should be run in the order shown to be sure things work"  
+  echo "\"$0 set environment ssh\" should be next command to run as that registers"
+  echo "environment type in $NORDEA_ENVIRONMENT_FILE"
+  echo ""
+  echo "The command should only be executed on the first database node."
+  echo ""
+  echo "A number of extra commands are shown below the list. These can be used"
+  echo "under the right circumstances."
+  echo ""
+  echo "Normal install sequence for steps to run before installation of Oracle Software"
+  echo "   $script_name configure ssh --clusternodes=\"node1 node2 ...nodex\""
+  echo "   $script_name set environment --environment <[prod|preprod|test|dev]> --availabilityLevel <bca|ha> [--forcelocalnode]"
+  echo "   $script_name check linux"
+  echo "   $script_name configure crash"
+  echo "   $script_name update hostfile [--ignoreadm] [--ifpriv1name <if name> --ifpriv2name <if name>] # default is --ifpriv1name ${ETH_PRIV1} and --ifpriv2name ${ETH_PRIV2}"
+  echo "   $script_name lock bashprofile"
+  echo "   $script_name configure tmpfs"
+  echo "   $script_name install securitylimits"
+  echo "   $script_name configure sysctl"
+  echo "   $script_name configure memory [--hugepagespercent <number>] [--forcelocalnode] # default is ${HUGE_PAGES_TO_ALLOCATE_PERCENT}"
+  echo "   $script_name partition asmdisks --ocrssize <size string> --datasize <size string>  --recosize <size string> [--forcerepartition]"
+  echo "   $script_name prepare u01 --oraclehome <grid oracle home>"
+  echo "   $script_name configure userssh --user <user name> # first for grid and then oracle user"
+  echo "   $script_name configure yum"
+  echo "Now install some nordea packages to get going  see installation manual"
+  echo "Now manually download golden image grid software to /u01/software (ensure grid and oracle can read/write file)"
+  echo "and prepare a grid home (see intsallation manual)"
+  echo "   $script_name install cvuqdisk --oraclehome <grid oracle home>" 
+  echo "   $script_name install gridhome --oraclehome <grid oracle home>" 
+  echo "   $script_name label asmdisks --oraclehome <grid oracle home>"
+  echo "Now run gridSetup.sh according to installation manual"
+  echo "Normal install sequence for steps to run after installation of Oracle Grid Software"
+  echo "   $script_name configure asm"
+  echo "   $script_name configure mgmtdb"  
+  echo "   $script_name protect listener"  
+  echo "   $script_name configure sqlnetora"
+  echo "   $script_name create clustershare --diskgroupmatch <some string that should be part of ASM disk group>"
+  echo "   $script_name create diag --diskgroupmatch <some string that should be part of ASM disk group>"
+  echo "   $script_name install nordeapackages [--packages=\"package1 package2 ...\"]" 
+  echo "   $script_name configure network"
+  echo "   $script_name add route --device <ip device name> --networkAddress <network address> --gateway <ip of gateway>"
+  echo "   $script_name install ahf"
+  echo ""
+  echo "Normal install sequence for steps to run after installation of Oracle Agent Software"
+  echo "   $script_name configure emagent"
+  echo ""
+  echo "To enable ogg to be installed - normally only used on GG SOP Setup"
+  echo "   $script_name setup ogg"
+  echo ""
+  echo "To enable uc4oracleproxy to be installed"
+  echo "   $script_name setup uc4oracleproxy"
+  echo ""
+  echo "Various verification/check scripts"
+  echo "   $script_name verify ssh [--user <user name>]"
+  echo "   $script_name show memory [--hugepagespercent <number>] # default is ${HUGE_PAGES_TO_ALLOCATE_PERCENT}"
+  echo "   $script_name show disksreport"
+  echo "   $script_name --help"
+  echo "   $script_name reinstall nordeapackages [--packages=\"package1 package2 ...\"]"  
+  echo "   $script_name update nordeapackages [--packages=\"package1 package2 ...\"]"
+  echo ""
+  echo "Various deinstall scripts - be carefull"
+  echo "   $script_name unconfigure ssh"
+  echo "   $script_name drop clustershare"  
+  echo "   $script_name drop diag"  
+  echo "   $script_name deinstall nordeapackages [--packages=\"package1 package2 ...\"]"
+  echo "   $script_name deinstall ahf"
+  echo ""
+  #echo "  NODEOPTIONS = [--forcelocalnode]"
+
+}
+
+#
+# Purpose: Check if we have sudo access as root
+#
+check_for_root_sudo()
+{
+  sudo -A -l /bin/su - >/dev/null 2>&1
+  if [ -$? -ne 0 ]
+  then
+    echo "   ERROR: No access rights. Need to be able to sudo to root (sudo su -)"
+    exit 1
+  fi
+}
+
+#
+# Purpose: Will check if string argument 1 is in argument2
+# Arguments: The section part to print
+# Return: 0 if ok 1 otherwise
+#
+string_contain()
+{
+  [ -z "${2##*$1*}" ] && [ -z "$1" -o -n "$2" ]
+}
+
+#
+# handle_request
+#
+# Purpose: handles the request after arguments have been analyzed checked
+#
+handle_request()
+{
+  case $OBJECT in
+    route)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        add)
+          add_route "$nordea_cluster_nodes" "$INPUT_DEVICE" "$INPUT_NETWORK_ADDRESS" "$INPUT_GATEWAY" ;;
+      esac  
+      ;;  
+    network)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_network "$nordea_cluster_nodes"  ;;
+      esac  
+      ;;   
+    crash)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_crash "$nordea_cluster_nodes"  ;;
+      esac  
+      ;;   
+    mgmtdb)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_mgmtdb "$nordea_cluster_nodes";;
+      esac  
+      ;;  
+    asm)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_asm "$nordea_cluster_nodes";;
+      esac  
+      ;;  
+    bashprofile)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        lock)
+          lock_bashprofile "$nordea_cluster_nodes" ;;
+      esac  
+      ;;
+    ahf)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        install)
+          install_ahf "$nordea_cluster_nodes";;
+        deinstall)
+          deinstall_ahf "$nordea_cluster_nodes";;
+      esac  
+      ;; 
+    nordeapackages)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        install)
+          install_nordeapackages "$nordea_cluster_nodes" "$NORDEA_PACKAGES";;
+        deinstall)
+          deinstall_nordeapackages "$nordea_cluster_nodes" "$NORDEA_PACKAGES";;
+        reinstall)
+          reinstall_nordeapackages "$nordea_cluster_nodes" "$NORDEA_PACKAGES";;
+        update)
+          update_nordeapackages "$nordea_cluster_nodes" "$NORDEA_PACKAGES";;
+      esac  
+      ;;       
+    gridhome)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        install)
+          install_gridhome "$nordea_cluster_nodes" "$INPUT_ORACLE_HOME";;
+      esac  
+      ;;  
+    listener)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        protect)
+          protect_listener "$nordea_cluster_nodes" ;;
+      esac  
+      ;;  
+    sqlnetora)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_sqlnetora "$nordea_cluster_nodes" ;;
+      esac  
+      ;;  
+    cvuqdisk)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        install)
+          install_cvuqdisk "$nordea_cluster_nodes" "$INPUT_ORACLE_HOME";;
+      esac  
+      ;;  
+    environment)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        set)
+          set_environment "$nordea_environment_type" "$nordea_availability_level" "$nordea_cluster_nodes";;
+        unset)
+          unset_environment "$nordea_cluster_nodes"         
+      esac  
+      ;;  
+    ssh)
+      case $ACTION in
+        configure)
+          configure_ssh "$CLUSTER_NODES";;
+        unconfigure)
+          unconfigure_ssh "$nordea_cluster_nodes";;
+        verify)
+          verify_ssh "$nordea_cluster_nodes" "$INPUT_USER";;
+      esac  
+      ;;
+    uc4oracleproxy)
+      check_ssh
+      case $ACTION in
+        setup)
+          setup_uc4oracleproxy "$nordea_cluster_nodes";;
+      esac  
+      ;;      
+    ogg)
+      check_ssh
+      case $ACTION in
+        setup)
+          setup_ogg "$nordea_cluster_nodes";;
+      esac  
+      ;;      
+    linux)
+      check_ssh
+      case $ACTION in
+        check)
+          check_linux "$nordea_cluster_nodes";;
+      esac  
+      ;;
+    securitylimits)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        install)
+          install_securitylimits "$nordea_cluster_nodes";;
+      esac  
+      ;;
+    diskreport)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        show)
+          show_diskreport "$nordea_cluster_nodes";;
+      esac  
+      ;;
+    hostfile)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        update)
+          update_hostfile "$ETH_PRIV1" "$ETH_PRIV2" "$nordea_cluster_nodes" "$IGNORE_ADM";;
+      esac  
+      ;;
+    tmpfs)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_tmpfs "$nordea_cluster_nodes";;
+      esac  
+      ;;
+    u01)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        prepare)
+          prepare_u01 "$nordea_cluster_nodes" "$INPUT_ORACLE_HOME";;
+      esac  
+      ;;
+    sysctl)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_sysctl "$nordea_cluster_nodes";;
+      esac  
+      ;;
+    yum)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_yum "$nordea_cluster_nodes";;
+      esac  
+      ;;
+    userssh)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_userssh "$INPUT_USER" "$nordea_cluster_nodes";;
+      esac  
+      ;;
+    memory)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_memory "${HUGE_PAGES_TO_ALLOCATE_PERCENT}" "$nordea_cluster_nodes";;
+        show)
+          show_memory "${HUGE_PAGES_TO_ALLOCATE_PERCENT}" "$nordea_cluster_nodes";;
+      esac
+      ;;
+    clustershare)
+      check_ssh  "$nordea_cluster_nodes"
+      case $ACTION in
+        create)
+          create_clustershare "$disk_group_match";;
+        drop)
+          drop_clustershare;;
+      esac  
+      ;;
+    diag)
+      check_ssh  "$nordea_cluster_nodes"
+      case $ACTION in
+        create)
+          create_diag "$disk_group_match";;
+        drop)
+          drop_diag;;
+      esac  
+      ;;
+    asmdisks)
+      check_ssh  "$nordea_cluster_nodes"
+      case $ACTION in
+        partition)
+          partition_asmdisks "$OCRS_SIZE" "$DATA_SIZE" "$RECO_SIZE" "$FORCE_REPARTITION" "$nordea_cluster_nodes";;
+        label)
+          label_asmdisks "$nordea_cluster_nodes" "$INPUT_ORACLE_HOME";;
+      esac  
+      ;;   
+    emagent)
+      check_ssh "$nordea_cluster_nodes"
+      case $ACTION in
+        configure)
+          configure_emagent "$nordea_cluster_nodes";;
+      esac  
+      ;;
+    *)
+      echo "   ERROR: $OBJECT not handled - internal error"
+      exit 1
+      ;;              
+  esac
+}
+
+
+#
+# parse_arguments
+#
+# Purpose: Parses all the arguments received on command line
+# first argument is always action and second is component/object
+#
+parse_arguments()
+{
+  if [ $# -eq 0 ]
+  then
+    write_usage
+    exit
+  fi
+  # First check action is one we know off
+  VALID_ACTION_LIST="add lock setup protect label prepare partition update create drop set unset check check configure install deinstall reinstall update unconfigure show verify -h --help "
+  if string_contain "$1 " "$VALID_ACTION_LIST"
+  then
+    ACTION=$1
+  else
+    echo "   ERROR: Action parameter \"$1\" given to script not recognized"
+    exit 1
+  fi
+  if [ "$ACTION" = "-h" -o "$ACTION" = "--help" ]
+  then
+    write_usage
+    exit
+  fi
+  shift
+  if [ $# -eq 0 ]
+  then
+    echo "   ERROR: Action parameter \"$ACTION\" given to script needs to be followed by an object"
+    exit 1
+  fi
+  # Depending on action various objects might be specified
+  case $1 in
+    crash) OBJECT="crash";VALID_ACTION_LIST="configure ";;
+    network) OBJECT="network";VALID_ACTION_LIST="configure ";;
+    asm) OBJECT="asm";VALID_ACTION_LIST="configure ";;
+    mgmtdb) OBJECT="mgmtdb";VALID_ACTION_LIST="configure ";;
+    bashprofile) OBJECT="bashprofile";VALID_ACTION_LIST="lock ";;
+    nordeapackages) OBJECT="nordeapackages";VALID_ACTION_LIST="install deinstall update reinstall ";;
+    ahf) OBJECT="ahf";VALID_ACTION_LIST="install deinstall ";;
+    ogg) OBJECT="ogg";VALID_ACTION_LIST="setup ";;
+    uc4oracleproxy) OBJECT="uc4oracleproxy";VALID_ACTION_LIST="setup ";;
+    u01) OBJECT="u01";VALID_ACTION_LIST="prepare ";;
+    listener) OBJECT="listener";VALID_ACTION_LIST="protect ";;
+    sqlnetora) OBJECT="sqlnetora";VALID_ACTION_LIST="configure ";;
+    sysctl) OBJECT="sysctl";VALID_ACTION_LIST="configure ";;
+    cvuqdisk) OBJECT="cvuqdisk";VALID_ACTION_LIST="install ";;
+    gridhome) OBJECT="gridhome";VALID_ACTION_LIST="install ";;
+    securitylimits) OBJECT="securitylimits";VALID_ACTION_LIST="install ";;
+    asmdisks) OBJECT="asmdisks";VALID_ACTION_LIST="partition label ";;
+    diskreport) OBJECT="diskreport";VALID_ACTION_LIST="show ";;
+    linux) OBJECT="linux";VALID_ACTION_LIST="check ";;
+    tmpfs) OBJECT="tmpfs";VALID_ACTION_LIST="configure ";;
+    hostfile) OBJECT="hostfile";VALID_ACTION_LIST="update ";;
+    environment) OBJECT="environment";VALID_ACTION_LIST="set unset ";;
+    ssh) OBJECT="ssh";VALID_ACTION_LIST="configure unconfigure verify ";;
+    yum) OBJECT="yum";VALID_ACTION_LIST="configure ";;
+    userssh) OBJECT="userssh";VALID_ACTION_LIST="configure ";;
+    memory) OBJECT="memory";VALID_ACTION_LIST="configure show ";;  
+    clustershare) OBJECT="clustershare";VALID_ACTION_LIST="create drop ";;
+    diag) OBJECT="diag";VALID_ACTION_LIST="create drop ";;
+    emagent) OBJECT="emagent";VALID_ACTION_LIST="configure ";;
+    route) OBJECT="route";VALID_ACTION_LIST="add ";;   
+    *)            echo "   ERROR: Object parameter $1 given to script not recognized";exit 1;;
+  esac;
+  shift
+  # first check if we support combination
+  if ! string_contain  "$ACTION " "$VALID_ACTION_LIST" 
+  then
+    echo "   ERROR: The action \"$ACTION\" is not not supported for object \"$OBJECT\". Actions allowed is \"$VALID_ACTION_LIST\""
+    exit 1
+  fi
+  # Now we checked that combination of object/action is valid
+  # Now we for each action/object checks the parameters, we use getopt for that in case there are some parameters
+  #echo ">${OBJECT}<"
+  case $OBJECT in
+    route)
+      case $ACTION in
+        add)
+          #set -x
+          TEMP=`getopt -o "" --name "$0" --long device:,networkAddress:,gateway: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --device) INPUT_DEVICE="$2";shift 2;;        
+              --networkAddress) INPUT_NETWORK_ADDRESS="$2";shift 2;;        
+              --gateway) INPUT_GATEWAY="$2";shift 2;;        
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$INPUT_DEVICE" == "" ]
+          then
+            echo "   ERROR: --device needs to be specified"
+            exit 1
+          fi   
+          if [ "$INPUT_NETWORK_ADDRESS" == "" ]
+          then
+            echo "   ERROR: --networkAddress needs to be specified"
+            exit 1
+          fi   
+          #if [ "$INPUT_GATEWAY" == "" ]
+          #then
+          #  echo "   ERROR: --gateway needs to be specified"
+          #  exit 1
+          #fi   
+          #set +x
+          ;;
+      esac;; 
+    network)
+      case $ACTION in
+        configure)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;;
+    crash)
+      case $ACTION in
+        configure)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;;
+    mgmtdb)
+      case $ACTION in
+        configure)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;; 
+    asm)
+      case $ACTION in
+        configure)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;; 
+    ahf)
+      case $ACTION in
+        install|deinstall)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;; 
+    bashprofile)
+      case $ACTION in
+        lock)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;; 
+    uc4oracleproxy)
+      case $ACTION in
+        setup)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;; 
+    ogg)
+      case $ACTION in
+        setup)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;;    
+    emagent)
+      case $ACTION in
+        configure)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+         ;;
+      esac;;
+    ssh)
+      case $ACTION in
+        configure)      
+          TEMP=`getopt -o "" --name "$0" --long clusternodes: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --clusternodes) CLUSTER_NODES="$2";shift 2;;        
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$CLUSTER_NODES" == "" ]
+          then
+            echo "   ERROR: --clusternodes needs to be specified"
+            exit 1
+          fi
+          if [ "$nordea_cluster_nodes" != "" ]
+          then
+            echo "   ERROR: Cluster nodes already set"
+            exit 1    
+          fi  
+          ;;
+        unconfigure)      
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+        verify)      
+          TEMP=`getopt -o "" --name "$0" --long user: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --user) INPUT_USER="$2";shift 2;;        
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;
+    userssh)
+      case $ACTION in
+        configure)      
+          TEMP=`getopt -o "" --name "$0" --long user: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --user) INPUT_USER="$2";shift 2;;        
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$INPUT_USER" == "" ]
+          then
+            echo "   ERROR: --user needs to be specified"
+            exit 1
+          fi
+          ;;
+      esac;;    
+    tmpfs)
+      case $ACTION in
+        configure)
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;    
+    u01)
+      case $ACTION in
+        prepare)
+          TEMP=`getopt -o "" --name "$0" --long oraclehome: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+              --oraclehome) INPUT_ORACLE_HOME="$2";shift 2;; 
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$INPUT_ORACLE_HOME" == "" ]
+          then
+            echo "   ERROR: --oraclehome needs to be specified"
+            exit 1
+          fi
+          if ! [[ "$INPUT_ORACLE_HOME" =~ ^/u01/app/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/grid$ ]]
+          then
+            echo "   ERROR: --oraclehome needs to be something like /u01/app/<number>.<number>.<number>.<number>/grid"
+            echo "          f.x. /u01/app/19.11.0.0/grid"
+            exit 1
+          fi
+          ;;
+      esac;;    
+    listener)
+      case $ACTION in
+        protect)
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;  
+    sqlnetora)
+      case $ACTION in
+        configure)
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;  
+    gridhome)
+      case $ACTION in
+        install)
+          TEMP=`getopt -o "" --name "$0" --long oraclehome: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --oraclehome) INPUT_ORACLE_HOME="$2";shift 2;;        
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$INPUT_ORACLE_HOME" == "" ]
+          then
+            echo "   ERROR: --oraclehome needs to be specified"
+            exit 1
+          fi
+          ;;
+      esac;;    
+    cvuqdisk)
+      case $ACTION in
+        install)
+          TEMP=`getopt -o "" --name "$0" --long oraclehome: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --oraclehome) INPUT_ORACLE_HOME="$2";shift 2;;        
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$INPUT_ORACLE_HOME" == "" ]
+          then
+            echo "   ERROR: --oraclehome needs to be specified"
+            exit 1
+          fi
+          ;;
+      esac;;    
+    nordeapackages)
+      case $ACTION in
+        install|deinstall|update|reinstall)
+          #set -x
+          TEMP=`getopt -o "" --name "$0" --long packages: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --packages) NORDEA_PACKAGES="$2";shift 2;;        
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          #set +x
+          ;;
+      esac;;    
+    sysctl)
+      case $ACTION in
+        configure)
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;    
+    hostfile)
+      case $ACTION in
+        update)
+          TEMP=`getopt -o "" --name "$0" --long ifpriv1name:,ifpriv2name:,ignoreadm -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --ignoreadm) IGNORE_ADM="YES";shift 1;;  
+              --ifpriv1name) ETH_PRIV1="$2";shift 2;;  
+              --ifpriv2name) ETH_PRIV2="$2";shift 2;;  
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;    
+    securitylimits)
+      case $ACTION in
+        install)
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;    
+    asmdisks)
+      case $ACTION in
+        label)
+          TEMP=`getopt -o "" --name "$0" --long oraclehome: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --oraclehome) INPUT_ORACLE_HOME="$2";shift 2;;        
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$INPUT_ORACLE_HOME" == "" ]
+          then
+            echo "   ERROR: --oraclehome needs to be specified"
+            exit 1
+          fi          ;;
+        partition)
+          TEMP=`getopt -o "" --name "$0" --long ocrssize:,datasize:,recosize:,forcerepartition -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --forcerepartition) FORCE_REPARTITION="YES";shift;;  
+              --ocrssize) OCRS_SIZE="$2";shift 2;;  
+              --datasize) DATA_SIZE="$2";shift 2;;  
+              --recosize) RECO_SIZE="$2";shift 2;;  
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$OCRS_SIZE" = "" ]
+          then
+            echo "   ERROR: --ocrssize needs to be specified"
+            exit 1
+          fi          
+          if [ "$DATA_SIZE" = "" ]
+          then
+            echo "   ERROR: --datasize needs to be specified"
+            exit 1
+          fi          
+          if [ "$RECO_SIZE" = "" ]
+          then
+            echo "   ERROR: --recosize needs to be specified"
+            exit 1
+          fi          
+          ;;
+      esac;;    
+    diskreport)
+      case $ACTION in
+        show)
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;    
+    linux)
+      case $ACTION in
+        check)
+          TEMP=`getopt -o "" --name "$0" --long forcelocalnode -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+              --forcelocalnode) runon_forcelocalnode="YES";shift;;        
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;    
+    yum)
+      case $ACTION in
+        configure)
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;    
+    environment)
+      case $ACTION in
+        set)
+          TEMP=`getopt -o "" --name "$0" --long environment:,availabilityLevel:,forcelocalnode -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --forcelocalnode) runon_forcelocalnode="YES";shift;;        
+              --availabilityLevel) nordea_availability_level=$2; shift 2
+                case $nordea_availability_level in
+                ha|bca)
+                  :
+                  ;;
+                *)
+                  echo "   ERROR: Parameter --availabilityLevel should be one of ha or bca";exit 1;;
+                esac
+                ;;
+              --environment) nordea_environment_type=$2; shift 2
+                case $nordea_environment_type in
+                prod)
+                  nordea_yum_server="isl-olpr1p.oneadr.net"
+                  ;;
+                preprod)
+                  nordea_yum_server="isl-olpr1t.oneadr.net"
+                  ;;
+                test)
+                  nordea_yum_server="isl-olpr1t.oneadr.net"
+                  ;;
+                dev)
+                  nordea_yum_server="isl-olpr1t.oneadr.net"
+                  ;;
+                *)
+                  echo "   ERROR: Parameter --environment should be one of prod, test or dev";exit 1;;
+                esac
+                ;;
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$nordea_environment_type" == "" ]
+          then
+            echo "   ERROR: --environment needs to be specified"
+            exit 1
+          fi
+          if [ "$nordea_availability_level" == "" ]
+          then
+            echo "   ERROR: --availabilityLevel needs to be specified"
+            exit 1
+          fi
+          ;;
+      esac;;
+    clustershare|diag)
+      case $ACTION in
+        create)
+          TEMP=`getopt -o "" --name "$0" --long diskgroupmatch: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --diskgroupmatch) disk_group_match=$2; shift 2
+                ;;
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$disk_group_match" == "" ]
+          then
+            echo "   ERROR: --diskgroupmatch needs to be specified"
+            exit 1
+          fi        
+          ;;
+        drop)
+          TEMP=`getopt -o "" --name "$0" -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;         
+      esac;;
+    memory)
+      case $ACTION in
+        configure|show)
+          TEMP=`getopt -o "" --name "$0" --long hugepagespercent: -- "$@"` || { echo "   ERROR: parameter error!" ; exit 1; }
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --hugepagespercent) HUGE_PAGES_TO_ALLOCATE_PERCENT=$2; shift 2
+                ;;
+              --) shift ; break ;;
+               *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$HUGE_PAGES_TO_ALLOCATE_PERCENT" == "" ]
+          then
+            echo "   ERROR: --size needs to be specified"
+            exit 1
+          fi
+          ;;
+      esac;;      
+    *)
+      echo "   ERROR: $OBJECT not handled - internal error"
+      exit 1
+      ;;        
+  esac
+  if ([[ "$nordea_cluster_nodes" = "" && ( "$ACTION" != "configure" || "$OBJECT" != "ssh" ) ]])
+  then
+    echo "   ERROR: Cluster nodes not set. Run \"$script_name configure ssh\""
+    exit 1
+  fi
+  if [ "$nordea_environment_type" = "" -a "$nordea_cluster_nodes" != "" -a "$OBJECT" != "ssh" ]
+  then
+    echo "   ERROR: Environment not set. Run \"$script_name set environment\""
+    exit 1    
+  fi
+}
+
+# Script really starts here
+check_for_root_sudo
+# If we have not create patchtmp set that as the only allowed option
+# check configuration file is there and load it if it is
+if [ -f ${NORDEA_ENVIRONMENT_FILE} ]
+then
+  source ${NORDEA_ENVIRONMENT_FILE}
+fi
+# Parse arguments (and check)
+parse_arguments "$@"
+# Generate comma list of clusternodes
+for node in $nordea_cluster_nodes
+do
+  if [ "$nordea_cluster_nodes_comma" = "" ]
+  then
+    nordea_cluster_nodes_comma="$node"
+  else
+    nordea_cluster_nodes_comma="$nordea_cluster_nodes_comma,$node"
+  fi
+done
+# Do the work
+create_empty_sqlite_database || { echo "   ERROR: create_empty_sqlite_database failed"; exit 1; }
+handle_request

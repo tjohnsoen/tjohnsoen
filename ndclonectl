@@ -1,0 +1,829 @@
+#!/bin/bash
+# This script is used to maintain the nordea Oracle Homes
+# 1.0.0   2018-06-28 asger.solvang@nordea.com     Initial version, tested for 12.2 only
+# 1.0.1   2018-12-20 asger.solvang@nordea.com     Better support for building patching homes
+# 1.0.2   2019-05-20 asger.solvang@nordea.com     Addedd setasmgid call just in case we use sql*plus as first startup option - do not work removed
+# 1.0.3   2019-06-20 asger.solvang@nordea.com     Addedd setasmgid call just in case we use sql*plus as first startup option - now works
+# 1.0.4   2019-10-29 asger.solvang@nordea.com     Updated ways we found grid home
+# 1.0.5   2019-10-30 asger.solvang@nordea.com     Will now relink for either rds or udp
+# 1.0.6   2019-11-21 asger.solvang@nordea.com     Moved setasmgid to correct place
+# 1.0.7   2020-09-14 asger.solvang@nordea.com     Changed remove oraclehome to use detach as wee seen issues with the other method
+# 1.0.8   2020-11-06 asger.solvang@nordea.com     Changed from realpath to readlink -m to handle directories missing
+# 1.0.9   2020-11-27 asger.solvang@nordea.com     Reintroduced check of running as oracle user - regression
+
+# Source the common functions
+source /var/lib/ndcommon/ndcommon
+SVERSION="1.0.9"
+# Used for logging timestamps
+now=$(date +"%F_%T")
+echo "   INFO: Script version $SVERSION (${now})"
+script_name=${0##*/}
+#Short host name
+local_short_hostname=${HOSTNAME%%.*}
+# Filename to use for temporary exclude list
+EXCLUDE_LIST=/tmp/excludelist_$$.txt
+# Nordea environment file
+NORDEA_ENVIRONMENT_FILE="/etc/nordea_environment.conf"
+log_file=/dev/null
+get_configuration_parameter()
+{
+  local parameter="$1"
+  grep "^${parameter}=" ${NORDEA_ENVIRONMENT_FILE} >>${log_file} 2>&1 && sed -n "s/^${parameter}[[:space:]]*=[[:space:]]*\(.*\)/\1/p" ${NORDEA_ENVIRONMENT_FILE} || echo ""     
+}
+
+
+clone_oraclehome()
+{  
+  local source_oracle_home=$1
+  local destination_oracle_home=$2
+  #echo "source_oracle_home=$source_oracle_home"
+  #echo "destination_oracle_home=$destination_oracle_home"
+  create_structure_on_nodes "$destination_oracle_home"
+  copy_clone_on_nodes "$source_oracle_home" "$destination_oracle_home"
+  clone_on_nodes "$destination_oracle_home"
+  root_on_nodes $destination_oracle_home  
+  ensure_options_on_nodes "$oracle_home"
+  setasmgid_on_nodes "$oracle_home"
+}
+
+create_oraclehome()
+{
+  local oracle_home=$1
+  local file=$2
+  #echo "oracle_home=$oracle_home"
+  #echo "file=$file"
+  create_structure_on_nodes "$oracle_home"
+  unpack_clone_on_nodes "$oracle_home" "$file"
+  clone_on_nodes "$oracle_home"
+  root_on_nodes "$oracle_home"
+  ensure_options_on_nodes "$oracle_home"
+  setasmgid_on_nodes "$oracle_home"
+}
+remove_oraclehome()
+{
+  local oracle_home=$1
+  #echo "oracle_home=$oracle_home"
+  # Check that the home is not used
+  # Set grid home first
+  GRID_HOME=$(find_grid_home)
+  # Check if we are using Oracle home
+  local DATABASES_FOUND="$($GRID_HOME/bin/srvctl config db -v | grep  "$oracle_home")"
+  if [ "$DATABASES_FOUND" != "" ]
+  then
+    # We found that it's used
+    echo "   ERROR: Oracle Home $oracle_home is being used in below databases - aborting removal"
+    echo "$DATABASES_FOUND"
+    exit 1
+  fi
+  # New way as deinstall fucked up and deleted databases that was not even using the Oracle Home
+  local RAC_NODE
+  for RAC_NODE in $RAC_NODES
+  do
+    echo "  INFO: Detaching Oracle Home on node $RAC_NODE"
+    ssh $RAC_NODE "$oracle_home/oui/bin/runInstaller -silent -detachHome oracle_home=$oracle_home"
+    ssh $RAC_NODE "rm -rf $oracle_home"    
+  done  
+}
+
+create_clonefile()
+{
+  local oracle_home=$1
+  local directory=$2
+  local file=$3
+  local oracle_home_name
+  if [ "$directory" != "" ]
+  then
+    # We need to create a file name
+    oracle_home_name=$(calc_file_name $oracle_home)
+    file="${directory}/${oracle_home_name}.tar.gz"
+  fi
+  create_exclude_list
+  echo "  INFO: Will create $file with clone of Oracle Home in $oracle_home"
+  (cd $oracle_home; tar zcpfX - $EXCLUDE_LIST . > $file)
+  echo "  INFO: Create $file with clone of Oracle Home in $oracle_home"
+}
+
+get_oracle_base()
+{
+  # Assume it's build like /u01/app<user>
+  echo "/u01/app/${USER}"
+}
+
+# CAll with ORACLE_HOME as parameter
+calc_oracle_home_name()
+{
+  #set -x
+  local ORACLE_HOME=$1
+  local NEW_ORACLE_HOME_NAME
+  local TMP_DB_SUBDIR
+  local TMP_REMAIN
+  local TMP_DB_SUB_SUBDIR
+	# We need to constuct the name
+	# Do this by taking the last to directories and remove .
+  TMP_DB_SUBDIR=${ORACLE_HOME##*/}
+  TMP_REMAIN=${ORACLE_HOME%/*}
+  TMP_DB_SUB_SUBDIR=${TMP_REMAIN##*/}
+  NEW_ORACLE_HOME_NAME=${TMP_DB_SUB_SUBDIR}_${TMP_DB_SUBDIR}
+  NEW_ORACLE_HOME_NAME=${NEW_ORACLE_HOME_NAME//./_}
+  NEW_ORACLE_HOME_NAME=${NEW_ORACLE_HOME_NAME// /}
+  #set +x
+  echo $NEW_ORACLE_HOME_NAME
+}
+
+# CAll with ORACLE_HOME as parameter
+calc_file_name()
+{
+  local ORACLE_HOME=$1
+  local NEW_ORACLE_HOME_NAME
+  local TMP_DB_SUBDIR
+  local TMP_REMAIN
+  local TMP_DB_SUB_SUBDIR
+	# We need to constuct the name
+	# Do this by taking the lat to directories and remove .
+  TMP_DB_SUBDIR=${ORACLE_HOME##*/}
+  TMP_REMAIN=${ORACLE_HOME%/*}
+  TMP_DB_SUB_SUBDIR=${TMP_REMAIN##*/}
+  NEW_ORACLE_HOME_NAME=${TMP_DB_SUB_SUBDIR}_${TMP_DB_SUBDIR}
+  #NEW_ORACLE_HOME_NAME=${NEW_ORACLE_HOME_NAME//./}
+  NEW_ORACLE_HOME_NAME=${NEW_ORACLE_HOME_NAME// /}
+  echo $NEW_ORACLE_HOME_NAME
+}
+
+# CAll with file name as parameter to get bacak something like /u01/app/oracle/product/12.2.0.1/db786858a
+calc_oracle_home()
+{
+  local file=$1
+  local NEW_ORACLE_HOME="/u01/app/oracle/product"
+  local TMP_REMAIN
+  local TMP_VERSION
+  local TMP_NAME
+	# We need to constuct the name
+	# Do this by taking the lat to directories and remove .
+	# /tmp/12.2.0.1_db180417a.tar.gz
+	TMP_REMAIN=${file##*/}
+	TMP_VERSION=${TMP_REMAIN%%_*}
+  TMP_REMAIN=${TMP_REMAIN##*_}
+	TMP_NAME=${TMP_REMAIN%%.*}
+	if [ "$TMP_VERSION" = "" -o "$TMP_NAME" = "" ]
+	then
+    exit 1
+  fi
+	NEW_ORACLE_HOME=$NEW_ORACLE_HOME/$TMP_VERSION/$TMP_NAME
+  echo $NEW_ORACLE_HOME
+}
+
+
+
+
+#
+# copy_clone_on_nodes
+#
+# Purpose: Copy software directly on nodes
+copy_clone_on_nodes()
+{
+  local source_oracle_home=$1
+  local destination_oracle_home=$2  
+  local RAC_NODE
+  for RAC_NODE in $RAC_NODES
+  do
+    echo "  INFO: Copying $source_oracle_home to $destination_oracle_home on node $RAC_NODE"
+    ssh $RAC_NODE "cd $destination_oracle_home; cp -r $source_oracle_home/. $destination_oracle_home/"   || { echo "ERROR: Can't copy $source_oracle_home to $destination_oracle_home on node $RAC_NODE" ; exit 1; }
+    ssh $RAC_NODE "find $destination_oracle_home -name \"*.log\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home -name \"*.dbf\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home/rdbms/audit -name \"*.aud\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home -name \"tnsnames.ora\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home -name \"listener.ora\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home -name \"sqlnet.ora\" -exec rm {} \\;" 2>/dev/null
+    for RAC_NODE2 in $RAC_NODES
+    do
+      ssh $RAC_NODE "find $destination_oracle_home -name \"${RAC_NODE2}_*\" -exec rm {} \\;" 2>/dev/null
+    done
+    ssh $RAC_NODE "find $destination_oracle_home/oc4j/j2ee -name \"OC4J_DBConsole_*\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home/dbs -name \"hc_*\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home/dbs -name \"init*\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home/dbs -name \"snapcf*\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home/dbs -name \"orapw*\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home/dbs -name \"dr1*\" -exec rm {} \\;" 2>/dev/null
+    ssh $RAC_NODE "find $destination_oracle_home/dbs -name \"dr2*\" -exec rm {} \\;" 2>/dev/null
+    # Will be recreated by running root.sh
+    #ssh $RAC_NODE "echo \"$destination_oracle_home/bin/nmo\""
+    #ssh $RAC_NODE "echo \"$destination_oracle_home/bin/nmb\""
+    #ssh $RAC_NODE "echo \"$destination_oracle_home/bin/nmhs\""
+  done
+}
+
+#
+# unpack_clone_on_nodes
+#
+# Purpose: Unpack the clone software on all the nodes
+# call with oracle_home and tar.gz file as parameter
+unpack_clone_on_nodes()
+{
+  local NEW_ORACLE_HOME=$1
+  local TAR_FILE_GZ=$2
+  local RAC_NODE
+  for RAC_NODE in $RAC_NODES
+  do
+    echo "  INFO: Unpacking into $NEW_ORACLE_HOME on node $RAC_NODE"
+    cat $TAR_FILE_GZ | ssh $RAC_NODE "cd $NEW_ORACLE_HOME; tar zxpf -"   || { echo "ERROR: Can't unpack $NEW_ORACLE_HOME on $RAC_NODE" ; exit 1; }
+  done
+}
+
+#
+# clone_on_nodes
+#
+# Purpose: Do the actual cloning of the ORACLE_HOME on each node
+#
+# Call with ORACLE_HOME as psarameter
+clone_on_nodes()
+{
+  local NEW_ORACLE_HOME=$1
+  local NEW_ORACLE_HOME_NAME=$( calc_oracle_home_name $NEW_ORACLE_HOME )
+  local RAC_NODE
+  local ORACLE_BASE=$( get_oracle_base ) 
+  for RAC_NODE in $RAC_NODES
+  do
+    echo "  INFO: Cloning $NEW_ORACLE_HOME_NAME on $RAC_NODE"
+    # Call the clone command
+    #echo "cd $NEW_ORACLE_HOME/clone/bin; $NEW_ORACLE_HOME/perl/bin/perl clone.pl -silent CLUSTER_NODES=\{${CLUSTER_NODES}\} LOCAL_NODE=$RAC_NODE ORACLE_BASE=$ORACLE_BASE ORACLE_HOME=$NEW_ORACLE_HOME ORACLE_HOME_NAME=$NEW_ORACLE_HOME_NAME OSDBA_GROUP=$OSDBA_GROUP OSOPER_GROUP=$OSOPER_GROUP OSBACKUPDBA_GROUP=$OSBACKUPDBA_GROUP OSDGDBA_GROUP=$OSDGDBA_GROUP OSKMDBA_GROUP=$OSKMDBA_GROUP OSRACDBA_GROUP=$OSRACDBA_GROUP"
+    ssh $RAC_NODE "cd $NEW_ORACLE_HOME/clone/bin; $NEW_ORACLE_HOME/perl/bin/perl clone.pl  -silent CLUSTER_NODES=\{${CLUSTER_NODES}\} LOCAL_NODE=$RAC_NODE ORACLE_BASE=$ORACLE_BASE ORACLE_HOME=$NEW_ORACLE_HOME ORACLE_HOME_NAME=$NEW_ORACLE_HOME_NAME OSDBA_GROUP=$OSDBA_GROUP OSOPER_GROUP=$OSOPER_GROUP OSBACKUPDBA_GROUP=$OSBACKUPDBA_GROUP OSDGDBA_GROUP=$OSDGDBA_GROUP OSKMDBA_GROUP=$OSKMDBA_GROUP OSRACDBA_GROUP=$OSRACDBA_GROUP" || { echo " ERROR: Can't clone $NEW_ORACLE_HOME on $RAC_NODE" ; exit 1; }
+    # Fix node list as it does not always work setting it above
+    ssh $RAC_NODE "$NEW_ORACLE_HOME/oui/bin/runInstaller -updateNodeList ORACLE_HOME=$NEW_ORACLE_HOME CLUSTER_NODES=\"{${CLUSTER_NODES}}\" -local"        
+  done
+}
+
+#
+# root_on_nodes
+#
+# Purpose: Do the root.sh part
+#
+# Call with ORACLE_HOME as parameter
+root_on_nodes()
+{
+  local NEW_ORACLE_HOME=$1
+  local RAC_NODE
+  for RAC_NODE in $RAC_NODES
+  do
+    echo "  INFO: Running $NEW_ORACLE_HOME/root.sh on $RAC_NODE"
+    # Call the root.sh command
+    echo "sudo $NEW_ORACLE_HOME/root.sh -silent"
+    ssh -t $RAC_NODE "sudo $NEW_ORACLE_HOME/root.sh -silent" || { echo " ERROR: Can't run $NEW_ORACLE_HOME/root.sh -silent on $RAC_NODE" ; exit 1; }
+  done
+}
+
+
+#
+# setasmgid_on_nodes
+#
+# Purpose: Ensure that oracle executable can access ASM disks if /etc/oracle/setasmgid exists
+#
+# Call with ORACLE_HOME as parameter
+setasmgid_on_nodes()
+{
+  local NEW_ORACLE_HOME=$1
+  local RAC_NODE
+  for RAC_NODE in $RAC_NODES
+  do
+    # Run /etc/oracle/setasmgid exists
+    ssh $RAC_NODE "     if [ -x /etc/oracle/setasmgid ] ; then
+                echo \"  INFO: /etc/oracle/setasmgid found - running it on oracle binary\"
+                /etc/oracle/setasmgid oracle_binary_path=$NEW_ORACLE_HOME/bin/oracle
+        else
+                echo \"  INFO: /etc/oracle/setasmgid not found - ignoring\"
+        fi" 
+    if [ $? -ne 0 ]
+    then 
+      echo " ERROR: Running /etc/oracle/setasmgid on $RAC_NODE failed" 
+      exit 1
+    fi
+  done
+}
+
+#
+# ensure_options_on_nodes
+#
+# Purpose: Ensure that oracle executable has correct option slinked in, like f.x. RDS
+#
+# Call with ORACLE_HOME as parameter
+ensure_options_on_nodes()
+{
+  local NEW_ORACLE_HOME=$1
+  local GRID_HOME
+  local RAC_NODE
+  local nordea_availability_level
+  GRID_HOME=$(find_grid_home)
+  # Are RAC Option allowed or not
+  nordea_availability_level=$(get_configuration_parameter "nordea_availability_level")
+  if [ "$nordea_availability_level" = "" ]
+  then
+    nordea_availability_level="bca"
+  fi
+  # Check that it's an avaiability level we can handle
+  case $nordea_availability_level in
+  ha|bca)
+    :
+    ;;
+  *)
+    echo "   ERROR: availability_level in file \"${NORDEA_ENVIRONMENT_FILE}\" should be one of ha or bca";exit 1;;
+  esac
+  # Turn RAC on/off
+  set -x
+  for RAC_NODE in $RAC_NODES
+  do
+    case $nordea_availability_level in
+    ha)
+      echo "  INFO: Turn RAC option off"
+      ssh $RAC_NODE "export ORACLE_HOME=${NEW_ORACLE_HOME}; make -C ${NEW_ORACLE_HOME}/rdbms/lib -f ins_rdbms.mk rac_off ioracle"
+      if [ $? -ne 0 ]
+      then 
+        echo " ERROR: Running make -C ${NEW_ORACLE_HOME}/rdbms/lib -f ins_rdbms.mk rac_off ioracle on $RAC_NODE failed" 
+        exit 1
+      fi
+      ;;
+    bca)
+      echo "  INFO: Turn RAC option on"
+      ssh $RAC_NODE "export ORACLE_HOME=${NEW_ORACLE_HOME}; make -C ${NEW_ORACLE_HOME}/rdbms/lib -f ins_rdbms.mk rac_on ioracle"
+      if [ $? -ne 0 ]
+      then 
+        echo " ERROR: Running make -C ${NEW_ORACLE_HOME}/rdbms/lib -f ins_rdbms.mk rac_on ioracle on $RAC_NODE failed" 
+        exit 1
+      fi
+      ;;
+    esac
+  done
+  set +x
+  # Do we run UDP/IP on grid
+  ${GRID_HOME}/bin/skgxpinfo | grep -i -q "udp"
+  if [ $? -eq 0 ]
+  then
+    # We recompile to make sure it's correct (UDP)
+    for RAC_NODE in $RAC_NODES
+    do
+      ssh $RAC_NODE "export ORACLE_HOME=${NEW_ORACLE_HOME}; make -C ${NEW_ORACLE_HOME}/rdbms/lib -f ins_rdbms.mk ipc_rds ioracle"
+      if [ $? -ne 0 ]
+      then 
+        echo " ERROR: Running make -C ${NEW_ORACLE_HOME}/rdbms/lib -f ins_rdbms.mk ipc_g ioracle on $RAC_NODE failed" 
+        exit 1
+      fi
+    done
+  fi
+  # Do we run RDS/IP on grid
+  ${GRID_HOME}/bin/skgxpinfo | grep -i -q "rds"
+  if [ $? -eq 0 ]
+  then
+    # We recompile to make sure it's correct (RDS)
+    for RAC_NODE in $RAC_NODES
+    do
+      ssh $RAC_NODE "export ORACLE_HOME=${NEW_ORACLE_HOME}; make -C ${NEW_ORACLE_HOME}/rdbms/lib -f ins_rdbms.mk ipc_rds ioracle"
+      if [ $? -ne 0 ]
+      then 
+        echo " ERROR: Running make -C ${NEW_ORACLE_HOME}/rdbms/lib -f ins_rdbms.mk ipc_rds ioracle on $RAC_NODE failed" 
+        exit 1
+      fi
+    done
+  fi
+}
+
+#
+# create_structure_on_nodes
+#
+# Purpose: Create the new Oracle homes directories on all nodes
+#
+# Call with ORACLE_HOME as psarameter
+create_structure_on_nodes()
+{
+  local NEW_ORACLE_HOME=$1
+  local RAC_NODE
+  for RAC_NODE in $RAC_NODES
+  do
+    echo "  INFO: Creating directory $NEW_ORACLE_HOME on node $RAC_NODE"
+    # Does the directory already exist?
+    ssh $RAC_NODE [ -d "$NEW_ORACLE_HOME" ]
+    if [ $? -eq 0 ]
+    then
+      # There is a directory, is it empty? - skip this always give error
+      #ssh $RAC_NODE [ "$(ls -A $NEW_ORACLE_HOME)" ] && { echo "ERROR: The directory $NEW_ORACLE_HOME already exists on node $RAC_NODE and is not empty" ; exit 1; }
+      echo "ERROR: The directory $NEW_ORACLE_HOME already exists on node $RAC_NODE" ; exit 1; 
+    fi
+    # Create it 
+    ssh $RAC_NODE mkdir -p $NEW_ORACLE_HOME || { echo "ERROR: Can't create $NEW_ORACLE_HOME on $RAC_NODE" ; exit 1; }
+  done
+}
+
+#
+# create_exclude_list
+#
+# Purpose: Build the list of files not to be taken fron the ORACLE_HOME
+#
+# Call with Source Oracle Hoem as parameter
+create_exclude_list()
+{
+  local SOURCE_ORACLE_HOME=$1
+  echo "" >$EXCLUDE_LIST
+  (cd $SOURCE_ORACLE_HOME; find . -name "*.log" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd $SOURCE_ORACLE_HOME; find . -name "*.dbf" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd $SOURCE_ORACLE_HOME; find ./rdbms/audit -name "*.aud" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd $SOURCE_ORACLE_HOME; find . -name "tnsnames.ora" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd $SOURCE_ORACLE_HOME; find . -name "listener.ora" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd $SOURCE_ORACLE_HOME; find . -name "sqlnet.ora" >>$EXCLUDE_LIST) 2>/dev/null
+  for RAC_NODE in $RAC_NODES
+  do
+    (cd $SOURCE_ORACLE_HOME; find . -name "${RAC_NODE}_*" >>$EXCLUDE_LIST) 2>/dev/null
+  done
+  (cd ${SOURCE_ORACLE_HOME}; find ./oc4j/j2ee -name "OC4J_DBConsole_*" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd ${SOURCE_ORACLE_HOME}; find ./dbs -name "hc_*" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd ${SOURCE_ORACLE_HOME}; find ./dbs -name "init*" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd ${SOURCE_ORACLE_HOME}; find ./dbs -name "snapcf*" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd ${SOURCE_ORACLE_HOME}; find ./dbs -name "orapw*" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd ${SOURCE_ORACLE_HOME}; find ./dbs -name "dr1*" >>$EXCLUDE_LIST) 2>/dev/null
+  (cd ${SOURCE_ORACLE_HOME}; find ./dbs -name "dr2*" >>$EXCLUDE_LIST) 2>/dev/null
+  # Will be recreated by running root.sh
+  echo "./bin/nmo" >>$EXCLUDE_LIST
+  echo "./bin/nmb" >>$EXCLUDE_LIST
+  echo "./bin/nmhs" >>$EXCLUDE_LIST
+}
+
+check_node_access()
+{
+  local node
+  for node in $RAC_NODES
+  do
+    # Check ssh access
+    timeout 5 ssh $node date >>$log_file 2>&1
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't reach node $node"
+      exit 1
+    fi      
+  done
+}
+
+
+write_usage()
+{
+  cat << EOF
+$0 is used to make a clone of an existing Oracle home to a new Oracle home at Nordea.
+Curently it support only RAC platforms.
+It's important that the paths of the Oracle Homes follows a strict naming
+convention.
+/u01/app/oracle/product/<oracle release number>/db<patch set number><nordea patch letter>
+
+an example is
+
+/u01/app/oracle/product/12.1.0.2/db161018a
+
+The process for creating new Oracle Homes should normally be:
+1) Use "$script_name clone oraclehome" to create a clone of the Oracle Home.
+   Name the new Oracle Home with the desired version information you will have after
+   patching have been done.
+2) Now apply patches to the new local Oracle Home created (be aware that with newer
+   versiona of opatch you need to specify -all_nodes no apply patch on all nodes
+3) Use "$script_name create clonefile" to create a local file that can be used
+   for instaling the New Oracle homes on other systems or here.
+5) Use "$script_name create oraclehome" to create a clustered Oracle Home using the generated file
+
+Usage:
+  $script_name clone oraclehome 
+    --sourceOracleHome <Oracle home path>
+    --destinationOracleHome <Oracle home path>
+  $script_name create clonefile 
+    --oracleHome <Oracle home path>
+    --directory <path to directory for clonefile>|--file <file to write to>
+  $script_name remove oraclehome 
+    --oracleHome <Oracle home path>
+  $script_name create oraclehome 
+    --file <path to directory for clonefile>
+    [--oracleHome <Oracle home path>] # Use this when creating a home that has
+                                        different name then the automatic one
+                                        f.x. when creating a home for patching
+    [--localnode ]                    # Use this if the home created are going to
+                                        be used for creating new gold image
+  -h|--help
+    Will show this help    
+EOF
+}
+
+#
+# parse_arguments
+#
+# Purpose: Parses all the arguments received on command line
+# first argument is always action and second is component/object
+#
+parse_arguments()
+{
+  if [ $# -eq 0 ]
+  then
+    write_usage
+    exit
+  fi
+  # First check action is one we know off
+  VALID_ACTION_LIST="clone create remove -h --help "
+  if string_contain "$1 " "$VALID_ACTION_LIST"
+  then
+    ACTION=$1
+  else
+    echo "   ERROR: Action parameter \"$1\" given to script not recognized"
+    exit 1
+  fi
+  if [ "$ACTION" = "-h" -o "$ACTION" = "--help" ]
+  then
+    write_usage
+    exit
+  fi
+  shift
+  if [ $# -eq 0 ]
+  then
+    echo "   ERROR: Action parameter \"$ACTION\" given to script needs to be followed by an object"
+    exit 1
+  fi
+  # Depending on action various objects might be specified
+  case $1 in
+    oraclehome) OBJECT="oraclehome";VALID_ACTION_LIST="clone create remove ";;
+    clonefile) OBJECT="clonefile";VALID_ACTION_LIST="create ";;
+    *)            echo "   ERROR: Object parameter $1 given to script not recognized";exit 1;;
+  esac;
+  shift
+  # first check if we support combination
+  if ! string_contain  "$ACTION " "$VALID_ACTION_LIST" 
+  then
+    echo "   ERROR: The action \"$ACTION\" is not not supported for object \"$OBJECT\". Actions allowed is \"$VALID_ACTION_LIST\""
+    exit 1
+  fi
+  check_node_access "$RAC_NODES"          
+  
+  # Now we for each action/object checks the parameters, we use getopt for that in case there are some parameters
+  case $OBJECT in
+    oraclehome)
+      case $ACTION in
+        clone)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" --long sourceOracleHome:,destinationOracleHome: -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --sourceOracleHome) INPUT_SOURCE_ORACLE_HOME="$(readlink -m $2)";shift 2 ;;
+            --destinationOracleHome) INPUT_DESTINATON_ORACLE_HOME="$(readlink -m $2)";shift 2 ;;
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "${INPUT_SOURCE_ORACLE_HOME}" == "" ]
+          then
+            echo "   ERROR: --sourceOracleHome needs to be specified"
+            exit 1
+          else
+            if [ ! -d "${INPUT_SOURCE_ORACLE_HOME}" ]
+            then
+              echo "   ERROR: Directory $INPUT_SOURCE_ORACLE_HOME does not exist"
+              exit 1
+            fi
+          fi
+          if [ "${INPUT_DESTINATON_ORACLE_HOME}" == "" ]
+          then
+            echo "   ERROR: --destinationOracleHome needs to be specified"
+            exit 1
+          else
+            if [ -d "${INPUT_DESTINATON_ORACLE_HOME}" ]
+            then
+              echo "   ERROR: Directory $INPUT_DESTINATON_ORACLE_HOME does already exist"
+              exit 1
+            fi
+          fi
+          ;;
+        create)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" --long oracleHome:,file:,localnode -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --oracleHome) INPUT_ORACLE_HOME="$(readlink -m $2)";shift 2 ;;
+            --file) INPUT_FILE="$2";shift 2 ;;              
+            --localnode) LOCAL_NODE="YES";shift 1 ;;              
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "${INPUT_ORACLE_HOME}" == "" ]
+          then
+            # Try to calculate from file name
+            # Let's see if we can extract the name from the file, will exit with error if it fails
+            INPUT_ORACLE_HOME=$(calc_oracle_home $INPUT_FILE)
+            if [ $? -ne 0 ]
+            then
+              echo " ERROR: Can't extract oracle home information from file name $INPUT_FILE. Use option --oracleHome to specify Oracle Home"
+              exit 1
+            fi
+          fi
+          #if [ -d "${INPUT_ORACLE_HOME}" ]
+          #then
+          #  echo "   ERROR: Directory $INPUT_ORACLE_HOME does already exist"
+          #  exit 1
+          #fi
+          if [ "${INPUT_FILE}" == "" ]
+          then
+            echo "   ERROR: --file needs to be specified"
+            exit 1
+          else
+            if [ ! -f "${INPUT_FILE}" ]
+            then
+              echo "   ERROR: File $INPUT_FILE does not exist"
+              exit 1
+            fi
+          fi
+          ;; 
+        remove)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" --long oracleHome: -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --oracleHome) INPUT_ORACLE_HOME="$(readlink -m $2)";shift 2 ;;
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "${INPUT_ORACLE_HOME}" == "" ]
+          then
+            echo "   ERROR: --oracleHome needs to be specified"
+            exit 1
+          else
+            if [ ! -d "${INPUT_ORACLE_HOME}" ]
+            then
+              echo "   ERROR: Directory $INPUT_ORACLE_HOME does not exist"
+              exit 1
+            fi
+          fi
+          ;; 
+      esac
+      ;;
+    clonefile)
+      case $ACTION in
+        create)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" --long oracleHome:,file:,directory: -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --oracleHome) INPUT_ORACLE_HOME="$(readlink -m $2)";shift 2 ;;
+            --file) INPUT_FILE="$2";shift 2 ;;              
+            --directory) INPUT_DIRECTORY="$2";shift 2 ;;              
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "${INPUT_ORACLE_HOME}" == "" ]
+          then
+            echo "   ERROR: --oracleHome needs to be specified"
+            exit 1
+          else
+            if [ ! -d "${INPUT_ORACLE_HOME}" ]
+            then
+              echo "   ERROR: Directory $INPUT_ORACLE_HOME does not exist"
+              exit 1
+            fi
+          fi
+          if [ "${INPUT_DIRECTORY}" == "" -a "${INPUT_FILE}" == "" ]
+          then
+            echo "   ERROR: --directory or --file needs to be specified"
+            exit 1
+          fi
+          if [ "${INPUT_DIRECTORY}" != "" -a "${INPUT_FILE}" != "" ]
+          then
+            echo "   ERROR: only one of --directory or --file can to be specified"
+            exit 1
+          fi
+          ;;
+      esac;;
+    *)
+      echo "   ERROR: $OBJECT not handled - internal error"
+      exit 1
+      ;;        
+  esac
+}
+
+#
+# Purpose: Test if user is the one specified as parameter
+#
+check_for_permission()
+{
+  local input_user
+  input_user=$1
+  if [ `id -un` != "$input_user" ]
+  then
+    echo " ERROR: No access rights. Need to be run as user $1"
+    exit 1
+  fi
+}
+
+
+#
+# handle_request
+#
+# Purpose: handles the request after arguments have been analyzed checked
+#
+handle_request()
+{
+  case $OBJECT in
+    oraclehome)
+      case $ACTION in
+        clone)
+          clone_oraclehome "${INPUT_SOURCE_ORACLE_HOME}" "${INPUT_DESTINATON_ORACLE_HOME}";;
+        create)
+          create_oraclehome "${INPUT_ORACLE_HOME}" "${INPUT_FILE}" "${LOCAL_NODE}";;
+        remove)
+          remove_oraclehome "${INPUT_ORACLE_HOME}";;
+      esac
+      ;;
+    clonefile)
+      case $ACTION in
+        create)
+          create_clonefile "${INPUT_ORACLE_HOME}" "${INPUT_DIRECTORY}" "${INPUT_FILE}";;
+      esac
+      ;;
+  esac
+}
+
+
+#
+# build_environment_names
+#
+# Purpose: Build some environment names based on parameters
+#          given to script plus other variables needed
+#
+build_environment_names()
+{
+  DOMAIN_NAME=${HOSTNAME#*.}
+  SHORT_HOST_NAME=${HOSTNAME%%.*}
+  local ORAINST_LOC="/etc/oraInst.loc"
+  local ASM_SID
+  local GRID_HOME
+  GRID_HOME=$(find_grid_home)
+  # Get the owner of grid home
+  GRID_USER=$(stat -c "%U" ${GRID_HOME}/bin/oracle)
+  # If --localnode specified do it only on the local node
+  if [ "$LOCAL_NODE" = "YES" ]
+  then
+    RAC_NODES="$SHORT_HOST_NAME"
+  else
+    RAC_NODES=`$GRID_HOME/bin/olsnodes`
+  fi
+  RAC_NODES=`echo $RAC_NODES`
+  for RAC_NODE in $RAC_NODES
+  do
+    if [ "$CLUSTER_NODES" = "" ]
+    then
+      CLUSTER_NODES="$RAC_NODE"
+    else
+      CLUSTER_NODES="$CLUSTER_NODES,$RAC_NODE"
+    fi
+  done
+  # Now check for various groups exists
+  #set -x
+  getent group dba >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    OSDBA_GROUP=dba
+    OSOPER_GROUP=dba
+    OSBACKUPDBA_GROUP=dba
+    OSDGDBA_GROUP=dba
+    OSKMDBA_GROUP=dba
+    OSRACDBA_GROUP=dba    
+  else
+    echo " ERROR: At nordea we need at least the group dba";exit 1;   
+  fi
+  getent group oper >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    OSOPER_GROUP=oper
+  fi  
+  getent group backupdba >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    OSBACKUPDBA_GROUP=backupdba
+  fi  
+  getent group dgdba >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    OSDGDBA_GROUP=dgdba
+  fi  
+  getent group kmdba >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    OSKMDBA_GROUP=kmdba
+  fi    
+  getent group racdba >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    OSRACDBA_GROUP=racdba
+  fi    
+}
+
+# Script really starts here
+check_for_permission oracle
+# Parse arguments (and check)
+parse_arguments "$@"
+# Build some standard environment stuff
+build_environment_names
+# Handle the request
+handle_request
+echo "  INFO: Script finished ($(date +"%F_%T"))"

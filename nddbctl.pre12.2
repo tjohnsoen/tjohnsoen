@@ -1,0 +1,2256 @@
+#!/bin/bash
+#set -x
+# Script to install databases with on EXADATA  
+# 
+# 1.0.0   2015-06-30 asger.solvang@nordea.com    Initial version
+# 1.0.1   2015-07-03 asger.solvang@nordea.com    First "working" version
+# 1.0.2   2015-07-06 asger.solvang@nordea.com    First released version
+# 1.0.3   2015-07-07 asger.solvang@nordea.com    Added nls_length_semantics option to command line (-nlsLengthSemantics)
+# 1.0.4   2015-07-08 asger.solvang@nordea.com    Added dg_broker_config_file1 and dg_broker_config_file2
+#                                                rman service needs to be defined as primary,physical_standby
+#                                                Check for CHAR was wrong
+# 1.0.5   2015-07-10 asger.solvang@nordea.com    Changed handling of custom scripts
+# 1.0.6   2015-07-15 asger.solvang@nordea.com    Added small,medimum,large and modified parameters. Also added DB_CACHE_SIZE 
+# 1.0.7   2015-08-13 asger.solvang@nordea.com    Fixed wrong setup of dg_broker_config_file2
+# 1.0.8   2015-08-25 asger.solvang@nordea.com    Fixed handling on new database types
+# 1.0.9   2015-08-31 asger.solvang@nordea.com    Now sets prerred instances on services correct
+# 1.0.10  2015-09-01 asger.solvang@nordea.com    Added help
+# 1.0.11  2015-09-02 asger.solvang@nordea.com    Added automatically finding the correct ORACLE AGENT home
+# 1.0.12  2015-09-04 asger.solvang@nordea.com    Now using obfusticated passwords
+# 1.0.13  2015-09-10 asger.solvang@nordea.com    Better way to find agent home as it seems to be broken on some exadatas
+# 1.0.14  2015-09-18 asger.solvang@nordea.com    Added streams_pool_size
+# 1.0.15  2015-09-22 asger.solvang@nordea.com    Added Template as parameter (not to be used yet)
+#                                                Fixed also some wrong memory parameters, java_pool_size,
+#                                                db_cache_size,shared_pool_size,large_pool_size,streams_pool_size
+#                                                use fix_tiny_memory_before_20150922.sql to fix existing ones
+# 1.0.16  2015-09-22 asger.solvang@nordea.com    Added help for -nlsLengthSemantics  
+# 1.0.17  2015-10-01 asger.solvang@nordea.com    Changed Tiny to allow for two instances (was 1) and removed the check on running on only one instance
+#                                                Also added that standard service is runing on 1 random instance
+#
+# 1.0.18  2015-10-02 asger.solvang@nordea.com    Added more report output to tell more precisely what has been created, fixed java_pool_size in large 
+# 1.0.19  2015-10-20 asger.solvang@nordea.com    Started adding more comprehensive tracking of what have been installed (not enabled) 
+# 1.0.20  2015-10-20 asger.solvang@nordea.com    Added maxsize settings for various tablespaces 
+# 1.0.21  2016-01-05 asger.solvang@nordea.com    Added DB_RECOVERY_FILE_DEST_SIZE_MB for each database type
+# 1.0.22  2016-01-05 asger.solvang@nordea.com    Added + in front of parameter value to db_recovery_file_dest (+$ASM_RECO_DISK_GROUP)
+# 1.0.23  2016-01-05 asger.solvang@nordea.com    Added micro for testing purposes
+# 1.0.24  2016-01-20 asger.solvang@nordea.com    Added more testing configuration
+# 1.0.25  2016-01-28 asger.solvang@nordea.com    First version that support 12c
+# 1.0.26  2016-02-01 asger.solvang@nordea.com    Small textual changes
+# 1.0.27  2016-02-08 asger.solvang@nordea.com    Fixed PGA_AGGREGATE_LIMIT = 3 * PGA_AGGREGATE_TARGET fro 12c
+# 1.0.28  2016-02-12 asger.solvang@nordea.com    Wong init.ora parameter name for PGA_AGGREGATE_LIMIT made dbca fail
+# 1.0.29  2016-03-14 asger.solvang@nordea.com    Added possibility to call specific scripts depending on major db version. Used for running datapatch on 12c
+#                                                Increased SHARED_POOL_SIZE memory for micro setup
+# 1.0.30  2016-08-11 asger.solvang@nordea.com    Added possibility to use shared TNS_ADMIN
+# 1.0.31  2016-08-12 asger.solvang@nordea.com    Minor changes
+# 1.0.32  2016-11-22 asger.solvang@nordea.com    Added data center site
+# 1.0.33  2016-11-30 asger.solvang@nordea.com    Rewrote as nddbctl
+# 1.0.34  2016-11-30 asger.solvang@nordea.com    Changed a couple of paths
+# 1.0.35  2016-11-30 asger.solvang@nordea.com    Changed a another set of paths and lower database names for files
+# 1.0.36  2016-12-01 asger.solvang@nordea.com    Added check of data center unique number
+# 1.0.37  2016-12-02 asger.solvang@nordea.com    Added delete database
+# 1.0.38  2016-12-02 asger.solvang@nordea.com    Fixed that delete database did not work for 11.2.0.4 databases
+# 1.0.39  2016-12-02 asger.solvang@nordea.com    Added seeting DB_PERFORMANCE_PROFILE on 12c databases and commented it out as it did not work
+# 1.0.40  2017-01-04 asger.solvang@nordea.com    Missed some exports when deleting db's
+# 1.0.41  2017-01-04 asger.solvang@nordea.com    Changed deafault nllengthsemnatics help text to show char is default
+# 1.0.42  2017-01-06 asger.solvang@nordea.com    using database uniquename where relevant
+# 1.0.43  2017-01-11 asger.solvang@nordea.com    Preparing for crating standby ready empty databases
+# 1.0.44  2017-01-14 asger.solvang@nordea.com    Now can better clean up database when delting them
+# 1.0.45  2017-01-14 asger.solvang@nordea.com    Added ORACLE_BASE before dbca as it seems like that was needed
+# 1.0.46  2017-01-14 asger.solvang@nordea.com    Renamed diretory that logs ar put in
+# 1.0.47  2017-01-14 asger.solvang@nordea.com    Minor typo
+# 1.0.48  2017-01-14 asger.solvang@nordea.com    Tns was not called correctly
+# 1.0.49  2017-01-15 asger.solvang@nordea.com    Now allow database unique name when creating databases. Will extract site etc form that name plus ficxed wrong year in comments
+# 1.0.50  2017-01-15 asger.solvang@nordea.com    Now supports distribution of password files for 11.x databases
+# 1.0.51  2017-01-16 asger.solvang@nordea.com    Small textual updates
+# 1.0.52  2017-01-18 asger.solvang@nordea.com    Added more rigid database name testing
+# 1.0.53  2017-01-19 asger.solvang@nordea.com    Now adds directory for backups
+# 1.0.54  2017-01-19 asger.solvang@nordea.com    Updated version string
+# 1.0.55  2017-02-06 asger.solvang@nordea.com    Bug in how UNIQUE SITE NUMBER was calculated fron database unique name plus mkdir rman directories got -p
+# 1.0.56  2017-02-10 asger.solvang@nordea.com    Updated help text and corrected spelling errors
+# 1.0.57  2017-03-30 asger.solvang@nordea.com    Added --skipEmConfiguration to documentation
+# 1.0.58  2017-04-18 asger.solvang@nordea.com    Now modifies standby database in cluster registry to be registred as a 'PHYSICAL_STANDBY' database
+# 1.0.59  2017-06-08 asger.solvang@nordea.com    Print extra step when doing Dataguard, # CONFIGURE SNAPSHOT CONTROLFILE NAME TO '+DATAC2/isoems1h/CONTROLFILE/snapcf_isoems1h.f' ;
+# 1.0.59.1 2017-06-08 asger.solvang@nordea.com    Only create one member of standby redo log groups
+# 1.0.59.2 2017-09-08 asger.solvang@nordea.com    Error in creating standby logs, missing ''
+# 1.0.59.3 2018-01-09 asger.solvang@nordea.com    Creates two control files in "DATA" and redo files in "DATA". Don't use RECO because of IO pressure problems on Exadata
+# 1.0.59.4 2018-01-10 asger.solvang@nordea.com    Removed some RMAN commands as they we not needed for duplicating
+# 1.0.59.5 2018-01-15 asger.solvang@nordea.com    Added -XX:MaxPermSize=128M to dbca to avoid Bug 21121578  
+# 1.0.59.6 2018-01-16 asger.solvang@nordea.com    Added demultiplex standbylogs and now default is not to register with em   
+# 1.0.59.7 2018-01-17 asger.solvang@nordea.com    Removed thread from standby logs and colred dataguard output   
+# 1.0.59.8 2018-01-17 asger.solvang@nordea.com    AUDIT Trail changed for dm11-dm14 to DB,EXTENDED   
+# 1.0.59.9 2018-01-18 asger.solvang@nordea.com    renamed dontSkipEmConfiguration to -registerWithEm and fixed demultiplex standbylog  
+# 1.0.59.10 2018-02-06 asger.solvang@nordea.com   Fixed wrong deletion of standby logs  
+# 1.0.59.11 2018-03-06 asger.solvang@nordea.com   Now Creating standby logs with thead again as it gave warning in dgmgrl not to have threads
+# 1.0.59.12 2020-03-03 asger.solvang@nordea.com   Fixing how to find grid home
+#                                                 Added that we understand the new exadata naming convention db-e*
+# 1.0.59.13 2020-09-15 asger.solvang@nordea.com   Fixed issue with tr and missing quotes
+# TODO much more error checking
+# TODO MAybe set snapshot control file name in RMAN to "clustered" file system as duplicate does not work if we run active on multiple instancers
+# Maybe use for getting IB adresses
+#  $GRID_HOME/bin/oifcfg getif # Get all interfaces
+#  ip addr show ib0 | grep 'state UP' -A2 | tail -n1 | awk -F'[/ ]+' '{print $3}' # Gets first IP
+SVERSION="1.0.59.12"
+# Used for timestamps in files etc
+now=$(date +"%F_%T")
+echo "   INFO: Script version $SVERSION (${now})"
+# Where we can get the dbca logs
+dbca_logs_directory="/u01/app/oracle/cfgtoollogs/dbca"
+# name of the script
+script_name=${0##*/}
+# File for various log stuff
+#log_file="/var/log/${script_name}.log"
+log_file=/dev/null
+# Save the command line parameters
+CMD_LINE_PARAMS=$*
+# Location of a clustered tnsnames.ora. If the file tnsnames.ora exists in this directory we assume that databases uses a shared TNS_ADMIN
+# In this case we add also TNS_ADMIN environment to the cluster configuratiomn for the database we create
+# and the variable USING_SHARED_TNS_ADMIN will be set to "Y" 
+# TBD
+CLUSTERED_TNS_ADMIN=/clustershare/network/admin
+# LOg files are put here
+CLUSTERED_LOG_LOCATION=/clustershare/nddbctl/log
+# Local log files to be moved after creation
+LIB_LOG_LOCATION="/var/lib/nddbctl/log"
+# Location of oratab used to find the GRID ORACLE_HOME later
+ORA_TAB=/etc/oratab	
+# Where is oraInst.loc file. Used for finding inventory and later agent
+ORA_INST_LOC_POSSIBLE_LOCATIONS=("/etc/oraInst.loc" "/u01/app/oracle/product/agent/core/12.1.0.3.0/oraInst.loc" "/u01/app/oracle/product/agent/core/12.1.0.5.0/oraInst.loc")
+# How to find disk groups in ASM - remember escape $ with 1 slash
+ASM_DISK_GROUPS_SQL="set heading off
+set feedback off
+select name
+from v\$asm_diskgroup;
+"
+# Default skip em configuration
+SKIP_EM_CONFIGURATION="Y"
+# Default auditing
+AUDIT_TRAIL="XML,EXTENDED"
+# Default datacenter running unique number
+DATACENTER_UNIQUE_NUMBER=1
+# Default characterset
+CHARACTERSET=AL32UTF8
+# Default national characterset
+NATIONAL_CHARACTERSET=AL16UTF16
+# Default nls_length_semantics
+NLS_LENGTH_SEMANTICS=char
+# Location of where the templates are located
+#COMMON_TEMPLATES_DIRECTORY=/zfssa/rmantest/backup1/dbtp/exadata/templates
+#COMMON_TEMPLATES_DIRECTORY=/clustershare/tools/dbca/templates
+# Used while testing
+#COMMON_TEMPLATES_DIRECTORY=/home/oracle/g48642/templates
+# Should point to where the script is located right now
+#COMMON_TEMPLATES_DIRECTORY="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+COMMON_LIB_DIRECTORY="/var/lib/nddbctl"
+COMMON_TEMPLATES_DIRECTORY="${COMMON_LIB_DIRECTORY}/templates"
+# Database will default be multiple instances enabled on multiple hosts
+#SINGLE_INSTANCE="N"
+# This is work in progreaa (logging)
+# This will be used as unique id when logging info 
+LOG_ID=$(date +%s%N)
+# This is where we will put the final "log" and artifacts that was used to create the database
+LOG_DIRECTORY=${CLUSTERED_LOG_LOCATION}/${LOG_ID}
+# Database will default have no DG enabled - not implemented yet. Manual process
+USE_DATA_GUARD="N"
+# Default Template for 11 and 12 versions
+TEMPLATE_11=nordea_exadata_11204_v1.0.dbt
+TEMPLATE_12=nordea_exadata_12102_v1.0.dbt
+TEMPLATE_13=nordea_exadata_13101_v1.0.dbt
+# User needed for 12c dbca em registration
+AGENT_REGISTRATOR_USERNAME="AGENT_REGISTRATOR"
+AGENT_REGISTRATOR_OMS_PORT="7802"
+AGENT_REGISTRATOR_OMS_HOST="ap-oem1p.oneadr.net"
+# User neede for 12c dbca em registration on test cluster rac4
+TEST_AGENT_REGISTRATOR_USERNAME="AGENT_REGISTRATOR"
+TEST_AGENT_REGISTRATOR_OMS_PORT="7799"
+TEST_AGENT_REGISTRATOR_OMS_HOST="server40.leva.dk"
+# Obfusticated passwords
+PROD_SYS_PASSWORD="053c65b228d44ef9774791aba0960895a8d55569553f7ece60"
+TEST_SYS_PASSWORD="05be62744170c6c11d301bab0c986696e4fae4519cca0c3c05"
+DEMO_SYS_PASSWORD="05fb9a4d4252d87b29421bca0151f723b81cef1dc4970e6aa4"
+SANDBOX_SYS_PASSWORD="059c77773ca927ae4495c63093ac96f79a57dd99ae4fd49f63"
+
+PROD_ASM_SYS_PASSWORD="051623be2894b73aeeb50a3f92d5046fa9602e20f01183aafa"
+TEST_ASM_SYS_PASSWORD="05dcce6419bc4e71a4ccf74f9d39ea7f8a4f167166157f2201"
+DEMO_ASM_SYS_PASSWORD="057635833c6990efbadbc9669812679afe71d1612028c76d16"
+SANDBOX_ASM_SYS_PASSWORD="057635833c6990efbadbc9669812679afe71d1612028c76d16"
+
+PROD_SYSTEM_PASSWORD="050302c428f46b5ba9a91bbddab3d84459bcd14be63164b923"
+TEST_SYSTEM_PASSWORD="05ab417a41d07ae2d8e3da5852f0d0cd24c1cf13d007efae50"
+DEMO_SYSTEM_PASSWORD="05fb9a4d4252d87b29cfce4ae9d289f5fab7cd31652f766584"
+SANDBOX_SYSTEM_PASSWORD="059c77773ca927ae449f54d1b296d816f9c3753d993990a15f"
+
+PROD_SYSMAN_PASSWORD="050302c428f46b5ba9a91bbddab3d84459bcd14be63164b923"
+TEST_SYSMAN_PASSWORD="053b744719dbc8cdfc8c8091b4ae5fa6c96d1620b18f2d96ca"
+DEMO_SYSMAN_PASSWORD="05fb9a4d4252d87b29cfce4ae9d289f5fab7cd31652f766584"
+SANDBOX_SYSMAN_PASSWORD="059c77773ca927ae449f54d1b296d816f9c3753d993990a15f"
+
+PROD_DBSNMP_PASSWORD="051623be2894b73aee15ada733395d89bd90afaba32e523bf4"
+TEST_DBSNMP_PASSWORD="05c9ad6a191c03925fc732c8064a51a71fd2f03ea5173f8131"
+DEMO_DBSNMP_PASSWORD="053b744719dbc8cdfc5982c563a3bd5962c24c6b135e9d9524"
+SANDBOX_DBSNMP_PASSWORD="057635833c6990efbabe3ba55df2b63b50329061ef38d77fea"
+
+PROD_AGENT_REGISTRATOR_PASSWORD="051623be2894b73aee15ada733395d89bd90afaba32e523bf4"
+TEST_AGENT_REGISTRATOR_PASSWORD="05c9ad6a191c03925fc732c8064a51a71fd2f03ea5173f8131"
+DEMO_AGENT_REGISTRATOR_PASSWORD="053b744719dbc8cdfc5982c563a3bd5962c24c6b135e9d9524"
+SANDBOX_AGENT_REGISTRATOR_PASSWORD="057635833c6990efbabe3ba55df2b63b50329061ef38d77fea"
+
+# The following 2 are not used yet. Specified directly in SQL files instead
+BL_PASSWORD="S:F87EF4F691D98EF8E0D8477F235D894FECE5FCC8AE84E209B393205C198C"
+DBADMIN_PASSWORD="S:095BB9E38C45305422CDA6EA232B0CD5079018FC3BA7419516A2A668CDC5"
+# Used for preparing the primary
+# Here escape $ with 3 slashes as that's needed when using it in this context
+prepare_primary_sql="set serveroutput on
+set heading off
+set feedback off
+--enable dg_broker
+alter system set dg_broker_start=true scope=both;
+--Add standby logs
+set serveroutput on
+DECLARE
+  l_cnt   NUMBER;
+  l_size  NUMBER;
+  l_group NUMBER;
+  l_thread NUMBER;
+  l_sql   VARCHAR2(4096);
+  l_data  varchar2(32);
+BEGIN
+  SELECT
+    COUNT(*),
+    MAX(bytes),
+    MAX(GROUP#),
+    MAX(thread#)
+  INTO
+    l_cnt,
+    l_size,
+    l_group,
+    l_thread
+  FROM
+    v\\\$log;
+  select value into l_data from v\\\$parameter where name = 'db_create_file_dest';
+  FOR i0 IN l_group+1..l_group+l_cnt+l_thread
+  LOOP
+    l_sql:='alter database add standby logfile thread '||(mod(i0,l_thread)+1)||' group '||i0||
+    ' '''||l_data||'(ONLINELOG)'' size '||l_size;
+    BEGIN
+      --dbms_output.put_line('Executing:'||l_sql);
+      EXECUTE immediate l_sql;
+    EXCEPTION
+    WHEN OTHERS THEN
+      dbms_output.put_line(l_sql||' failed with '||sqlerrm);
+    END;
+  END LOOP;
+END;
+/
+"
+# This is the sql that tries to demultiplex standby logs 
+# Will delete RECO before DATA if both exists
+demultiplex_standby_logs_sql="
+set serveroutput on
+DECLARE
+  sql_to_execute VARCHAR2(4096);
+BEGIN
+  FOR stdby_files_rec IN (
+    with ordered_standby_logfile as
+      (
+        select group#,  member,
+          case 
+            when member like '+DATA%' then 1 
+            when member like '+RECO%' then 2
+            else 3
+          end cust_order
+       from v\\\$logfile
+       where type='STANDBY'),   
+    standby_files_to_delete as
+      (
+        select group#,  member, cust_order
+        from ordered_standby_logfile 
+      minus
+        select group#,  member, cust_order from 
+        (
+          select First_Value(member) over (partition by group# order by cust_order ) first_member,group#,member,cust_order
+          from ordered_standby_logfile
+          where cust_order = 1
+        )
+        where first_member = member
+      )
+    select group#,  member, cust_order from standby_files_to_delete
+    )
+  LOOP
+    sql_to_execute:='ALTER DATABASE DROP LOGFILE MEMBER '''||stdby_files_rec.member||'''';
+    BEGIN
+      dbms_output.put_line('Executing: '||sql_to_execute);
+      EXECUTE immediate sql_to_execute;
+    EXCEPTION
+    WHEN OTHERS THEN
+      dbms_output.put_line('Failed with '||sqlerrm);
+    END;    
+  END LOOP;
+END;
+/
+"
+# Nordea environment file
+NORDEA_ENVIRONMENT_FILE="/etc/nordea_environment.conf"
+# Find Grid Home - complicated as we can't assume in the future /etc/oratab will have an ASM entry
+find_grid_home()
+{
+  # Where is the file that tells us where the oracle inventory is 
+  local ORAINST_LOC="/etc/oraInst.loc"
+  # If the file is there we can try to find the ASM home
+  if [ -f $ORAINST_LOC ]
+  then
+    # Look up the oracle inventory location
+    local ORAINVENTORY_LOCATION=`cat $ORAINST_LOC 2>>/dev/null | sed -n -e 's/inventory_loc=\(.*\)/\1/p' 2>>/dev/null`
+    if [ "$ORAINVENTORY_LOCATION" != "" ]
+    then
+      # If we wound the oracle inventory location look for grid home by looking for OraGI name 
+      GRID_HOME=`grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null | sed -n -e '/<HOME NAME=.*CRS="true"/s/.*LOC=\"\([^\"]*\)\".*CRS="true".*/\1/p' 2>>/dev/null`
+    fi
+  fi
+  if [ "$GRID_HOME" != "" ]
+  then
+    echo "$GRID_HOME"
+  fi
+}
+
+# Used to color text
+cecho() {
+  local code="\033["
+  case "$1" in
+    black  | bk) color="${code}0;30m";;
+    red    |  r) color="${code}1;31m";;
+    green  |  g) color="${code}1;32m";;
+    yellow |  y) color="${code}1;33m";;
+    blue   |  b) color="${code}1;34m";;
+    purple |  p) color="${code}1;35m";;
+    cyan   |  c) color="${code}1;36m";;
+    gray   | gr) color="${code}0;37m";;
+    *) local text="$1"
+  esac
+  [ -z "$text" ] && local text="$color$2${code}0m"
+  echo -e "$text"
+}
+
+get_configuration_parameter()
+{
+  local parameter="$1"
+  grep "^${parameter}=" ${NORDEA_ENVIRONMENT_FILE} >>${log_file} 2>&1 && sed -n "s/^${parameter}[[:space:]]*=[[:space:]]*\(.*\)/\1/p" ${NORDEA_ENVIRONMENT_FILE} || echo ""     
+}
+
+make_bakeup_directories()
+{
+  local database_unique_name=$1
+  local backup_directories=$(get_configuration_parameter "nordea_rman_directories")
+  # Loop over the directories found
+  for directory in ${backup_directories//,/ }
+  do
+    # DOes the directory exist
+    if [ -d ${directory} ]
+    then
+      mkdir -p ${directory}/${database_unique_name}
+    fi
+  done  
+  
+}
+#
+# Purpose: We only want root to run this
+#
+check_for_permission()
+{
+  local input_user
+  input_user=$1
+  if [ `id -un` != "$input_user" ]
+  then
+    echo " ERROR: No access rights. Need to be run as user $1"
+    exit 1
+  fi
+}
+
+
+#
+# string_contain
+#
+# Purpose: Will check if string argument 1 is in argument2
+# Arguments: The section part to print
+# Return: 0 if ok 1 otherwise
+#
+string_contain()
+{
+  [ -z "${2##*$1*}" ] && [ -z "$1" -o -n "$2" ]
+}
+
+# Will return 0 if parameter supplied is integer, otherwise return 1
+# Will also echo the number if it is integer
+check_integer()
+{
+  #log_file DEBUG "Entered function: $FUNCNAME"
+  test $1 -eq 0 2>/dev/null
+  if [ $? -eq 2 ]; then
+    return 1
+  else
+    echo $1
+  fi
+}  
+
+
+
+# Will find orainventory location and look up the ACTIVE agent
+find_agent_oracle_home()
+{
+  for ORAINST_LOC in "${ORA_INST_LOC_POSSIBLE_LOCATIONS[@]}"
+  do
+    if [ -f $ORAINST_LOC ] 
+    then
+      ORAINVENTORY_LOCATION=`cat $ORAINST_LOC | sed -n -e 's/inventory_loc=\(.*\)/\1/p'`
+      if [ "$ORAINVENTORY_LOCATION" = "" ]
+      then
+        echo "ERROR: Can't find oraInventory location in $ORAINST_LOC"
+        exit 1
+      fi
+      # Then find current agent oracle_home
+      AGENT_ORACLE_HOME=`grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml | sed -n -e '/<HOME NAME="agent.*/s/.*LOC=\"\([^\"]*\)\".*/\1/p'`
+      if [ "$AGENT_ORACLE_HOME" != "" ]
+      then
+        break
+      fi
+    fi
+  done
+  if [ "$AGENT_ORACLE_HOME" = "" ]
+  then
+    echo " WARNING: Can't find current agent oracle_home in any of ${ORA_INST_LOC_POSSIBLE_LOCATIONS[@]}" 
+  fi
+}
+
+
+# used to set obfusticated passwords
+set_password()
+{
+  case $1 in
+    p)
+    	SYS_PASSWORD=$PROD_SYS_PASSWORD
+    	ASM_SYS_PASSWORD=$PROD_ASM_SYS_PASSWORD
+    	SYSTEM_PASSWORD=$PROD_SYSTEM_PASSWORD
+    	SYSMAN_PASSWORD=$PROD_SYSMAN_PASSWORD
+    	DBSNMP_PASSWORD=$PROD_DBSNMP_PASSWORD
+    	AGENT_REGISTRATOR_PASSWORD=$PROD_AGENT_REGISTRATOR_PASSWORD
+    	;;
+    d)
+    	SYS_PASSWORD=$DEMO_SYS_PASSWORD
+    	ASM_SYS_PASSWORD=$DEMO_ASM_SYS_PASSWORD
+    	SYSTEM_PASSWORD=$DEMO_SYSTEM_PASSWORD
+    	SYSMAN_PASSWORD=$DEMO_SYSMAN_PASSWORD
+    	DBSNMP_PASSWORD=$DEMO_DBSNMP_PASSWORD
+    	AGENT_REGISTRATOR_PASSWORD=$DEMO_AGENT_REGISTRATOR_PASSWORD
+    	;;
+    t)
+    	SYS_PASSWORD=$TEST_SYS_PASSWORD
+    	ASM_SYS_PASSWORD=$TEST_ASM_SYS_PASSWORD
+    	SYSTEM_PASSWORD=$TEST_SYSTEM_PASSWORD
+    	SYSMAN_PASSWORD=$TEST_SYSMAN_PASSWORD
+    	DBSNMP_PASSWORD=$TEST_DBSNMP_PASSWORD
+    	AGENT_REGISTRATOR_PASSWORD=$TEST_AGENT_REGISTRATOR_PASSWORD
+    	;;
+    s)
+    	SYS_PASSWORD=$SANDBOX_SYS_PASSWORD
+    	ASM_SYS_PASSWORD=$SANDBOX_ASM_SYS_PASSWORD
+    	SYSTEM_PASSWORD=$SANDBOX_SYSTEM_PASSWORD
+    	SYSMAN_PASSWORD=$SANDBOX_SYSMAN_PASSWORD
+    	DBSNMP_PASSWORD=$SANDBOX_DBSNMP_PASSWORD
+    	AGENT_REGISTRATOR_PASSWORD=$SANDBOX_AGENT_REGISTRATOR_PASSWORD    	
+    	;;
+    *) echo " ERROR: Parameter 1 should be one of [pdts]"
+  esac
+}
+
+# Used to convert a string to lower case
+convert_to_lower()
+{
+  echo $1 | tr '[:upper:]' '[:lower:]'
+}
+# Used to convert a string to upper case
+convert_to_upper()
+{
+  echo $1 | tr '[:lower:]' '[:upper:]'
+}
+
+# These are the values for a normal micro database (including Multiple Instances)
+# Are now official
+set_micro_parameters()
+{
+  MAX_INSTANCES_TO_RUN_ON=2  
+  # Normal database parameters
+  CPU_COUNT=2
+  SGA_TARGET=5368709120
+  PGA_AGGREGATE_TARGET=1073741824
+  PARALLEL_MAX_SERVERS=1
+  LARGE_POOL_SIZE=134217728
+  JAVA_POOL_SIZE=134217728
+  SHARED_POOL_SIZE=301989888
+  DB_CACHE_SIZE=1610612736
+  JOB_QUEUE_PROCESSES=1
+  AQ_TM_PROCESSES=1
+  PARALLEL_DEGREE_LIMIT=2
+  PROCESSES=250
+  DB_FILES=4096
+  RECOVERY_PARALLELISM=1
+  LOG_ARCHIVE_MAX_PROCESSES=2
+  STREAMS_POOL_SIZE=134217728
+  # Seems not to work have put it under "size" directories also
+  DB_RECOVERY_FILE_DEST_SIZE_MB=524288
+  REDO_LOG_FILE_SIZE_MB=4096
+  PGA_AGGREGATE_LIMIT=$((PGA_AGGREGATE_TARGET*3))
+}
+
+# These are the values for a normal tiny database (including Multiple Instances)
+set_tiny_parameters()
+{
+  MAX_INSTANCES_TO_RUN_ON=2  
+  # Normal database parameters
+  CPU_COUNT=4
+  SGA_TARGET=10737418240
+  PGA_AGGREGATE_TARGET=2147483648
+  PARALLEL_MAX_SERVERS=3
+  LARGE_POOL_SIZE=268435456
+  JAVA_POOL_SIZE=134217728
+  SHARED_POOL_SIZE=2147483648
+  DB_CACHE_SIZE=3221225472
+  JOB_QUEUE_PROCESSES=2
+  AQ_TM_PROCESSES=1
+  PARALLEL_DEGREE_LIMIT=2
+  PROCESSES=500
+  DB_FILES=4096
+  RECOVERY_PARALLELISM=2
+  LOG_ARCHIVE_MAX_PROCESSES=4
+  STREAMS_POOL_SIZE=134217728
+  # Seems not to work have put it under "size" directories also
+  DB_RECOVERY_FILE_DEST_SIZE_MB=524288
+  REDO_LOG_FILE_SIZE_MB=4096
+  PGA_AGGREGATE_LIMIT=$((PGA_AGGREGATE_TARGET*3))
+}
+
+# These are the values for a normal small database (including Multiple Instances)
+set_small_parameters()
+{
+  MAX_INSTANCES_TO_RUN_ON=2  
+  # Normal database parameters
+  CPU_COUNT=6
+  SGA_TARGET=18253611008
+  PGA_AGGREGATE_TARGET=5368709120
+  PARALLEL_MAX_SERVERS=5
+  LARGE_POOL_SIZE=268435456
+  JAVA_POOL_SIZE=134217728
+  SHARED_POOL_SIZE=4294967296
+  DB_CACHE_SIZE=5368709120
+  JOB_QUEUE_PROCESSES=3
+  AQ_TM_PROCESSES=1
+  PARALLEL_DEGREE_LIMIT=4
+  PROCESSES=500
+  DB_FILES=8192
+  RECOVERY_PARALLELISM=2
+  LOG_ARCHIVE_MAX_PROCESSES=10
+  STREAMS_POOL_SIZE=134217728
+  # Seems not to work have put it under "size" directories also
+  DB_RECOVERY_FILE_DEST_SIZE_MB=1048576
+  REDO_LOG_FILE_SIZE_MB=4096
+  PGA_AGGREGATE_LIMIT=$((PGA_AGGREGATE_TARGET*3))
+}
+
+# These are the values for a normal medium database (including Multiple Instances)
+set_medium_parameters()
+{
+  MAX_INSTANCES_TO_RUN_ON=3  
+  # Normal database parameters
+  CPU_COUNT=8
+  SGA_TARGET=25769803776
+  PGA_AGGREGATE_TARGET=8589934592
+  PARALLEL_MAX_SERVERS=7
+  LARGE_POOL_SIZE=10737418240
+  JAVA_POOL_SIZE=268435456
+  SHARED_POOL_SIZE=5368709120
+  DB_CACHE_SIZE=7516192768
+  JOB_QUEUE_PROCESSES=4
+  AQ_TM_PROCESSES=2
+  PARALLEL_DEGREE_LIMIT=4
+  PROCESSES=1000
+  DB_FILES=10240
+  RECOVERY_PARALLELISM=3
+  LOG_ARCHIVE_MAX_PROCESSES=4
+  STREAMS_POOL_SIZE=268435456
+  # Seems not to work have put it under "size" directories also
+  DB_RECOVERY_FILE_DEST_SIZE_MB=2097152
+  REDO_LOG_FILE_SIZE_MB=4096
+  PGA_AGGREGATE_LIMIT=$((PGA_AGGREGATE_TARGET*3))
+}
+
+# These are the values for a normal large database (including Multiple Instances)
+set_large_parameters()
+{
+  MAX_INSTANCES_TO_RUN_ON=4  
+  # Normal database parameters
+  CPU_COUNT=12
+  SGA_TARGET=36507222016
+  PGA_AGGREGATE_TARGET=10737418240
+  PARALLEL_MAX_SERVERS=11
+  LARGE_POOL_SIZE=2147483648
+  JAVA_POOL_SIZE=402653184
+  SHARED_POOL_SIZE=7516192768
+  DB_CACHE_SIZE=10737418240
+  JOB_QUEUE_PROCESSES=6
+  AQ_TM_PROCESSES=4
+  PARALLEL_DEGREE_LIMIT=8
+  PROCESSES=2000
+  DB_FILES=4096
+  RECOVERY_PARALLELISM=3
+  LOG_ARCHIVE_MAX_PROCESSES=4
+  STREAMS_POOL_SIZE=402653184
+  # Seems not to work have put it under "size" directories also
+  DB_RECOVERY_FILE_DEST_SIZE_MB=4194304
+  REDO_LOG_FILE_SIZE_MB=4096
+  PGA_AGGREGATE_LIMIT=$((PGA_AGGREGATE_TARGET*3))
+}
+
+
+# Here we create the actual database
+create_database_dbca()
+{
+  # Anything special for the specific db versions
+  case $ORACLE_MAJOR_VERSION in
+    11)
+      SPECIAL_DB_PARAMETERS="";;
+    12)
+#      -initParams db_performance_profile=${DATABASE_TYPE}  \
+      SPECIAL_DB_PARAMETERS="-initParams pga_aggregate_limit=${PGA_AGGREGATE_LIMIT} \
+";;
+  esac;
+  if [ "$SKIP_EM_CONFIGURATION" = "N" ]
+  then
+  	# Dont skip
+    case $ORACLE_MAJOR_VERSION in
+      11)
+      	EM_CONFIGURATION="-sysmanPassword ${SYSMAN_PASSWORD} \
+  -dbsnmpPassword ${DBSNMP_PASSWORD} \
+  -emConfiguration CENTRAL \
+  -centralAgent ${AGENT_ORACLE_HOME} \
+";;
+      12)
+        EM_CONFIGURATION="-emConfiguration CENTRAL
+  -dbsnmpPassword ${DBSNMP_PASSWORD} \
+  -omsHost ${AGENT_REGISTRATOR_OMS_HOST} \
+  -omsPort ${AGENT_REGISTRATOR_OMS_PORT} \
+  -emUser ${AGENT_REGISTRATOR_USERNAME} \
+  -emPassword ${AGENT_REGISTRATOR_PASSWORD} \
+";;
+    esac;
+  else
+  	# Skip EM Configuration
+  	EM_CONFIGURATION=""
+  fi
+  export JRE_OPTIONS="-XX:MaxPermSize=128M"
+  $ORACLE_HOME/bin/dbca \
+  -silent \
+  -createDatabase  \
+  -templateName ${COMMON_TEMPLATES_DIRECTORY}/$TEMPLATE \
+  -sid $DATABASE_INSTANCE \
+  -gdbName $DATABASE_UNIQUE_NAME \
+  -sysPassword ${SYS_PASSWORD} \
+  -systemPassword ${SYSTEM_PASSWORD} \
+  -asmSysPassword ${ASM_SYS_PASSWORD} \
+  ${EM_CONFIGURATION}-storageType ASM \
+  ${SPECIAL_DB_PARAMETERS}-diskGroupName $ASM_DATA_DISK_GROUP \
+  -redundancy NORMAL \
+  -datafileDestination $ASM_DATA_DISK_GROUP \
+  -recoveryGroupName $ASM_RECO_DISK_GROUP \
+  -recoveryGroupRedundancy NORMAL \
+  -nodeinfo $INSTALL_ON_NODES \
+  -characterSet $CHARACTERSET  \
+  -nationalCharacterSet $NATIONAL_CHARACTERSET \
+  -obfuscatedPasswords true \
+  -sampleSchema false \
+  -redoLogFileSize $REDO_LOG_FILE_SIZE_MB \
+  -variables COMMON_TEMPLATES_DIRECTORY=$COMMON_TEMPLATES_DIRECTORY \
+  -variables CUSTOM1=exadata \
+  -variables CUSTOM2=nordea \
+  -variables CUSTOM3=${DATABASE_TYPE} \
+  -variables CUSTOM4=${ORACLE_MAJOR_VERSION} \
+  -variables CUSTOM5=none \
+  -variables CUSTOM6=none \
+  -variables CUSTOM7=none \
+  -variables CUSTOM8=none \
+  -variables CUSTOM9=none \
+  -initParams db_name=$DB_NAME \
+  -initParams cpu_count=$CPU_COUNT \
+  -initParams pga_aggregate_target=$PGA_AGGREGATE_TARGET \
+  -initParams db_unique_name=$DATABASE_UNIQUE_NAME \
+  -initParams large_pool_size=$LARGE_POOL_SIZE \
+  -initParams java_pool_size=$JAVA_POOL_SIZE \
+  -initParams shared_pool_size=$SHARED_POOL_SIZE \
+  -initParams db_cache_size=$DB_CACHE_SIZE \
+  -initParams job_queue_processes=$JOB_QUEUE_PROCESSES \
+  -initParams parallel_max_servers=$PARALLEL_MAX_SERVERS \
+  -initParams parallel_degree_limit=$PARALLEL_DEGREE_LIMIT \
+  -initParams aq_tm_processes=$AQ_TM_PROCESSES \
+  -initParams processes=$PROCESSES \
+  -initParams recovery_parallelism=$RECOVERY_PARALLELISM \
+  -initParams log_archive_max_processes=$LOG_ARCHIVE_MAX_PROCESSES \
+  -initParams sga_target=$SGA_TARGET \
+  -initParams db_create_online_log_dest_1=+$ASM_DATA_DISK_GROUP \
+  -initParams db_create_online_log_dest_2=+$ASM_DATA_DISK_GROUP \
+  -initParams streams_pool_size=$STREAMS_POOL_SIZE \
+  -initParams dg_broker_config_file1=+${ASM_DATA_DISK_GROUP}/${DATABASE_UNIQUE_NAME}/dr1${DATABASE_UNIQUE_NAME}.dat \
+  -initParams dg_broker_config_file2=+${ASM_DATA_DISK_GROUP}/${DATABASE_UNIQUE_NAME}/dr2${DATABASE_UNIQUE_NAME}.dat \
+  -initParams nls_length_semantics=$NLS_LENGTH_SEMANTICS \
+  -initParams db_files=$DB_FILES \
+  -initParams db_recovery_file_dest=+$ASM_RECO_DISK_GROUP \
+  -initParams db_recovery_file_dest_size=$DB_RECOVERY_FILE_DEST_SIZE_MB \
+  -initParams control_files=+${ASM_DATA_DISK_GROUP}
+  # Does not work
+  #-initParams audit_trail=XML/,EXTENDED
+  #-initParams 'audit_trail="${AUDIT_TRAIL}"'
+  #-initParams control_files='+${ASM_DATA_DISK_GROUP}/${DATABASE_UNIQUE_NAME}/control01.ctl','+${ASM_DATA_DISK_GROUP}/${DATABASE_UNIQUE_NAME}/control02.ctl'   
+}
+
+#
+# Parse arguments
+#
+# Purpose: Parses all the arguments received on command line
+#
+parse_arguments()
+{
+  if [ $# -eq 0 ]
+  then
+  	echo "No parameters given."
+  	echo "Information about environment"
+    print_environment
+    write_usage
+    exit
+  fi
+  # First check action is one we know off
+  VALID_ACTION_LIST="distribute delete create export import prepare duplicate demultiplex -h --help "
+  if string_contain "$1 " "$VALID_ACTION_LIST"
+  then
+    ACTION=$1
+  else
+    echo " ERROR: Action parameter \"$1\" given to script not recognized"
+    exit 1
+  fi
+  if [ "$ACTION" = "-h" -o "$ACTION" = "--help" ]
+  then
+    write_usage
+    exit
+  fi
+  shift
+  if [ $# -eq 0 ]
+  then
+    echo " ERROR: Action parameter \"$ACTION\" given to script needs to be followed by an object"
+    exit 1
+  fi
+  # Depending on action various objects might be specified
+  case $1 in
+    standbylog) OBJECT="standbylog";VALID_ACTION_LIST="demultiplex ";;
+    primary) OBJECT="primary";VALID_ACTION_LIST="prepare ";;
+    database) OBJECT="database";VALID_ACTION_LIST="delete create ";;
+    asmpasswordfile) OBJECT="asmpasswordfile";VALID_ACTION_LIST="export import ";;
+    passwordfile) OBJECT="passwordfile";VALID_ACTION_LIST="distribute ";;
+    *)            echo " ERROR: Object parameter $1 given to script not recognized";exit 1;;
+  esac;
+  shift  
+  # first check if we support combination
+  if ! string_contain  "$ACTION " "$VALID_ACTION_LIST" 
+  then
+    echo " ERROR: The action \"$ACTION\" is not not supported for object \"$OBJECT\". Actions allowed is \"$VALID_ACTION_LIST\""
+    exit 1
+  fi  
+  case $OBJECT in
+    standbylog)
+      check_for_permission oracle
+      case $ACTION in
+        demultiplex)
+          TEMP=`getopt -o "" --name "$0" --long databaseUniqueName: -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --databaseUniqueName) DATABASE_UNIQUE_NAME="$2";shift 2;;
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$DATABASE_UNIQUE_NAME" == "" ]
+          then
+            echo " ERROR: --databaseUniqueName <database unique name> needs to be specified"
+            exit 1
+          fi              
+          ;;
+      esac
+      ;;              
+    passwordfile)
+      check_for_permission oracle
+      case $ACTION in
+        distribute)
+          TEMP=`getopt -o "" --name "$0" --long databaseUniqueName: -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --databaseUniqueName) DATABASE_UNIQUE_NAME="$2";shift 2;;
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$DATABASE_UNIQUE_NAME" == "" ]
+          then
+            echo " ERROR: --databaseUniqueName <database unique name> needs to be specified"
+            exit 1
+          fi              
+          ;;
+      esac
+      ;;              
+    primary)
+      check_for_permission oracle
+      case $ACTION in
+        prepare)
+          TEMP=`getopt -o "" --name "$0" --long databaseUniqueName: -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --databaseUniqueName) DATABASE_UNIQUE_NAME="$2";shift 2;;
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$DATABASE_UNIQUE_NAME" == "" ]
+          then
+            echo " ERROR: --databaseUniqueName <database unique name> needs to be specified"
+            exit 1
+          fi              
+          ;;
+      esac
+      ;;          
+    asmpasswordfile)
+      check_for_permission grid
+      case $ACTION in
+        export)
+          TEMP=`getopt -o "" --name "$0" --long file:,databaseUniqueName: -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --file) IMPORT_EXPORT_FILE="$2";shift 2;;
+              --databaseUniqueName) DATABASE_UNIQUE_NAME="$2";shift 2;;
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$DATABASE_UNIQUE_NAME" == "" ]
+          then
+            echo " ERROR: --databaseUniqueName <database unique name> needs to be specified"
+            exit 1
+          fi              
+          if [ "$IMPORT_EXPORT_FILE" == "" ]
+          then
+            echo " ERROR: --file <file name> needs to be specified"
+            exit 1
+          fi          
+          ;;
+        import)
+          TEMP=`getopt -o "" --name "$0" --long file:,diskgroup:,databaseUniqueName:  -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --file) IMPORT_EXPORT_FILE="$2";shift 2;;
+              --diskGroup) IMPORT_DISK_GROUP="$2";shift 2;;
+              --databaseUniqueName) DATABASE_UNIQUE_NAME="$2";shift 2;;                
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$DATABASE_UNIQUE_NAME" == "" ]
+          then
+            echo " ERROR: --databaseUniqueName <database unique name> needs to be specified"
+            exit 1
+          fi              
+          if [ "$IMPORT_EXPORT_FILE" == "" ]
+          then
+            echo " ERROR: --file <file name> needs to be specified"
+            exit 1
+          fi          
+          if [ "$IMPORT_DISK_GROUP" == "" ]
+          then
+            echo " ERROR: --diskGroup <ASM disk group name> needs to be specified"
+            exit 1
+          fi          
+          ;;
+      esac
+      ;;
+    database)
+      check_for_permission oracle
+      case $ACTION in
+        delete)
+          TEMP=`getopt -o "" --name "$0" --long includingBackup,shutdownDatabase,databaseUniqueName:  -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --shutdownDatabase) SHUTDOWN_DATABASE="YES";shift;;
+              --databaseUniqueName) DATABASE_UNIQUE_NAME=`convert_to_lower $2`;shift 2 ;;
+              --includingBackup) INCLUDING_BACKUP="YES";shift ;;
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$DATABASE_UNIQUE_NAME" == "" ]
+          then
+            echo " ERROR: --databaseUniqueName <database unique name> needs to be specified"
+            exit 1
+          fi          
+          ;;
+        create)      
+          while [ $# -gt 0 ]
+          do
+            case $1 in
+              --help|-h|-help) write_usage; exit 0;;
+              --registerWithEm|-registerWithEm) SKIP_EM_CONFIGURATION="N";;
+              --oracleHome|-oracleHome) shift; ORACLE_HOME=$1;;
+              --installOnNodes|-installOnNodes) shift; INSTALL_ON_NODES=$1;;
+              --runOnNodes|-runOnNodes) shift; RUN_ON_NODES=$1;;
+              --databaseType|-databaseType) shift; DATABASE_TYPE=`convert_to_lower $1`;;
+        #      --runSingleInstance|-runSingleInstance) shift; SINGLE_INSTANCE="Y";;
+              --configureDataGuard|-configureDataGuard) shift; USE_DATA_GUARD="Y";;
+        #      --systemPassword|-systemPassword) shift; SYSTEM_PASSWORD=$1;;
+        #      --sysPassword|-sysPassword) shift; SYS_PASSWORD=$1;;
+        #      --asmSysPassword|-asmSysPassword) shift; ASM_SYS_PASSWORD=$1;;
+        #      --dbsnmpPassword|-dbsnmpPassword) shift; DBSNMP_PASSWORD=$1;;
+              --nlsLengthSemantics|-nlsLengthSemantics) shift; NLS_LENGTH_SEMANTICS=`convert_to_lower $1`;;
+              --databaseName|-databaseName) shift; DATABASE_NAME=`convert_to_lower $1`;;
+              --databaseUniqueName|-databaseUniqueName) shift; DATABASE_UNIQUE_NAME=`convert_to_lower $1`;;
+              --characterSet|-characterSet) shift; CHARACTERSET=$1;;
+              --nationalCharacterSet|-nationalCharacterSet) shift; NATIONAL_CHARACTERSET=$1;;
+              --asmDataDiskGroup|-asmDataDiskGroup) shift; ASM_DATA_DISK_GROUP=`convert_to_upper $1`;;
+              --asmRecoDiskGroup|-asmRecoDiskGroup) shift; ASM_RECO_DISK_GROUP=`convert_to_upper $1`;;
+              --datacenterSite|-datacenterSite) shift; DATACENTER_SITE=$1;;
+              --template|-template) shift; TEMPLATE=$1;;
+              --datacenterUniqueNumber|-datacenterUniqueNumber) shift; DATACENTER_UNIQUE_NUMBER=$1;;
+              --prepareAsStandby|-prepareAsStandby) PREPARE_AS_STANDBY="YES";;
+              --primaryScanListener|-primaryScanListener) shift; PRIMARY_SCAN_LISTENER=$1;;
+              --primaryDatabaseUniqueName) shift; PRIMARY_DATABASE_UNIQUE_NAME=$1;;
+              --prepareAsPrimary|-prepareAsPrimary) PREPARE_AS_PRIMARY="YES";;
+              --standbyScanListener|-standbyScanListener) shift; STANDBY_SCAN_LISTENER=$1;;
+              --standbyDatabaseUniqueName|-standbyDatabaseUniqueName) shift; STANDBY_DATABASE_UNIQUE_NAME=$1;;
+              --standbyVip|-standbyVip) shift; STANDBY_VIP=$1;;
+              --standbyAsmDataDiskGroup|-standbyAsmDataDiskGroup) shift; STANDBY_ASM_DATA_DISK_GROUP=`convert_to_upper $1`;;
+              --standbyAsmRecoDiskGroup|-standbyAsmRecoDiskGroup) shift; STANDBY_ASM_RECO_DISK_GROUP=`convert_to_upper $1`;;
+              *)            echo " ERROR: Parameter $1 given to script not recognized";exit 1;;
+            esac;
+            shift
+          done
+          create_database_check_arguments
+          ;;
+      esac
+      ;;
+  esac  
+}
+#
+# get_environment_names
+#
+# Purpose: Get some environment initially
+#
+get_environment_names()
+{
+  # The hostname without domain
+  SHORT_HOST_NAME=${HOSTNAME%%.*}
+  # Domainame
+  DOMAIN_NAME=${HOSTNAME#*.}
+  # Build a couple of variable holding all the nodes or the
+  # the ones that have been specified as parameter
+  # Was CLUSTER_NODES explicitely not asked for?
+  if [ "$CLUSTER_NODES" = "" ]
+  then
+    # Find the GRID ORACLE_HOME
+    GRID_ORACLE_HOME=$(find_grid_home) 
+    # Get the cluster name
+    GRID_CLUSTER_NAME=`$GRID_ORACLE_HOME/bin/cemutlo -n`
+    # Get ASM Instance on this box
+    GRID_ASM_INSTANCE=`ps -ef | grep pmon_+ASM | grep asm_ | sed -n "s/.*\(+ASM[0123456789][0123456789]*\)/\1/p"`
+    # Get a list of all nodes in cluster
+    RAC_NODES=`$GRID_ORACLE_HOME/bin/olsnodes`
+    RAC_NODES=`echo $RAC_NODES`
+    for RAC_NODE in $RAC_NODES
+    do
+      if [ "$CLUSTER_NODES" = "" ]
+      then
+        CLUSTER_NODES="$RAC_NODE"
+      else
+        CLUSTER_NODES="$CLUSTER_NODES,$RAC_NODE"
+      fi
+    done
+    INSTALL_ON_NODES=$CLUSTER_NODES
+  else
+    for RAC_NODE in ${CLUSTER_NODES//,/ }
+    do
+      if [ "$RAC_NODES" = "" ]
+      then
+        RAC_NODES="$RAC_NODE"
+      else
+        RAC_NODES="$RAC_NODES $RAC_NODE"
+      fi
+    done
+  fi
+  # Find the ASM disk groups on this cluster
+  while read LINE; do
+  	# If empty lines skip them
+  	if [ "$LINE" = "" ]; then continue; fi 
+  	# Parse the line
+  	case $LINE in
+  	  DATA*) ASM_DATA_DISK_GROUP="$LINE";;
+  	  RECO*) ASM_RECO_DISK_GROUP="$LINE";;
+    esac
+  done < <(export ORACLE_SID=${GRID_ASM_INSTANCE}; export ORACLE_HOME=${GRID_ORACLE_HOME}; echo "$ASM_DISK_GROUPS_SQL"|${GRID_ORACLE_HOME}/bin/sqlplus -S / as sysdba)
+  case $GRID_CLUSTER_NAME in
+  	dm00*) DATACENTER_SITE='h' ;;
+  	dm11*) DATACENTER_SITE='h'; AUDIT_TRAIL="DB,EXTENDED" ;;
+  	dm12*) DATACENTER_SITE='c'; AUDIT_TRAIL="DB,EXTENDED" ;;
+  	dm13*) DATACENTER_SITE='h'; AUDIT_TRAIL="DB,EXTENDED" ;;
+  	dm14*) DATACENTER_SITE='c'; AUDIT_TRAIL="DB,EXTENDED" ;;
+  	dm15*) DATACENTER_SITE='h' ;;
+  	dm16*) DATACENTER_SITE='c' ;;
+  	dm17*) DATACENTER_SITE='h' ;;
+  	dm18*) DATACENTER_SITE='c' ;;
+  	dm19*) DATACENTER_SITE='h' ;;
+  	dm20*) DATACENTER_SITE='c' ;;
+  	dm21*) DATACENTER_SITE='h' ;;
+  	dm22*) DATACENTER_SITE='c' ;;
+  	db-e*) # New Exadata naming, parse data center site from db-s001oed-clu
+  	       [[ $GRID_CLUSTER_NAME =~ db-e(.{3})(.{2})(.{1})-clu ]]
+  	       if [ $? -eq 0 ]
+  	       then
+  	         case ${BASH_REMATCH[2]} in # Site
+  	           oe) DATACENTER_SITE='o';;
+  	           cb) DATACENTER_SITE='c';;
+  	           hh) DATACENTER_SITE='h';;
+  	           s1) DATACENTER_SITE='x';;
+  	           s2) DATACENTER_SITE='y';;
+  	           *) 
+                   cecho r "  ERROR: Grid Site name in $GRID_CLUSTER_NAME is not one of <oe|hh|cb>"
+                   exit 1;;
+  	         esac  	   
+  	       else
+  	         cecho r "  ERROR: Grid Cluster Name $GRID_CLUSTER_NAME is not one of on the form db-s<3 digts><oe|hh|cb><p|d|t|s>-clu"
+  	         exit 1
+  	       fi;;
+  	rac4) DATACENTER_SITE='s'
+          AGENT_REGISTRATOR_USERNAME="$TEST_AGENT_REGISTRATOR_USERNAME"
+          AGENT_REGISTRATOR_OMS_PORT="$TEST_AGENT_REGISTRATOR_OMS_PORT"
+          AGENT_REGISTRATOR_OMS_HOST="$TEST_AGENT_REGISTRATOR_OMS_HOST"
+  	  ;;
+  	    *) echo " ERROR: Grid Cluster Name $GRID_CLUSTER_NAME is not one of dm00, dm11*,dm12*,dm13*,dm14*,dm15*,dm16,dm17,dm18,dm19,dm20,dm21 or dm22*"; exit 1;;
+  esac
+  # Do we run in a shared tns_admin environment
+  if [ -f ${CLUSTERED_TNS_ADMIN}/tnsnames.ora ]
+  then
+  	export TNS_ADMIN=${CLUSTERED_TNS_ADMIN}
+  	USING_SHARED_TNS_ADMIN="Y"
+  fi
+  # Find agent oracle_home
+  find_agent_oracle_home
+  #echo $AGENT_ORACLE_HOME
+}
+
+#
+# create_database_check_arguments
+#
+# Purpose: checks if all arguments given on command line is valid
+#
+create_database_check_arguments()
+{
+  errors_found=0
+  if [ "$AGENT_ORACLE_HOME" = "" -a "$SKIP_EM_CONFIGURATION" = "N" ]
+    then
+      echo " ERROR: No agent home found. Can't register with Enterprise Manager. Specify --skipEmConfiguration to skip registration"
+      (( errors_found++ ))
+    fi  
+  if [ -z "${ORACLE_HOME}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --oracleHome has to be given or ORACLE_HOME env variable should be set"
+    (( errors_found++ ))
+  else
+    if [ ! -f $ORACLE_HOME/bin/sqlplus ]
+    then
+      echo " ERROR: $ORACLE_HOME/bin/sqlplus not found. Is Oracle Home specified correct?"
+      (( errors_found++ ))
+    fi
+  fi
+  if [ -z "${INSTALL_ON_NODES}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --installOnNodes has to be given or INSTALL_ON_NODES env variable should be set"
+    (( errors_found++ ))
+  fi
+  if [ -z "${RUN_ON_NODES}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --runOnNodes has to be given or RUN_ON_NODES env variable should be set"
+    (( errors_found++ ))
+  fi
+  if [ -z "${DATABASE_TYPE}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --databaseType has to be given or DATABASE_TYPE env variable should be set"
+    (( errors_found++ ))
+  else
+  	# Check that type is a supported one and set parameters accordingly
+  	case $DATABASE_TYPE in
+  	  micro) set_micro_parameters ;;
+  	  tiny) set_tiny_parameters ;;
+  	  small) set_small_parameters ;;
+  	  medium) set_medium_parameters ;;
+  	  large) set_large_parameters ;;
+  	  *) echo " ERROR: --databaseType $DATABASE_TYPE not supported should be one of: micro,tiny,small,medium,large"
+  	esac
+  fi
+#  if [ -z "${SYSTEM_PASSWORD}" ]  # Is this variable defined?
+#  then
+#    echo " ERROR: --systemPassword has to be given or SYSTEM_PASSWORD env variable should be set"
+#    (( errors_found++ ))
+#  fi
+#  if [ -z "${SYS_PASSWORD}" ]  # Is this variable defined?
+#  then
+#    echo " ERROR: --sysPassword has to be given or SYS_PASSWORD env variable should be set"
+#    (( errors_found++ ))
+#  fi
+#  if [ -z "${ASM_SYS_PASSWORD}" ]  # Is this variable defined?
+#  then
+#    echo " ERROR: --asmSysPassword has to be given or ASM_SYS_PASSWORD env variable should be set"
+#    (( errors_found++ ))
+#  fi
+#  if [ -z "${DBSNMP_PASSWORD}" ]  # Is this variable defined?
+#  then
+#    echo " ERROR: --dbsnmpPassword has to be given or DBSNMP_PASSWORD env variable should be set"
+#    (( errors_found++ ))
+#  fi
+  if [ -z "${DATABASE_NAME}" ]  # Is this variable defined?
+  then
+    # Check if database unique name is set and check that values are OK
+    if [ -z "${DATABASE_UNIQUE_NAME}" ]  # Is this variable defined?
+    then
+      echo " ERROR: --databaseName or --databaseUniqueName has to be given or DATABASE_NAME/DATABASE_UNIQUE_NAME env variable should be set"
+      (( errors_found++ ))      
+      if [[ "${DATABASE_NAME:${#DATABASE_NAME} -1}" != [pdts] ]]
+      then
+        echo " ERROR: third last character in --databaseUniqueName (${DATABASE_NAME:${#DATABASE_NAME} -1}) needs to end on a character in the following set [pdts]"
+      fi
+    else
+      # Now check if it's ok
+      #<dbname>p|d|t|s<data center uniqe number 1-9><datacenter site>
+      if [ ${#DATABASE_UNIQUE_NAME} -gt 8 ]
+      then
+      	echo " ERROR: --databaseUniqueName $DATABASE_NAME is to long, Max size is 8"
+        (( errors_found++ ))
+      fi
+      if [ "${DATABASE_UNIQUE_NAME:${#DATABASE_UNIQUE_NAME} -1}" != "$DATACENTER_SITE" ]
+      then
+        echo " ERROR: last character in --databaseUniqueName (${DATABASE_UNIQUE_NAME:${#DATABASE_UNIQUE_NAME} -1}) does not match --datacenterSite ($DATACENTER_SITE)"
+        (( errors_found++ ))
+      fi
+      local database_unique_name_minus_site="${DATABASE_UNIQUE_NAME%?}"
+      if [[ "${database_unique_name_minus_site:${#database_unique_name_minus_site} -1}" != [1-9] ]]
+      then
+        echo " ERROR: second last character (Datacenter Unique Number) in --databaseUniqueName (${database_unique_name_minus_site:${#database_unique_name_minus_site} -1}) does not match [1-9}"
+        (( errors_found++ ))
+      else
+        # Extract the site number
+        DATACENTER_UNIQUE_NUMBER="${database_unique_name_minus_site:${#database_unique_name_minus_site} -1}"
+      fi
+      DATABASE_NAME="${database_unique_name_minus_site%?}"
+    fi
+  else
+    if [ ${#DATABASE_NAME} -gt 6 ]
+    then
+    	echo " ERROR: --databaseName $DATABASE_NAME is to long, Max size is 6"
+      (( errors_found++ ))
+    fi
+    if [[ "${DATABASE_NAME:${#DATABASE_NAME} -1}" != [pdts] ]]
+    then
+      echo " ERROR: --databaseName $DATABASE_NAME needs to end on a character in the following set [pdts]"
+      (( errors_found++ ))
+    fi
+    if [[ "${DATACENTER_UNIQUE_NUMBER}" != [1-9] ]]
+    then
+      echo " ERROR: --datacenterUniqueNumber does not match [1-9}"
+      (( errors_found++ ))
+    fi    
+  fi
+  if [[ $DATABASE_NAME =~ ^[a-z].*[pdts]$ ]]
+  then
+    :
+  else
+    echo "  ERROR: Database name has to start with character [a-z]"
+    (( errors_found++ ))
+  fi
+  if [[ $DATABASE_NAME =~ ^.([a-z]|[0-9])*[pdts]$ ]]
+  then
+    :
+  else
+    echo "  ERROR: Database name except first chaacter has to be made of characters [a-z] or [0-9]"
+    (( errors_found++ ))
+  fi
+  # If character set - has been checked
+  case ${DATABASE_NAME:${#DATABASE_NAME} -1} in
+    p) set_password "p"
+    	 # Maybe check if RAC and DG makes sense
+    	 ;;
+    d) set_password "d"
+    	 # Maybe check if RAC and DG makes sense
+    	 ;;
+    t) set_password "t"
+    	 # Maybe check if RAC and DG makes sense
+    	 ;;
+    s) set_password "s"
+    	 # Maybe check if RAC and DG makes sense
+    	 ;;
+  esac    
+  if [ -z "${CHARACTERSET}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --characterSet has to be given or CHARACTERSET env variable should be set"
+    (( errors_found++ ))
+  fi
+  if [ -z "${NATIONAL_CHARACTERSET}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --nationalCharacterSet has to be given or NATIONAL_CHARACTERSET env variable should be set"
+    (( errors_found++ ))
+  fi
+  if [ -z "${NLS_LENGTH_SEMANTICS}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --nlsLengthSemantics has to be given or NLS_LENGTH_SEMANTICS env variable should be set"
+    (( errors_found++ ))
+  else
+  	case ${NLS_LENGTH_SEMANTICS} in
+  	  byte) : ;;
+  	  char) : ;;
+  	  *)  (( errors_found++ ))
+  	  	  echo " ERROR: --nlsLengthSemantics $NLS_LENGTH_SEMANTICS needs to either BYTE or CHAR"
+  	esac
+  fi
+  if [ -z "${ASM_DATA_DISK_GROUP}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --asmDataDiskGroup has to be given or ASM_DATA_DISK_GROUP env variable should be set"
+    (( errors_found++ ))
+  fi
+  if [ -z "${ASM_RECO_DISK_GROUP}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --asmRecoDiskGroup has to be given or ASM_RECO_DISK_GROUP env variable should be set"
+    (( errors_found++ ))
+  fi
+  if [ -z "${DATACENTER_SITE}" ]  # Is this variable defined?
+  then
+    echo " ERROR: --datacenterSite has to be given or DATACENTER_SITE env variable should be set"
+    (( errors_found++ ))
+  fi
+  # Check standby/primary parameters
+  if [ "$PREPARE_AS_STANDBY" == "YES" -a "$PREPARE_AS_PRIMARY" = "YES" ]
+  then
+    echo " ERROR: --prepareAsStandby and  --prepareAsPrimary can not both be specified"
+    (( errors_found++ ))
+  fi
+  # Check Standby parameters
+  if [ "$PREPARE_AS_STANDBY" == "YES"  ]
+  then
+    # Need to check that parameters needed are given
+    if [ "$PRIMARY_SCAN_LISTENER" =  "" -a "$PRIMARY_DATABASE_UNIQUE_NAME" =  "" ]
+    then
+      echo " ERROR: --primaryScanListener and --primaryDatabaseUniqueName needs to be specified when --prepareAsStandby is specified"
+      (( errors_found++ ))
+    fi
+    # If any of the 2 parameters are specified they all need to be there
+    if [ "$PRIMARY_SCAN_LISTENER" !=  "" -o "$PRIMARY_DATABASE_UNIQUE_NAME" !=  "" ]
+    then
+      if [ "$PRIMARY_SCAN_LISTENER" ==  "" ]
+      then
+        echo " ERROR: --primaryScanListener needs to be specified together with --primaryDatabaseUniqueName"
+        (( errors_found++ ))
+      fi
+      if [ "$PRIMARY_DATABASE_UNIQUE_NAME" ==  "" ]
+      then
+        echo " ERROR: --primaryDatabaseUniqueName needs to be specified together with --primaryScanListener"
+        (( errors_found++ ))
+      fi
+    fi      
+  else
+    if [ "$PRIMARY_SCAN_LISTENER" != "" ]
+    then
+      echo " ERROR: --primaryScanListener can only be specified when --prepareAsStandby is specified"
+      (( errors_found++ ))
+    fi
+    if [ "$PRIMARY_DATABASE_UNIQUE_NAME" != "" ]
+    then
+      echo " ERROR: --primaryDatabaseUniqueName can only be specified when --prepareAsStandby is specified"
+      (( errors_found++ ))
+    fi
+  fi
+  # Check standby parameters
+  if [  "$PREPARE_AS_PRIMARY" = "YES" ]
+  then
+    # Check that needed parameters are there
+    if [ "$STANDBY_SCAN_LISTENER" =  "" -a "$STANDBY_DATABASE_UNIQUE_NAME" =  "" -a "$STANDBY_VIP" =  "" ]
+    then
+      echo " ERROR: --standbyScanListener, --standbyDatabaseUniqueName and --standbyVip needs to be specified when --prepareAsPrimary is specified "
+      (( errors_found++ ))
+    fi
+    # If any of the 3 parameters are specified they all need to be there
+    if [ "$STANDBY_SCAN_LISTENER" !=  "" -o "$STANDBY_DATABASE_UNIQUE_NAME" !=  "" -o "$STANDBY_VIP" !=  "" ]
+    then
+      if [ "$STANDBY_SCAN_LISTENER" ==  "" ]
+      then
+        echo " ERROR: --standbyScanListener needs to be specified together with --standbyDatabaseUniqueName and --standbyVip"
+        (( errors_found++ ))
+      fi
+      if [ "$STANDBY_DATABASE_UNIQUE_NAME" ==  "" ]
+      then
+        echo " ERROR: --standbyDatabaseUniqueName needs to be specified together with --standbyScanListener and --standbyVip"
+        (( errors_found++ ))
+      fi
+      if [ "$STANDBY_VIP" ==  "" ]
+      then
+        echo " ERROR: --standbyVip needs to be specified together with --standbyDatabaseUniqueName and --standbyScanListener"
+        (( errors_found++ ))
+      fi
+    fi      
+  else
+    if [ "$STANDBY_SCAN_LISTENER" != "" ]
+    then
+      echo " ERROR: --standbyScanListener can only be specified when --prepareAsPrimary is specified"
+      (( errors_found++ ))
+    fi
+    if [ "$STANDBY_DATABASE_UNIQUE_NAME" != "" ]
+    then
+      echo " ERROR: --standbyDatabaseUniqueName can only be specified when --prepareAsPrimary is specified"
+      (( errors_found++ ))
+    fi
+    if [ "$STANDBY_VIP" != "" ]
+    then
+      echo " ERROR: --standbyVip can only be specified when --prepareAsPrimary is specified"
+      (( errors_found++ ))
+    fi
+    if [ "$STANDBY_ASM_DATA_DISK_GROUP" != "" ]
+    then
+      echo " ERROR: --standbyAsmDataDiskGroup can only be specified when --prepareAsPrimary is specified"
+      (( errors_found++ ))
+    fi
+    if [ "$STANDBY_ASM_RECO_DISK_GROUP" != "" ]
+    then
+      echo " ERROR: --standbyAsmRecoDiskGroup can only be specified when --prepareAsPrimary is specified"
+      (( errors_found++ ))
+    fi    
+  fi
+  if [ $errors_found -gt 0 ]
+  then
+  	exit 2
+  fi
+  # Check that RUN_ON_NODES is one of the nodes in this cluster
+  total_nodes_found=0
+  for run_node in  ${RUN_ON_NODES//,/ }
+  do
+  	(( total_nodes_found++ ))
+  	ALL_RUN_ON_NODES[$total_nodes_found]=$run_node
+  	found="N"
+    for install_node in ${INSTALL_ON_NODES//,/ }
+    do
+      if [ "$install_node" = "$run_node" ]
+      then
+        # It's OK
+        found="Y"
+      fi
+    done
+    if [ "$found" = "N" ]
+    then
+      echo " ERROR: The node $run_node is not one of the nodes in $INSTALL_ON_NODES"
+      exit 1
+    fi
+  done  
+  if [ $total_nodes_found -gt $MAX_INSTANCES_TO_RUN_ON ]
+  then
+    echo " ERROR: Want to run on $total_nodes_found nodes, but database type \"${DATABASE_TYPE}\" only allows to run on max $MAX_INSTANCES_TO_RUN_ON node(s)"
+    exit 1
+  fi
+  # Generate some random number that points to the index of one of the run_node
+  node_selected_for_service=$(( RANDOM % total_nodes_found + 1 ))
+  # Pick the node
+  RUN_NODE_FOR_APP_SERVICE=${ALL_RUN_ON_NODES[node_selected_for_service]}
+}
+
+#
+# create_database_build_environment_names
+#
+# Purpose: Build some environment names based on parameters
+#          given to script plus other variables needed
+#
+create_database_build_environment_names()
+{
+  DB_NAME=$DATABASE_NAME
+  DATABASE_UNIQUE_NAME="${DATABASE_NAME}${DATACENTER_UNIQUE_NUMBER}${DATACENTER_SITE}"
+  ORACLE_BASE=$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/orabase)
+  DATABASE_INSTANCE=$DATABASE_UNIQUE_NAME
+  # Find version of oracle_home
+  ORACLE_HOME_VERSION=`export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/sqlplus -version | sed -n "s/.*elease[[:space:]]\([^ \t].*\)[[:space:]].*/\1/p"`
+  if [[ "$ORACLE_HOME_VERSION" =~ ^11.* ]]; then
+    ORACLE_MAJOR_VERSION=11
+    TEMPLATE=$TEMPLATE_11
+  fi
+  if [[ "$ORACLE_HOME_VERSION" =~ ^12.* ]]; then
+    ORACLE_MAJOR_VERSION=12
+    TEMPLATE=$TEMPLATE_12
+  fi  
+  if [[ "$ORACLE_HOME_VERSION" =~ ^13.* ]]; then
+    ORACLE_MAJOR_VERSION=13
+    TEMPLATE=$TEMPLATE_13
+  fi  
+  echo "Oracle Home major version=$ORACLE_MAJOR_VERSION"
+}
+
+print_environment()
+{
+  echo "        Grid cluster name: $GRID_CLUSTER_NAME"
+  echo "         Nodes in cluster: $CLUSTER_NODES"
+  echo "Found ASM DATA disk group: $ASM_DATA_DISK_GROUP"
+  echo "Found ASM RECO disk group: $ASM_RECO_DISK_GROUP"
+}
+
+write_usage()
+{
+  # Removed until script is cleaned up to allow this correctly
+  #$script_name prepare primary
+  #  --databaseUniqueName <unique name of database>  
+  cat << EOF
+$0 is used to create standard nordea databases on Exadata.
+The script will create a database and create a number of services for accessing
+the database. Also it can be used in helping setting up an initial 2 site
+data guard setup.
+
+Usage:
+  $script_name demultiplex standbylog
+    --databaseUniqueName <unique name of database>    
+  $script_name distribute passwordfile
+    --databaseUniqueName <unique name of database>    
+  $script_name delete database
+    --databaseUniqueName <unique name of database>
+    [--shutdownDatabase]
+    [--includingBackup]
+  $script_name create database
+    --oracleHome <Path to the Oracle Home where the database should run from>
+    --runOnNodes <The database type that will be created>
+    --databaseType <The database type that will be created>
+    --databaseName <The raw database name>|--databaseUniqueName <unique name of database>
+    --registerWithEm
+    [--characterSet <Characterset to use >]
+    [--nationalCharacterSet <National Characterset to use>]
+    [--nlsLengthSemantics char|byte]
+    [--installOnNodes <Comma separated list of node names>]
+    [--asmDataDiskGroup <The ASM diskgroup for data>]
+    [--asmRecoDiskGroup <The ASM diskgroup for Recovery files etc>] 
+    [--datacenterUniqueNumber <single digit>]
+    [--datacenterSite <single letter>]
+    [--prepareAsStandby 
+      [--primaryScanListener <scan listener dns of primary db>
+       --primaryDatabaseUniqueName <database unique name of the primary database>
+      ]|[--prepareAsPrimary 
+      [--standbyScanListener <scan listener dns of standby db>
+       --standbyDatabaseUniqueName <database unique name of the standby database>
+       --standbyVip <vip name of standby database where we will duplicate to>
+       [--standbyAsmDataDiskGroup <The ASM diskgroup for data on standby site>]
+       [--standbyAsmRecoDiskGroup <The ASM diskgroup for reco on standby site>]
+      ]   
+    ]
+
+More explanation of parameters
+--oracleHome   <Path to the Oracle Home where the database should run from>
+--runOnNodes   <Comma separated list of node names the database will actively
+               run on after the install>
+--databaseType <The database type that will be created>. Can be one of micro,
+               tiny,small,medium or large. Will set various sizing parameters
+               differently.
+--databaseName <The database name to create. This should NOT include the
+               datacenter sites "letter" as that will be added by other means.
+               Also be aware the the last letter has to be one of (s=sandbox,
+               t=test,p=production,d=development)
+--characterSet <Characterset to use when creating the database>. If not
+               specified it will default to AL32UTF8>
+--nationalCharacterSet
+               <National Characterset to use when creating the database>. If
+               not specified it will default to AL16UTF16>
+--nlsLengthSemantics
+               <enables you to create CHAR and VARCHAR2 columns using either
+               byte or character length semantics. Default is char, possible
+               values are [byte|char]>
+--installOnNodes
+               <What nodes will the database instances be registered on.
+               Normally we will prepare running instances on all nodes which
+               is the default if the parameter is not specified.
+--asmDataDiskGroup
+               <The ASM diskgroup for data. If not specified will default to
+               the diskgroup on the cluster that starts with DATA>
+--asmRecoDiskGroup
+               <The ASM diskgroup for Recovery files etc. If not specified will
+               default to the diskgroup on the cluster that starts with RECO
+--datacenterUniqueNumber
+               <A single digit that identifies a unique number of the database
+               on a specific site. Normally 1, but if a standby database is 
+               created on the same site this option needs to be specified. The
+               number specified should be different than all other numbers used
+               for this database on this site.
+               Default value 1.
+--datacenterSite
+               <The single letter that identifies the datacenter (c,h or o).
+               Will default try to find the site the cluster is located on>
+--prepareAsStandby
+               Will prepare the database to be a standby database. That is it
+               will create the database and then clean it out. Enable dataguard
+               broker and start it an instance in mount mode.
+--primaryScanListener
+               <scan listenere of the primary database> Can be used when 
+               specifying  --prepareAsStandby. If this and
+               --primaryDatabaseUniqueName is specified tns entries will be
+               created automtically for a two site data guard setup.
+--primaryDatabaseUniqueName
+               <database unique name of the primary database>  Can be used when 
+               specifying  --prepareAsStandby. If this and
+               --primaryScanListener is specified tns entries will be
+               created automtically for a two site data guard setup.
+--prepareAsPrimary
+               Will prepare the database to be a primary database. That is it
+               will create the database and create standby log files. Enable
+               dataguard broker and start the database. Will print needed
+               information to be used when finalizing the Data Guard setup.
+--standbyScanListener
+               <scan listenere of the standby database> Can be used when 
+               specifying  --prepareAsPrimary. If this and --standbyVip and
+               --standbyDatabaseUniqueName is specified tns entries will be
+               created automtically for a two site data guard setup.
+--standbyDatabaseUniqueName
+               <database unique name of the standby database> Can be used when 
+               specifying  --prepareAsPrimary. If this and --standbyVip and
+               --standbyScanListener is specified tns entries will be
+               created automtically for a two site data guard setup.
+--standbyVip 
+               <vip name of standby database where we will duplicate to>  Can be
+               used when specifying  --prepareAsPrimary. If this and 
+               --standbyDatabaseUniqueName and --standbyScanListener is
+               specified tns entries will be created automtically for a two site
+               data guard setup.
+--standbyAsmDataDiskGroup
+               <The ASM diskgroup for data on standby site> Can be
+               used when specifying --prepareAsPrimary. Will help generate rman
+               scripts and dataguard broker entries.
+--standbyAsmRecoDiskGroup
+               <The ASM diskgroup for reco on standby site> Can be
+               used when specifying --prepareAsPrimary. Will help generate rman
+               scripts and dataguard broker entries.
+--registerWithEm
+               Will register the database in Enterprise Manager
+EOF
+}
+
+
+delete_database_report()
+{
+  # We will now create some logs about what we have deleted
+  # Make sure log directory is there
+  mkdir -p $LOG_DIRECTORY
+  echo "Script Version: $SVERSION" >$LOG_DIRECTORY/report.txt
+  echo "Probably executed by: $(logname)"
+  echo "Database name: ${DATABASE_UNIQUE_NAME}"
+  echo "Command Line parameters:  CMD_LINE_PARAMS" >>$LOG_DIRECTORY/report.txt
+}
+
+create_database_report()
+{
+  # We will now create some logs about what we have build
+  # Make sure log directory is there
+  mkdir -p $LOG_DIRECTORY
+  echo "Script Version: $SVERSION" >$LOG_DIRECTORY/report.txt
+  echo "Probably executed by: $(logname)">>$LOG_DIRECTORY/report.txt
+  echo "Database name: ${DATABASE_NAME}"
+  echo "Command Line parameters:  $CMD_LINE_PARAMS" >>$LOG_DIRECTORY/report.txt
+  echo "Config Database ($ORACLE_HOME/bin/srvctl config database -d $DATABASE_UNIQUE_NAME -v -a):">>$LOG_DIRECTORY/report.txt
+  echo "===Config Database START===">>$LOG_DIRECTORY/report.txt
+  $ORACLE_HOME/bin/srvctl config database -d $DATABASE_UNIQUE_NAME -v -a >>$LOG_DIRECTORY/report.txt
+  echo "===Config Database END===">>$LOG_DIRECTORY/report.txt
+  echo "Status Database ($ORACLE_HOME/bin/srvctl status database -d $DATABASE_UNIQUE_NAME -v -f):">>$LOG_DIRECTORY/report.txt
+  echo "===Status Database START===">>$LOG_DIRECTORY/report.txt
+  $ORACLE_HOME/bin/srvctl status database -d $DATABASE_UNIQUE_NAME -v -f >>$LOG_DIRECTORY/report.txt
+  echo "===Status Database END===">>$LOG_DIRECTORY/report.txt
+  echo "Status Service ($ORACLE_HOME/bin/srvctl status service -d $DATABASE_UNIQUE_NAME -v):">>$LOG_DIRECTORY/report.txt
+  echo "===Status Service START===">>$LOG_DIRECTORY/report.txt
+  $ORACLE_HOME/bin/srvctl status service -d $DATABASE_UNIQUE_NAME -v >>$LOG_DIRECTORY/report.txt
+  echo "===Status Service END===">>$LOG_DIRECTORY/report.txt
+  # Find artifacts and put them in catalog as zip file including the report.txt
+  # $LOG_DIRECTORY/report.txt
+  # $COMMON_TEMPLATES_DIRECTORY
+  database_name_uppercase=$(convert_to_upper ${DATABASE_NAME})
+  database_unique_name_lowercase=$(convert_to_lower ${DATABASE_UNIQUE_NAME})
+  mv ${dbca_logs_directory}/${database_unique_name_lowercase} ${LOG_DIRECTORY} 
+  mv ${LIB_LOG_LOCATION}/${database_name_uppercase}* ${LOG_DIRECTORY}
+  mv ${LOG_DIRECTORY} ${LOG_DIRECTORY}_${database_unique_name_lowercase}
+}
+
+set_grid_home()
+{
+  local ORAINST_LOC="/etc/oraInst.loc"
+  if [ -f $ORAINST_LOC ]
+  then
+    local ORAINVENTORY_LOCATION=`cat $ORAINST_LOC 2>>/dev/null | sed -n -e 's/inventory_loc=\(.*\)/\1/p' 2>>/dev/null`
+    if [ "$ORAINVENTORY_LOCATION" != "" ]
+    then
+      GRID_ORACLE_HOME=`grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null | sed -n -e '/<HOME NAME=.*CRS="true"/s/.*LOC=\"\([^\"]*\)\".*CRS="true".*/\1/p' 2>>/dev/null`
+    fi
+  fi
+  # Get ASM Instance on this box
+  GRID_ORACLE_SID=`ps -ef | grep pmon_+ASM | grep asm_ | sed -n "s/.*\(+ASM[0123456789][0123456789]*\)/\1/p"`
+}
+
+
+delete_database()
+{
+  #set -x
+  local database_unique_name="$1"
+  local shutdown_database="$2"
+  local including_backup="$3"
+  local status
+  local database_oracle_home
+  #echo "database_unique_name=$database_unique_name"
+  #echo "shutdown_database=$shutdown_database"
+  # Set grid environment
+  set_grid_home
+  # First Check if database exists
+  # Find databases Oracle_home
+  DB_ORACLE_HOME=$($GRID_ORACLE_HOME/bin/crsctl status resource ora.${database_unique_name}.db -f | sed -n -e "s/ORACLE_HOME=\(.*\)/\1/p")
+  if [ "$DB_ORACLE_HOME" == "" ]
+  then
+    # Does not exists as we can't find connected home
+    echo " ERROR: Database ${database_unique_name} is not configured on this cluster"
+    exit 1
+  fi
+  status=$(export ORACLE_HOME=$DB_ORACLE_HOME;$DB_ORACLE_HOME/bin/srvctl status database -d ${database_unique_name})
+  if [ $? -ne 0 ]
+  then
+    # Does not exists
+    echo " ERROR: Database ${database_unique_name} is not configured on this cluster"
+    exit 1
+  fi
+  # Are instances running?
+  echo "$status" | grep "is running">/dev/null
+  if [ $? -eq 0 ]
+  then
+    # Instances are running
+    # Check that we have shudown_database="YES" before continuing
+    if [ "$shutdown_database" == "YES" ]
+    then
+      # We will try to stop it
+      status=$(export ORACLE_HOME=$DB_ORACLE_HOME;$DB_ORACLE_HOME/bin/srvctl stop database -d ${database_unique_name})
+      if [ $? -ne 0 ]
+      then
+        # Ouch we can't stop it
+        echo " ERROR: Can't stop database ${database_unique_name} - manuel intervention required"
+        exit 1
+      fi
+    else
+      # We are not allowed to stop it
+      echo " ERROR: Database ${database_unique_name} is running, Can't be deleted while running"
+      exit 1
+    fi
+  fi
+  # Evrything is shudown
+  # We want to delete backups to?
+  if [ "$including_backup" = "YES" ]
+  then
+    # First find a node where it's configured
+    node_selected=$(export ORACLE_HOME=$DB_ORACLE_HOME;$DB_ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | head -1 | sed -n "s/.*node[[:space:]]*\(.*\)$/\1/p")
+    # Then find instance on that node
+    sid_selected=$(export ORACLE_HOME=$DB_ORACLE_HOME;$DB_ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | head -1 | sed -n "s/Instance[[:space:]]*\(.*\)[[:space:]]*is[[:space:]]*.*$/\1/p")    
+    # On specific node startup in restricted mode
+    ssh $node_selected "export ORACLE_HOME=$DB_ORACLE_HOME;export ORACLE_SID=$sid_selected; echo \"startup mount exclusive restrict;\" | $DB_ORACLE_HOME/bin/sqlplus / as sysdba"
+    # Then diasble dataguard broker,  and make database non rac
+    ssh $node_selected "export ORACLE_HOME=$DB_ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"alter system set dg_broker_start=false scope=both;\nALTER SYSTEM SET CLUSTER_DATABASE=FALSE SCOPE=SPFILE;\nshutdown immediate;\" | $DB_ORACLE_HOME/bin/sqlplus / as sysdba"
+    # On specific node startup in restricted mode
+    ssh $node_selected "export ORACLE_HOME=$DB_ORACLE_HOME;export ORACLE_SID=$sid_selected; echo \"startup mount exclusive restrict;\" | $DB_ORACLE_HOME/bin/sqlplus / as sysdba"    
+    # Use rman to delete evrything
+    ssh $node_selected "export ORACLE_HOME=$DB_ORACLE_HOME;export ORACLE_SID=$sid_selected; echo \"DROP DATABASE INCLUDING BACKUPS NOPROMPT;\" | $DB_ORACLE_HOME/bin/rman target /"
+    # Remove cluster configuration
+    (export ORACLE_HOME=$DB_ORACLE_HOME; $DB_ORACLE_HOME/bin/srvctl remove database -d ${database_unique_name} -f)
+  else
+    # Ok now delete the bastard using the dbca command in the databases home catalog
+    # Do the delete in a subshell
+    (export ORACLE_HOME=$DB_ORACLE_HOME; $DB_ORACLE_HOME/bin/dbca -silent -deleteDatabase -sourceDB ${database_unique_name})
+  fi
+  # Clean out other OS files
+  # Maybe call the grid user to have him fully clean out the ASM data  
+}
+
+demultiplex_standbylog()
+{
+  #set -x
+  local database_unique_name=$1  
+  echo "   INFO: Demultiplex standby logs"
+  # Set grid home
+  set_grid_home
+  # First Check if database exists
+  # Find databases Oracle_home
+  DB_ORACLE_HOME=$($GRID_ORACLE_HOME/bin/crsctl status resource ora.${database_unique_name}.db -f | sed -n -e "s/ORACLE_HOME=\(.*\)/\1/p")
+  if [ "$DB_ORACLE_HOME" == "" ]
+  then
+    # Does not exists as we can't find connected home
+    echo " ERROR: Database ${database_unique_name} is not configured on this cluster"
+    exit 1
+  fi
+  status=$(export ORACLE_HOME=$DB_ORACLE_HOME;$DB_ORACLE_HOME/bin/srvctl status database -d ${database_unique_name})
+  if [ $? -ne 0 ]
+  then
+    # Does not exists
+    echo " ERROR: Database ${database_unique_name} is not configured on this cluster"
+    exit 1
+  fi
+  echo "$status" | grep "is running">/dev/null
+  if [ $? -ne 0 ]
+  then
+    # Does not exists
+    echo " ERROR: Database ${database_unique_name} does not have running instances on this cluster"
+    exit 2
+  fi
+  # First find a first node where it exists
+  node_selected=$(export ORACLE_HOME=$DB_ORACLE_HOME;$DB_ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | grep "is running" | head -1 | sed -n "s/.*node[[:space:]]*\(.*\)$/\1/p")
+  # Then find instance on that node
+  sid_selected=$(export ORACLE_HOME=$DB_ORACLE_HOME;$DB_ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | grep "is running" | head -1 | sed -n "s/Instance[[:space:]]*\(.*\)[[:space:]]*is[[:space:]]*.*$/\1/p")
+  # Now delete unessececary standby logs
+  ssh $node_selected "export ORACLE_HOME=$DB_ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"${demultiplex_standby_logs_sql}\" | $DB_ORACLE_HOME/bin/sqlplus -S / as sysdba"  
+}
+
+prepare_standby()
+{
+  #set -x
+  local database_unique_name=$1  
+  echo "$PREPARE_AS_STANDBY"
+  # First find a first node where it exists
+  node_selected=$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | grep "is running" | head -1 | sed -n "s/.*node[[:space:]]*\(.*\)$/\1/p")
+  # Then find instance on that node
+  sid_selected=$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | grep "is running" | head -1 | sed -n "s/Instance[[:space:]]*\(.*\)[[:space:]]*is[[:space:]]*.*$/\1/p")
+  # Then find asm instance on that node
+  asm_sid_selected=$(ssh $node_selected "ps -ef | grep pmon_+ASM | grep asm_ | sed -n \"s/.*\\\(+ASM[0123456789][0123456789]*\\\)/\\\1/p\"")
+  # GEt the vip on that node (assuming we run grid 12.1
+  vip_selected=$(export ORACLE_HOME=${GRID_ORACLE_HOME};$ORACLE_HOME/bin/srvctl config vip -n ${node_selected} | sed -n "s/^VIP Name:[[:space:]]*\(.*\)/\1/p")
+  # Get spfile name from ASM - we always have it there
+  spfile_name=$(ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"set heading off\nset newpage none\nset feed off\nSELECT value from v\\\$parameter where name = 'spfile';\" | $ORACLE_HOME/bin/sqlplus -s / as sysdba")
+  # Get spfile diskgroup
+  spfile_disk_group=${spfile_name%%/*}
+  #set -x
+#  if [ "$ORACLE_MAJOR_VERSION" == "12" ]
+#  then
+#    # Password in ASM at nordea for 12 databases, back it up using sudo
+#    sudo -u grid /zfssa/tmpwork/asolvang/nddbctl export asmpasswordfile --file=/tmp/pwd${database_unique_name} --databaseUniqueName=${database_unique_name}
+#  fi
+  # Then enable dataguard broker, create a spfile copy and make database non rac
+  ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"alter system set dg_broker_start=true scope=both;\ncreate pfile='/tmp/pfile${database_unique_name}.ora' from spfile;\nALTER SYSTEM SET CLUSTER_DATABASE=FALSE SCOPE=SPFILE;\n\" | $ORACLE_HOME/bin/sqlplus / as sysdba"
+  # Can we delete all archive log files?
+  # Shutdown database
+  (export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl stop database -d ${database_unique_name})
+  # On specific node startup in restricted mode
+  ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo \"startup mount exclusive restrict;\" | $ORACLE_HOME/bin/sqlplus / as sysdba"
+  # Use rman to delete evrything
+  ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo \"DROP DATABASE INCLUDING BACKUPS NOPROMPT;\" | $ORACLE_HOME/bin/rman target /"
+  # Shutdown instance
+  # NOt needed it's gone
+  #ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo \"shutdown immediate\" | $ORACLE_HOME/bin/sqlplus / as sysdba"
+  # Maybe we should load the password file in 12c?
+
+#  if [ "$ORACLE_MAJOR_VERSION" == "12" ]
+#  then
+#    # Password in ASM at nordea for 12 databases, back it up using sudo
+#    sudo -u grid /usr/bin/nddbctl import asmpasswordfile --file=/tmp/pwd${database_unique_name} --databaseUniqueName=${database_unique_name}
+#  fi
+  # create spfile='${spfile_disk_group}/spfile${database_unique_name}.ora' from pfile='/tmp/pfile${database_unique_name}.ora'; 
+  # Now startup the database with pfile and recreste the spfile and shutdown again and startup mount
+  ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"startup nomount pfile='/tmp/pfile${database_unique_name}.ora';\ncreate spfile='${spfile_disk_group}/${DATABASE_UNIQUE_NAME}/spfile${DATABASE_UNIQUE_NAME}.ora' from pfile='/tmp/pfile${DATABASE_UNIQUE_NAME}.ora';\nshutdown immediate;\nstartup nomount;\" | $ORACLE_HOME/bin/sqlplus / as sysdba"
+  # As s final step modify the cluster repository to let it know it's now a standby database
+  (export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl modify database -d ${database_unique_name}  -r 'PHYSICAL_STANDBY' )
+  echo "When running ndtnsctl on primary cluster use \"--remoteNodeVip $vip_selected \""
+  echo "or --standbyVip if using the nddbctl command."
+  echo "$ORACLE_SID is now running in nomount mode on $node_selected and is ready for rman"
+  echo "to create the standby database"
+}
+
+
+create_database()
+{
+  create_database_dbca
+  if [ $? -ne 0 ]
+  then
+    echo " ERROR: dbca failed"
+    exit 1
+  fi
+  # Some of the following wont work unless we do this
+  export ORACLE_HOME=$ORACLE_HOME;
+  # If using clustered TNS_ADMIN then set this in the cluster configuration for the given database
+  if [ "$USING_SHARED_TNS_ADMIN" == "Y" ]
+  then
+    echo "  INFO: Setting TNS_ADMIN in cluster registry to ${CLUSTERED_TNS_ADMIN} "
+    ${ORACLE_HOME}/bin/srvctl setenv database -d $DATABASE_UNIQUE_NAME -T TNS_ADMIN=${CLUSTERED_TNS_ADMIN}  
+  fi
+  #set -x
+  # Let's add an extra controlfile and ensure that the  audit_trail is correct
+  # First find a node where it's configured
+  node_selected=$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status database -d ${DATABASE_UNIQUE_NAME} | grep "is running" | head -1 | sed -n "s/.*node[[:space:]]*\(.*\)$/\1/p")
+  # Then find instance on that node
+  sid_selected=$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status database -d ${DATABASE_UNIQUE_NAME} | grep "is running" | head -1 | sed -n "s/Instance[[:space:]]*\(.*\)[[:space:]]*is[[:space:]]*.*$/\1/p")  # update audit_trail
+  # update audit_trail
+  update_audit_trail_sql="alter system set audit_trail=${AUDIT_TRAIL} scope=spfile sid='*';
+exit;"
+  echo "  INFO: Update audit_trail"
+  ssh $node_selected "export ORACLE_SID=${sid_selected}; export ORACLE_HOME=${ORACLE_HOME}; echo \"${update_audit_trail_sql}\"|${ORACLE_HOME}/bin/sqlplus -S / as sysdba"
+  # find the control files
+  select_control_files_sql="set heading off
+set feedback off
+select name from v\\\$controlfile;
+exit;"
+  CONTROL_FILES_FOUND=`ssh $node_selected "export ORACLE_SID=${sid_selected}; export ORACLE_HOME=${ORACLE_HOME}; echo \"${select_control_files_sql}\"|${ORACLE_HOME}/bin/sqlplus -S / as sysdba"`
+  found_control_files=0
+  for control_file_found in $CONTROL_FILES_FOUND
+  do
+    ((found_control_files++))
+  done
+  if [ $found_control_files -eq 1 ]
+  then
+    echo "  INFO: Need to fix control files as there is only one defined. We will add one in disk group used for data"
+    ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"alter system set control_files='${control_file_found}','+${ASM_DATA_DISK_GROUP}' scope=spfile sid='*';\" | $ORACLE_HOME/bin/sqlplus -S / as sysdba"
+    # Then stop the database
+    echo "  INFO: Stop cluster database"
+    $ORACLE_HOME/bin/srvctl stop database -d $DATABASE_UNIQUE_NAME
+    # Start in nomount mode
+    echo "  INFO: Start instance in nomount mode"
+    ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"startup nomount;\" | $ORACLE_HOME/bin/sqlplus -S / as sysdba"
+    # Use rman to create copy
+    echo "  INFO: Use RMAN to restore the newly added controlfile"
+    ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo \"restore controlfile from '${control_file_found}'; \" | $ORACLE_HOME/bin/rman target /"
+    # Shutdown
+    echo "  INFO: Stop instance"
+    ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"shutdown immediate;\" | $ORACLE_HOME/bin/sqlplus -S / as sysdba"
+    # Then start again
+    echo "  INFO: Start cluster database"
+    $ORACLE_HOME/bin/srvctl start database -d $DATABASE_UNIQUE_NAME
+  else
+    # Just restart the damm thing as the rest does not work well otherwise sometimes
+    # First stop
+    echo "  INFO: Stop cluster database"
+    $ORACLE_HOME/bin/srvctl stop database -d $DATABASE_UNIQUE_NAME
+    # Then start again
+    echo "  INFO: Start cluster database"
+    $ORACLE_HOME/bin/srvctl start database -d $DATABASE_UNIQUE_NAME
+  fi
+  # Find all database instances
+  DATABASE_INSTANCES=`$ORACLE_HOME/bin/srvctl config database -d $DATABASE_UNIQUE_NAME | sed -n "s/^Database instances:\(.*\)/\1/p"`
+  # Find instances we want to run on
+  # and the ones we "don't" want to run on
+  # Now check if we want the instance to be "on"
+  for database_instance in ${DATABASE_INSTANCES//,/ }
+  do
+    # Find the node the instance run on
+    instance_on_node=`$ORACLE_HOME/bin/srvctl status instance -d $DATABASE_UNIQUE_NAME -i $database_instance |  sed -n "s/.*running on node \(.*\)/\1/p"`
+    # is it the one we want to run the app service on?
+    if [ "$instance_on_node" = "$RUN_NODE_FOR_APP_SERVICE" ]
+    then
+      # We want to run on it 
+      RUN_INSTANCE_FOR_APP_SERVICE=$database_instance
+    else
+      # Add it to apps avail list
+      if [ "$AVAIL_INSTANCE_FOR_APP_SERVICE" = "" ]
+      then
+        AVAIL_INSTANCE_FOR_APP_SERVICE="$database_instance"
+      else
+        AVAIL_INSTANCE_FOR_APP_SERVICE="$AVAIL_INSTANCE_FOR_APP_SERVICE,$database_instance"
+      fi
+    fi      
+    # IS it one of the nodes where we want an instance to run?
+    node_found="N"
+    for run_node in ${RUN_ON_NODES//,/ }
+    do
+      if [ "$instance_on_node" = "$run_node" ]
+      then
+      	node_found="Y"
+      fi
+    done
+    if [ "$node_found" = "N" ]
+    then
+      # We want not to run on it add to comma separated list
+      if [ "$AVAIL_INSTANCES" = "" ]
+      then
+        AVAIL_INSTANCES="$database_instance"
+      else
+        AVAIL_INSTANCES="$AVAIL_INSTANCES,$database_instance"
+      fi
+    else
+      # We want to run on it add to comma separated list
+      if [ "$RUN_INSTANCES" = "" ]
+      then
+        RUN_INSTANCES="$database_instance"
+      else
+        RUN_INSTANCES="$RUN_INSTANCES,$database_instance"
+      fi
+    fi  
+  done
+  # Create services
+  echo "Creating services"
+  if [ -z "${AVAIL_INSTANCE_FOR_APP_SERVICE}" ]
+  then
+    # No AVAIL_INSTANCE_FOR_APP_SERVICE is avaialable
+    # Create the normal service on the primary (to be prepared) on one of the instances (can later be changed to all if the App supports it)
+    $ORACLE_HOME/bin/srvctl add service -d $DATABASE_UNIQUE_NAME -s ${DATABASE_NAME} -r $RUN_INSTANCE_FOR_APP_SERVICE -l primary
+  else
+    # AVAIL_INSTANCE_FOR_APP_SERVICE is available
+    # Create the normal service on the primary (to be prepared) on one of the instances (can later be changed to all if the App supports it)
+    $ORACLE_HOME/bin/srvctl add service -d $DATABASE_UNIQUE_NAME -s ${DATABASE_NAME} -r $RUN_INSTANCE_FOR_APP_SERVICE -a $AVAIL_INSTANCE_FOR_APP_SERVICE -l primary
+  fi
+  if [ -z "${AVAIL_INSTANCES}" ]
+  then
+    # No avail_instances
+    # Create and start the Rman service:
+    $ORACLE_HOME/bin/srvctl add service -d $DATABASE_UNIQUE_NAME -s rman_${DATABASE_UNIQUE_NAME} -r $RUN_INSTANCES -l primary,physical_standby
+    # Create the read only service on the standby (to be prepared)
+    $ORACLE_HOME/bin/srvctl add service -d $DATABASE_UNIQUE_NAME -s ${DATABASE_NAME}_ro -r $RUN_INSTANCES -l physical_standby
+  else
+    # avail instances are present
+    # Create and start the Rman service:
+    $ORACLE_HOME/bin/srvctl add service -d $DATABASE_UNIQUE_NAME -s rman_${DATABASE_UNIQUE_NAME} -r $RUN_INSTANCES -a $AVAIL_INSTANCES -l primary,physical_standby
+    # Start/stop the service as that sometimes seems to be needed for it to work later in a dataguard configuration
+    $ORACLE_HOME/bin/srvctl start service -d $DATABASE_UNIQUE_NAME -s rman_${DATABASE_UNIQUE_NAME}
+    $ORACLE_HOME/bin/srvctl stop service -d $DATABASE_UNIQUE_NAME -s rman_${DATABASE_UNIQUE_NAME}    
+    # Create the read only service on the standby (to be prepared)
+    $ORACLE_HOME/bin/srvctl add service -d $DATABASE_UNIQUE_NAME -s ${DATABASE_NAME}_ro -r $RUN_INSTANCES -a $AVAIL_INSTANCES -l physical_standby	
+    # Start/stop the service as that sometimes seems to be needed for it to work later in a dataguard configuration
+    $ORACLE_HOME/bin/srvctl start service -d $DATABASE_UNIQUE_NAME -s ${DATABASE_NAME}_ro
+    $ORACLE_HOME/bin/srvctl stop service -d $DATABASE_UNIQUE_NAME -s ${DATABASE_NAME}_ro    
+  fi
+  # The final steps
+  # First stop
+  echo "Stop database"
+  $ORACLE_HOME/bin/srvctl stop database -d $DATABASE_UNIQUE_NAME
+  echo "Configuring which instances to enable"
+  # Disable all the instances
+  $ORACLE_HOME/bin/srvctl disable instance -d $DATABASE_UNIQUE_NAME -i $DATABASE_INSTANCES
+  # Enable instances we want active
+  $ORACLE_HOME/bin/srvctl enable instance -d $DATABASE_UNIQUE_NAME -i $RUN_INSTANCES
+  # Then start again
+  echo "Starting database"
+  $ORACLE_HOME/bin/srvctl start database -d $DATABASE_UNIQUE_NAME
+  # Save some info for later
+  create_database_report
+  # Print a little report
+  echo "-------------------Database created---------------------"
+  echo "            Database Name: $DATABASE_NAME"
+  echo "     Database Unique Name: $DATABASE_UNIQUE_NAME"
+  echo "             Characterset: $CHARACTERSET"
+  echo "    National Characterset: $NATIONAL_CHARACTERSET"
+  echo "     NLS Length Semantics: $NLS_LENGTH_SEMANTICS"
+  echo "   Database runs on nodes: $RUN_ON_NODES"
+  echo "Database defined on nodes: $CLUSTER_NODES"
+  echo "             Service name: $DATABASE_NAME runs on node $RUN_INSTANCE_FOR_APP_SERVICE when database is primary"
+  echo "             Service name: rman_$DATABASE_UNIQUE_NAME use instances $RUN_INSTANCES when database is primary or physical standby"
+  echo "             Service name: ${DATABASE_NAME}_ro use instances $RUN_INSTANCES when database is physical standby"
+  echo "     Services on database:`$ORACLE_HOME/bin/srvctl config database -d $DATABASE_UNIQUE_NAME | sed -n 's/^Services:\(.*\)/\1/p'`" 
+  echo "        Grid cluster name: $GRID_CLUSTER_NAME"
+  echo "         Nodes in cluster: $CLUSTER_NODES"
+  echo "      ASM DATA disk group: $ASM_DATA_DISK_GROUP"
+  echo "      ASM RECO disk group: $ASM_RECO_DISK_GROUP"
+  echo "Logs for this creation in: ${LOG_DIRECTORY}_$(convert_to_lower ${DATABASE_UNIQUE_NAME})"
+}
+
+
+export_asmpasswordfile()
+{
+  #set -x
+  local database_unique_name=$1
+  local file=$2
+  export ORACLE_HOME=$GRID_ORACLE_HOME
+  export ORACLE_SID=$GRID_ASM_INSTANCE
+  # asm_passsword_asm=$(ssh $node_selected export ORACLE_HOME=${GRID_ORACLE_HOME};export ORACLE_SID=${asm_sid_selected};$GRID_ORACLE_HOME/bin/asmcmd pwget --dbuniquename wfp1c )
+  asm_passsword_asm=$(${ORACLE_HOME}/bin/asmcmd pwget --dbuniquename ${database_unique_name})    
+  #+DATAC1/WFP1C/PASSWORD/pwdwfp1c.535.932897113
+  ${ORACLE_HOME}/bin/asmcmd pwcopy ${asm_passsword_asm} ${file}
+  #copying +DATAC1/WFP1C/PASSWORD/pwdwfp1c.535.932897113 -> /tmp/pwdwfp1c
+}
+
+import_asmpasswordfile()
+{
+  set -x
+  local database_unique_name=$1
+  local file=$2
+  local disk_group=$3
+  export ORACLE_HOME=$GRID_ORACLE_HOME
+  export ORCLE_SID=$GRID_ASM_INSTANCE
+  ${ORACLE_HOME}/bin/asmcmd  pwcopy $file ${disk_group}/${database_unique_name}/orapw${database_unique_name}
+  srvctl modify database -d STDBYDB -pwfile ${disk_group}/${database_unique_name}/orapw${database_unique_name}
+  # Password file for 12c
+  # srvctl modify asm -pwfile location
+  # srvctl modify database -db dbname -pwfile location    
+}
+
+distribute_passwordfile()
+{
+  local database_unique_name=$1
+  # Find Oracle home
+  local ORACLE_HOME=$($GRID_ORACLE_HOME/bin/crsctl status resource ora.${database_unique_name}.db -f | sed -n -e "s/ORACLE_HOME=\(.*\)/\1/p")
+  # Passwordfile is then in $ORACLE_HOME/dbs/orapw<instance_name> we dont now the last characters (0-99)
+  #scp /u01/app/oracle/product/11.2.0.4/db160419a/dbs/orapwds002p1c1 dm16db02:/u01/app/oracle/product/11.2.0.4/db160419a/dbs/orapwds002p1c2
+  # First loop over all nodes and find the instance that is there
+  local instance_node
+  local instance
+  local node
+  local instance_nodes="$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | sed -e "s/Instance[[:space:]]*\(.*\)[[:space:]]is[[:space:]]*.*node[[:space:]]\(.*\)/\1:\2/")"
+  #set -x
+  while read -r instance_node; do
+    instance=${instance_node%:*}
+    node=${instance_node#*:}
+    #echo "instance_node=$instance_node"
+    #echo "instance=$instance"
+    #echo "node=$node"
+    ssh -n $node "[ -f $ORACLE_HOME/dbs/orapw${instance} ]"
+    if [ $? -eq 0 ]
+    then
+      echo "   INFO: Getting $node $ORACLE_HOME/dbs/orapw${instance}"
+      scp -q $node:$ORACLE_HOME/dbs/orapw${instance} /tmp
+    fi
+  done <<< "$instance_nodes"
+  # now figure out which one differs from the others, this will be the new one
+  declare -A diff_counter
+  local node_with_most
+  local instance_with_most
+  local max_difference_found=0
+  local number_of_nodes=0
+  local file_to_copy=""
+  while read -r instance_node; do
+    (( number_of_nodes++ ))
+    instance=${instance_node%:*}
+    node=${instance_node#*:}
+    diff_counter[$node]=0
+    #echo "instance_node=$instance_node"
+    #echo "instance=$instance"
+    #echo "node=$node"
+    while read -r instance_node2; do
+      instance2=${instance_node2%:*}
+      node1=${instance_node2#*:}
+      #echo "cmp /tmp/orapw${instance} /tmp/orapw${instance2}"
+      cmp -s /tmp/orapw${instance} /tmp/orapw${instance2} || ((diff_counter[$node]++ ))
+    done  <<< "$instance_nodes"
+    echo "   INFO: Password file on $node differs from ${diff_counter[$node]} other passwords files"
+    if [ ${diff_counter[$node]} -gt $max_difference_found ]
+    then
+      # New top
+      max_difference_found=${diff_counter[$node]}
+      node_with_most=$node
+      instance_with_most=$instance
+    fi
+  done <<< "$instance_nodes"
+  #echo "Node with most difference=$node_with_most"
+  #echo "Max difference=$max_difference_found"
+  #echo "Number of nodes= ${number_of_nodes}"
+  if [ $max_difference_found -eq 0 ]
+  then
+    echo " ERROR: No single host has a password files that differ, exact one should be different"
+    exit 1
+  fi
+  if (( max_difference_found + 1 != number_of_nodes  ))
+  then
+    echo " ERROR: More that one password file is different, don't kow which one to pick"
+    exit 1
+  fi
+  while read -r instance_node; do
+    instance=${instance_node%:*}
+    node=${instance_node#*:}
+    #echo "instance_node=$instance_node"
+    #echo "instance=$instance"
+    #echo "node=$node"
+    ssh -n $node "[ -f $ORACLE_HOME/dbs/orapw${instance} ]"
+    if [ $? -eq 0 ]
+    then
+      if [ "$$node_with_most" != "$node" ]
+      then
+        echo "   INFO: Updating $node $ORACLE_HOME/dbs/orapw${instance}"
+        scp -q /tmp/orapw${instance_with_most} $node:$ORACLE_HOME/dbs/orapw${instance}
+      fi
+    fi
+  done <<< "$instance_nodes"  
+}
+prepare_primary()
+{
+  local database_unique_name=$1
+  local ORACLE_HOME=$($GRID_ORACLE_HOME/bin/crsctl status resource ora.${database_unique_name}.db -f | sed -n -e "s/ORACLE_HOME=\(.*\)/\1/p")
+  echo "   INFO: Preparing for standby by enabling data guard broker and creating missing standby logs"
+  # First find a first node where a running instance is
+  local node_selected=$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | grep "is running" | head -1 | sed -n "s/.*node[[:space:]]*\(.*\)$/\1/p")
+  # Then find instance on that node
+  local sid_selected=$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status database -d ${database_unique_name} | grep "is running" | head -1 | sed -n "s/Instance[[:space:]]*\(.*\)[[:space:]]*is[[:space:]]*.*$/\1/p")
+  ssh $node_selected "export ORACLE_HOME=$ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"${prepare_primary_sql}\" | $ORACLE_HOME/bin/sqlplus -s / as sysdba"
+  # Now print out what to do next
+  echo "########################## Post configuration start #########################"
+  echo "1) Login as oracle on a primary host where an active instance ($RUN_ON_NODES)."
+  echo "   Ensure you have proper environment. (if you get \"ORACLE_HOME set but not" 
+  echo "   ORACLE_SID\" you are on a wrong node. Run:"
+  cecho g "   oe ${database_unique_name}"
+  echo "2) start rman:"
+  cecho g "   rman"
+  echo "3) Run the following rman commands one by one - you should know the passwords:"
+  cecho g "   connect target sys"
+  cecho g "   connect auxiliary sys@${STANDBY_DATABASE_UNIQUE_NAME}_dup"
+  echo "4) After ensuring you are properly logged in on both databases now run the"
+  echo "   following rman script:"
+  echo "   ########### rman script start"
+  cecho g "   CONFIGURE SNAPSHOT CONTROLFILE NAME TO '+${ASM_DATA_DISK_GROUP}/${database_unique_name}/CONTROLFILE/snapcf_${database_unique_name}.f' ;"
+  cecho g "   run {"
+  cecho g "     allocate channel prmy1 type disk;"
+  cecho g "     allocate channel prmy2 type disk;"
+  cecho g "     allocate channel prmy3 type disk;"
+  cecho g "     allocate channel prmy4 type disk;"
+  cecho g "     allocate auxiliary channel stby type disk;"
+  cecho g "     duplicate target database for standby from active database;"
+  #cecho g "     DB_FILE_NAME_CONVERT ('+${ASM_DATA_DISK_GROUP}/${database_unique_name}/','+${STANDBY_ASM_DATA_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/','+${ASM_RECO_DISK_GROUP}/${database_unique_name}/','+${STANDBY_ASM_RECO_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/');"
+  cecho g "   }"
+  echo "   ########### rman script end"
+  echo "5) When finished then exit rman:"
+  cecho g "   exit"
+  echo "6) start dgmgrl:"
+  cecho g "   dgmgrl"
+  echo "7) Run the following dgmgrl command - you should know the password:"
+  cecho g "   connect sys"
+  echo "8) After ensuring you are properly logged in run the following dgmgrl commands."
+  echo "   You can ignore the need to restart errors on 12c databases, as we will do that:"
+  echo "   ########### dgmgrl commands start"
+  cecho g "   create configuration ${DATABASE_NAME} as primary database is ${database_unique_name} connect identifier is ${database_unique_name};"
+  cecho g "   add database ${STANDBY_DATABASE_UNIQUE_NAME} as connect identifier is ${STANDBY_DATABASE_UNIQUE_NAME} maintained as physical;"
+  #cecho g "   edit database ${STANDBY_DATABASE_UNIQUE_NAME} set property dbFileNameConvert ='+${ASM_DATA_DISK_GROUP}/${database_unique_name}/,+${STANDBY_ASM_DATA_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/,+${ASM_RECO_DISK_GROUP}/${database_unique_name}/,+${STANDBY_ASM_RECO_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/';"
+  #cecho g "   edit database ${database_unique_name} set property dbFileNameConvert ='+${ASM_DATA_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/,+${STANDBY_ASM_DATA_DISK_GROUP}/${database_unique_name}/,+${ASM_RECO_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/,+${STANDBY_ASM_RECO_DISK_GROUP}/${database_unique_name}/';"
+  #cecho g "   edit database ${STANDBY_DATABASE_UNIQUE_NAME} set property logFileNameConvert ='+${ASM_DATA_DISK_GROUP}/${database_unique_name}/,+${STANDBY_ASM_DATA_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/,+${ASM_RECO_DISK_GROUP}/${database_unique_name}/,+${STANDBY_ASM_RECO_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/';"
+  #cecho g "   edit database ${database_unique_name} set property logFileNameConvert ='+${ASM_DATA_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/,+${STANDBY_ASM_DATA_DISK_GROUP}/${database_unique_name}/,+${ASM_RECO_DISK_GROUP}/${STANDBY_DATABASE_UNIQUE_NAME}/,+${STANDBY_ASM_RECO_DISK_GROUP}/${database_unique_name}/';"
+  cecho g "   enable configuration;"  
+  echo "   ########### dgmgrl commands end"
+  echo "9) exit dgmgrl"
+  cecho g "   exit"
+  echo "10) As oracle on the standby host with an active instance (the VIP is"
+  echo "   ${STANDBY_VIP}) ensure you have proper environment. (if you get " 
+  echo "   \"ORACLE_HOME set but not ORACLE_SID\" you are on a wrong node. Run:"
+  cecho r "   oe ${STANDBY_DATABASE_UNIQUE_NAME}"
+  if [ "$ORACLE_MAJOR_VERSION" = "11" ]
+  then
+    echo "10.1) As we are creating an an 11.x database we have passwords in password"
+    echo "   files. We need to copy the password file from the standby node where we"
+    echo "   have the standby vip running (${STANDBY_VIP}) to the other nodes."
+    echo "   You run the following from any standby host to do that:"
+    cecho r "   nddbctl distribute passwordfile --databaseUniqueName ${STANDBY_DATABASE_UNIQUE_NAME}"
+  fi
+  echo "11) Restart the standby database from a standby node to ensure everything"
+  echo "   works after a total restart"
+  cecho r "   srvctl stop database -d ${STANDBY_DATABASE_UNIQUE_NAME}"
+  cecho r "   srvctl start database -d ${STANDBY_DATABASE_UNIQUE_NAME}"
+  echo "12) Go back to a primary node and restart the primary database to ensure"
+  echo "   everything works after a total restart"
+  cecho g "   srvctl stop database -d ${database_unique_name}"
+  cecho g "   srvctl start database -d ${database_unique_name}"
+  echo "13) To verify that things are working and to clean up multiplexed standby"
+  echo "   logs we need to switchover to standby"
+  echo "   start the dataguard manager:"
+  cecho g "   dgmgrl"
+  echo "   Run the following dataguard manager command - you should know the password:"
+  cecho g "   connect sys"
+  echo "   Do the switchover to the standby database"
+  cecho g "   switchover to ${STANDBY_DATABASE_UNIQUE_NAME};"
+  echo "14) Now delete the extra multiplexed set of standby logs in the standby database"
+  echo "   from a login on the standby node"
+  cecho r "   nddbctl demultiplex standbylog --databaseUniqueName ${STANDBY_DATABASE_UNIQUE_NAME}"
+  echo "15) Now switch back the database to have the primary database running on the"
+  echo "   original cluster and to test that it works"
+  echo "   start the dataguard manager:"
+  cecho r "   dgmgrl"
+  echo "   Run the following dataguard manager command - you should know the password:"
+  cecho r "   connect sys"
+  cecho r "   switchover to ${database_unique_name};"
+  echo "########################## Post configuration end ###########################"
+}
+
+duplicate_standby()
+{
+  :
+}
+
+create_standby_tns()
+{
+  echo "   INFO: Create standby tns"
+  ndtnsctl addorupdate tnsconf --entries local,remote,static  --databaseUniqueName ${DATABASE_UNIQUE_NAME}  --remoteDatabaseUniqueName ${PRIMARY_DATABASE_UNIQUE_NAME} --remoteScanListener ${PRIMARY_SCAN_LISTENER}
+}
+
+create_primary_tns()
+{
+  echo "   INFO: Create primary tns"
+  ndtnsctl addorupdate tnsconf --entries local,remote,static,duplicate  --databaseUniqueName ${DATABASE_UNIQUE_NAME}  --remoteDatabaseUniqueName ${STANDBY_DATABASE_UNIQUE_NAME} --remoteScanListener ${STANDBY_SCAN_LISTENER} --remoteNodeVip ${STANDBY_VIP}
+}
+#
+# handle_request
+#
+# Purpose: handles the request after arguments have been analyzed checked
+#
+handle_request()
+{
+  case $OBJECT in
+    standbylog)
+      case $ACTION in
+        demultiplex)
+          demultiplex_standbylog "$DATABASE_UNIQUE_NAME"
+          ;;
+      esac
+      ;;
+    primary)
+      case $ACTION in
+        prepare)
+          prepare_primary "$DATABASE_UNIQUE_NAME"
+          ;;
+      esac
+      ;;
+    passwordfile)
+      case $ACTION in
+        distribute)
+          distribute_passwordfile "$DATABASE_UNIQUE_NAME"
+          ;;
+      esac
+      ;;
+    asmpasswordfile)
+      case $ACTION in
+        export)
+          export_asmpasswordfile "$DATABASE_UNIQUE_NAME" "$IMPORT_EXPORT_FILE"
+          ;;
+        import)
+          import_asmpasswordfile "$DATABASE_UNIQUE_NAME" "$IMPORT_EXPORT_FILE" "$IMPORT_DISK_GROUP"
+          ;;
+      esac
+      ;;          
+    database)
+      case $ACTION in
+        create)
+          create_database_build_environment_names
+          create_database
+          make_bakeup_directories "$DATABASE_UNIQUE_NAME"
+          if [ "$PREPARE_AS_STANDBY" = "YES" ]
+          then
+            prepare_standby "$DATABASE_UNIQUE_NAME"
+            if [ "$PRIMARY_SCAN_LISTENER" != "" -a "" != "$PRIMARY_DATABASE_UNIQUE_NAME" ]
+            then
+              create_standby_tns
+            fi
+          fi
+          if [ "$PREPARE_AS_PRIMARY" = "YES" ]
+          then
+            prepare_primary "$DATABASE_UNIQUE_NAME"
+            if [ "$STANDBY_SCAN_LISTENER" != "" -a "" != "$STANDBY_DATABASE_UNIQUE_NAME" -a "" != "$STANDBY_VIP" ]
+            then
+              create_primary_tns
+            fi            
+          fi
+          ;;
+        delete)
+          delete_database "$DATABASE_UNIQUE_NAME" "$SHUTDOWN_DATABASE" "$INCLUDING_BACKUP";;
+      esac
+      ;;
+  esac
+}
+# Ok do the stuff
+get_environment_names
+parse_arguments $*
+
+# We still need to check arguments even better
+# Ok guess we are kind of ready now to build database
+#exit
+handle_request

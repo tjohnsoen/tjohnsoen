@@ -1,0 +1,1257 @@
+#!/bin/bash 
+# Script to clean up and maintain various oracle logfiles at nordea
+# 1.0.0   2015-09-07   asger.solvang@nordea.com   Initial version
+# 1.0.1   2015-09-14   asger.solvang@nordea.com   Rewrote audit to backup audit files before deleting them
+# 1.0.2   2015-09-17   asger.solvang@nordea.com   Changed defaults 
+# 1.0.3   2015-09-17   asger.solvang@nordea.com   fixed backup of aud files to use zip and test for proper backup before deleting and renamed backup files
+# 1.0.4   2015-10-20   asger.solvang@nordea.com   Changed default for alert logs to only rotate once a week and keep them one year
+# 1.0.5   2017-01-13   asger.solvang@nordea.com   Adaptedfor new exadata platform made sure audit backup directory have mod 775
+# 1.0.6   2017-01-31   asger.solvang@nordea.com   Now deletes on 2 files at a time in rm operations (ca be adjusted in default section), also fixed minór dryrun error (echo)
+# 1.0.7   2017-02-20   asger.solvang@nordea.com   Changed default log rotate day for alert logs to saturday from friday
+# 1.0.8   2017-05-08   asger.solvang@nordea.com   Updated to handle also xml files
+# 1.0.9   2017-09-20   asger.solvang@nordea.com   Wrong test for locking
+# 1.0.10  2017-09-21   asger.solvang@nordea.com   More robust handling of global locking (to clean up local stuff in any case)
+# 1.0.11  2017-10-11   asger.solvang@nordea.com   Minor changes to information print out
+# 1.0.12  2017-10-23   asger.solvang@nordea.com   Finding old *.aud and *.xml files in ORACLE_BASE did not work because of wrongly specified -name to find commnand
+# 1.0.13  2017-10-24   asger.solvang@nordea.com   Enhanced Finding old *.aud and *.xml files in ORACLE_BASE to enable plugale databases
+# 1.0.14  2017-10-25   asger.solvang@nordea.com   Wrong placed _ in file name made all audit zip files from Oracle_homes go to same file
+# 1.0.15  2017-11-22   asger.solvang@nordea.com   Added cleanup of tr? files in base diags
+# 1.0.16  2017-11-22   asger.solvang@nordea.com   Made zip "silent" and fixed problem where old alert and listener logs were not removed.
+# 1.0.17  2018-09-11   asger.solvang@nordea.com   Updated days to keep audit files to 5 to make sure we keep them if splunk goes down
+# 1.0.18  2019-02-05   asger.solvang@nordea.com   Added code to remove lock dirs if they are more tha 2 days old as they then probably are there because of some node crash
+# 1.0.19  2019-02-25   asger.solvang@nordea.com   Added migrate schema to listener purge command as we had issues with upgrades and also allow oly one Oracle home whene the HOME is CRS HOME
+# 1.0.20  2019-03-14   asger.solvang@nordea.com   Now handles asmnet listener and mgmtlsnr
+# 1.0.21  2019-08-30   asger.solvang@nordea.com   Had to lower number of days to keeep trc files as they where growing over our head
+# 1.0.22  2020-02-03   asger.solvang@nordea.com   Changed check for who own the Oracle Home to look at oui directory
+# 1.0.23  2020-02-05   asger.solvang@nordea.com   Now deletes all -mgmtdb alert xml files (using adrci) also cleans trace files on OH/rdbms/log
+# 1.0.24  2021-05-26   martinafd4983.jensen@nordea.com  Add support for truncating $oracle_home/network/log/sqlnet.log files daily
+# 1.0.25  2021-06-02   martinafd4983.jensen@nordea.com  Add support for removal of /u01/app/grid/crsdata/*/acfs/acfs.diag_vol-*-incident-*.bin files
+SVERSION="1.0.25"
+echo "   INFO: Script version $SVERSION ($(date  +%F_%H.%M.%S))"
+echo "   INFO: Script start time: `date  +\"%Y-%m-%d_%H.%M.%S_%z\"`"
+# This script will rotate and cleanup oracle logs according to specified policies
+# Normally ADRCI will be used for doing this but some files are not handled by ADRCI and
+# also sometimes ADRCI needs to be called on a regular basix to actually do the purge.
+# The script is designed to be called as the owner that owns the Oracle Installation.
+# Typically this will be the oracle and the grid user on a system. 
+# The script supports AIX and Linux systems AIX HA and Linux RAC
+# The script currently supports Oracle Database Versions 11 and forward but will silently do 
+# nothing for Oracle Homes having older versions.
+# The script uses in few places knowledge about how systems are setup at Nordea but
+# for the most the Script is Generic.
+# The idea is that the script is called once a day.
+# As we don't have logrotate on AIX a simple log rotate functionality have been build into 
+# the script. Two BASH Arrays has to be defined. The consist of a series of numbers from 1-7 
+# which represents the 7 weekdays. If the day is present in the Array then the log rotation
+# will be done on that day. The rotated logs are appended with the a dot and the 
+# string "YYYY-MM-DD". If the compression option is set the file will be gzip compressed
+# and have the ".gz" appended also.  If called more than once a day logrotation wil only happen
+# the first time.
+# It's possible to decide how many days of archived alert and listener logs should be kept. This
+# can be set individisually for each log type.
+# Also it's possibe to set for audit files for how many days they should be kept
+# The script will report all files it have deleted and all files it have rotated.
+
+#
+# Configure defaults
+#
+# Purpose: Will set default values for input parameters
+#          Change this to values that matches Nordea policies
+# Prereq:  None specific
+configure_defaults()
+{
+  # How many days of listener log files should be kept 
+  DAYS_TO_KEEP_LISTENER_LOG=30
+  # What days to rotate listener logs (1=mon,2=tue,3=wed,4=thu,5=fri,6=sat,7=sun)  
+  ROTATE_SCHEDULE_LISTENER_LOG=(1 2 3 4 5 6 7)
+  # Should we compress listener logs with gzip
+  COMPRESS_LISTENER_LOG="yes"
+  # ADR policies for short lived listener logs (hours) 
+  HOURS_SHORTP_POLICY_LISTENER=360 
+  # ADR policies for long lived listener logs (hours) 
+  HOURS_LONGP_POLICY_LISTENER=720 
+  # How many days of trace files should be kept 
+  DAYS_TO_KEEP_TRACE_FILES=4 
+  # How many days of alert log files should be kept 
+  DAYS_TO_KEEP_ALERT_LOG=365 
+  # What days to rotate alert logs (1=mon,2=tue,3=wed,4=thu,5=fri,6=sat,7=sun)  
+  ROTATE_SCHEDULE_ALERT_LOG=(6)
+  # Should we compress rotated alert logs with gzip
+  COMPRESS_ALERT_LOG="yes"
+  # ADR policies for short lived database logs (hours)
+  HOURS_SHORTP_POLICY_DB=360
+  # ADR policies for long lived database logs (hours)
+  HOURS_LONGP_POLICY_DB=720
+  # How many days should audit files in ORACLE HOMES be kept before backed up
+  DAYS_TO_KEEP_AUDIT_FILES=5 
+  # Where are audit files backed up after they have been kept local
+  PATH_TO_BACKUP_AUDIT_FILES="/zfssa/auditstage/auditbackup"
+  # Directory used for locking. E.g. only one person/system can run the script at one time
+  # Used when request on command line
+  LOCK_DIR=${PATH_TO_BACKUP_AUDIT_FILES}/.lock_dir_for_audit_stage
+  # LOCK_DIR To be migrated to
+  GLOBAL_LOCK_DIR=/clustershare/.lock_dir_for_audit_stage
+  # Used for handling local locks
+  LOCAL_LOCK_DIR="/tmp/.local_lock_dir_for_audit_stage"
+  # How many files to pass on to rm in each execution
+  MAX_NUMBER_OF_RM_FILES=2  
+}
+
+#
+# create_lock_dir
+#
+# Purpose: Try to create the various lock dira. Will fail if parameter $1 is "YES" and global lock
+#          can't be taken or a local lock can't be taken
+#
+create_lock_dir()
+{
+  local USE_LOCK=$1
+  # If there is a local lock dir and it's more than 2 days old, then remove it
+  if [ -d $LOCAL_LOCK_DIR ]
+  then
+    # Added removal of "old" directories as they can be left when node crashes
+    # Directory exists get create date
+    create_date_since_epoch=$( stat --format="%Z" $LOCAL_LOCK_DIR)
+    if [ $? -eq 0 ]
+    then
+      # Get now in epoch time
+      now_since_epoch=$(date +%s)
+      seconds_old=$((now_since_epoch-create_date_since_epoch))
+      if [ $seconds_old -gt 172800 ]
+      then
+        # 2 days old, lets remove it
+        echo "Will try to: rmdir $LOCAL_LOCK_DIR as directory is $seconds_old (greater than 172800)"
+        rmdir $LOCAL_LOCK_DIR
+      fi
+    fi
+  fi
+  # If there is a global lock dir and it's more than 2 days old, then remove it
+  if [ -d $GLOBAL_LOCK_DIR ]
+  then
+    # Directory exists get create date
+    create_date_since_epoch=$( stat --format="%Z" $GLOBAL_LOCK_DIR)
+    if [ $? -eq 0 ]
+    then
+      # Get now in epoch time
+      now_since_epoch=$(date +%s)
+      seconds_old=$((now_since_epoch-create_date_since_epoch))
+      if [ $seconds_old -gt 172800 ]
+      then
+        # 2 days old, lets remove it
+        echo "Will try to: rmdir $GLOBAL_LOCK_DIR as directory is $seconds_old (greater than 172800)"
+        rmdir $GLOBAL_LOCK_DIR
+      fi
+    fi
+  fi
+  # Try first the local lock
+  if ! mkdir $LOCAL_LOCK_DIR
+  then
+    echo "   ERROR: Could not get local lock on $LOCAL_LOCK_DIR. Somebody else might be running the script locally. If"
+    echo "          you are sure nobody else runs the script then remove the above directory and rerun"
+    local_lock="NO"
+    exit 1
+  else
+    local_lock="YES"
+  fi
+  # If we can't create the global maybe someone else is using script (should be on a shared file system)
+  # do we want to use the locking
+  if [ "$USE_LOCK" == "YES" ]
+  then
+    if ! mkdir $GLOBAL_LOCK_DIR
+    then
+      echo "WARNING: Could not get global lock on $GLOBAL_LOCK_DIR. Somebody else might be running the script from another"
+      echo "         node. If you are sure nobody else runs the script then remove the above directory and rerun"
+      global_lock="NO"
+      global_lock_taken="NO"
+    else
+      global_lock="YES"
+      global_lock_taken="YES"
+    fi
+  else
+    global_lock="YES"
+    global_lock_taken="NO"
+  fi
+}
+
+#
+# remove_lock_dir
+#
+# Purpose: Remove the lock dir. Should be called from trap, so we arealways sure the script finishes with this
+#
+remove_lock_dir()
+{
+  if [ "$global_lock_taken" == "YES" ]
+  then
+    rmdir $GLOBAL_LOCK_DIR
+  fi
+  if [ "$local_lock" == "YES" ]
+  then
+    rmdir $LOCAL_LOCK_DIR
+  fi  
+}
+
+# Static Configuration section
+ORA_INST_LOC_POSSIBLE_LOCATIONS=()
+# Add ORAINST if defined as it probably point so an oraInst.loc to search patern
+if [ "${ORAINST}" != "" ]
+then
+  ORA_INST_LOC_POSSIBLE_LOCATIONS+=("${ORAINST}")
+fi
+# Possible location of oraInst used to find the ORACLE_HOME later. First one found will be used. Separate with spaces.
+ORA_INST_LOC_POSSIBLE_LOCATIONS+=("/etc/oraInst.loc")
+# Possible location of oratab is used to find the ORACLE HOMES. First one found will be used. Separate with spaces.
+ORA_TAB_POSSIBLE_LOCATIONS=("/etc/oratab" "/var/opt/oracle/oratab")
+
+
+# From here on no more parameters to set
+
+# Find Grid Home - complicated as we can't assume in the future /etc/oratab will have an ASM entry
+find_grid_home()
+{
+  # Where is the file that tells us where the oracle inventory is 
+  local ORAINST_LOC="/etc/oraInst.loc"
+  # If the file is there we can try to find the ASM home
+  if [ -f $ORAINST_LOC ]
+  then
+    # Look up the oracle inventory location
+    local ORAINVENTORY_LOCATION=`cat $ORAINST_LOC 2>>/dev/null | sed -n -e 's/inventory_loc=\(.*\)/\1/p' 2>>/dev/null`
+    if [ "$ORAINVENTORY_LOCATION" != "" ]
+    then
+      # If we wound the oracle inventory location look for grid home by looking for OraGI name 
+      GRID_HOME=`grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null | sed -n -e '/<HOME NAME=.*CRS="true"/s/.*LOC=\"\([^\"]*\)\".*CRS="true".*/\1/p' 2>>/dev/null`
+    fi
+  fi
+  if [ "$GRID_HOME" != "" ]
+  then
+    echo "$GRID_HOME"
+  fi
+}
+
+#
+# show_help
+#
+# Purpose: Show some help
+#
+# Prereq:  None specific
+show_help()
+{
+  # Make sure defaults are shown with values specified in the default section
+  # They could have be ovewritten with command line parameters
+  configure_defaults
+  echo "Command: $0"
+  echo "This command will:"
+  echo "  1. Rotate, compress and clean out old oracle alert logs"
+  echo "     according to specified policies"
+  echo "  2. Configure ADRCI for the databases logs according to"
+  echo "     specified policies"
+  echo "  3. Backup and cleanup old database audit files according to"
+  echo "     specified policies"
+  echo "  4. Rotate, compress and clean out old oracle listener logs"
+  echo "     (also scan listener logs) according to specified policies"
+  echo "  5. Configure ADRCI for the listener logs according to"
+  echo "     specified policies"
+  echo "  6. Call the ADRCI purge command on all listeners to do the"
+  echo "     actual xml log clean up"
+  echo ""  
+  echo "The script has the following options"
+  echo ""    
+  echo "-help"
+  echo "    will show this help. This help will also be shown if action"
+  echo "    parameter is not specified"
+  echo ""    
+  echo "-action <run|dryrun>"
+  echo "    This option determines if the utility will actually execute"
+  echo "    commands or only tell what it would do. Some important"
+  echo "    commands that will be run is also shown when using dryrun."
+  echo "    There is no default."
+  echo ""
+  echo "-debug"
+  echo "    If this is turned on more debug information is written to"
+  echo "    the output"
+  echo ""
+  echo "-lock"
+  echo "    If this is turned on a lock will be create in the audit stage"
+  echo "    area by creating directory $LOCK_DIR"
+  echo "    This ensures that multiple scripts from different nodes will not run"
+  echo "    at the same time"
+  echo ""
+  echo "-daysToKeepListenerLog <days>"
+  echo "    This value determines for how long a listener log file will"
+  echo "    be kept on the system after it has initially been written"
+  echo "    to. Default is $DAYS_TO_KEEP_LISTENER_LOG days."
+  echo ""
+  echo "-compressListenerLog <yes|no>"
+  echo "    If specified the rotated listener logs will also be"
+  echo "    compressed with gzip. Default this option is $COMPRESS_LISTENER_LOG."
+  echo ""
+  echo "-hoursShortpPolicyListener <hours>"
+  echo "    This parameter will be used to set the SHORTP_POLICY Number"
+  echo "    of hours after which to purge ADR contents that have a short"
+  echo "    life for Listener. Default is $HOURS_SHORTP_POLICY_LISTENER."
+  echo ""
+  echo "-hoursLongpPolicyListener <hours>"
+  echo "    This parameter will be used to set the LONGP_POLICY Number"
+  echo "    of hours after which to purge ADR contents that have a long"
+  echo "    life for the Listener. Default is $HOURS_LONGP_POLICY_LISTENER."
+  echo ""
+  echo "-hoursShortpPolicyDb <hours>"
+  echo "    This parameter will be used to set the SHORTP_POLICY Number"
+  echo "    of hours after which to purge ADR contents that have a short"
+  echo "    life for Database. Default is $HOURS_SHORTP_POLICY_DB."
+  echo ""
+  echo "-hoursLongpPolicyDb <hours>"
+  echo "    This parameter will be used to set the LONGP_POLICY Number"
+  echo "    of hours after which to purge ADR contents that have a long"
+  echo "    life for the Database.Default is $HOURS_SHORTP_POLICY_DB."
+  echo ""
+  echo "-daysToKeepTraceFiles <days>"
+  echo "    This value determines for how long database trace files"
+  echo "    will be kept on the system after they last have been written to"
+  echo "    written to. Default is $DAYS_TO_KEEP_TRACE_FILES days."
+  echo ""
+  echo "-daysToKeepAlertLog <days>"
+  echo "    This value determines for how long a database alertlog file"
+  echo "    will be kept on the system after it has initially been"
+  echo "    written to. Default is $DAYS_TO_KEEP_ALERT_LOG days."
+  echo ""
+  echo "-compressAlertLog <yes|no>"
+  echo "    If specified the rotated alert logs will also be compressed"
+  echo "    with gzip. Default this option is $DAYS_TO_KEEP_ALERT_LOG"
+  echo ""
+  echo "-daysToKeepAuditFiles <days>"
+  echo "    This value determines for how many days the Oracle Database"
+  echo "    audit files will be kept on the system. The default is $DAYS_TO_KEEP_AUDIT_FILES days."
+  echo "    After this number of days filkes will be backed up to a directory"
+  echo ""
+  echo "-pathToBackupAuditFiles <path>"
+  echo "    This value determines where audit files will be backed up"
+  echo "    when they are deleted on the local system. The default value"
+  echo "    is $PATH_TO_BACKUP_AUDIT_FILES"
+  echo ""
+  echo "-rotateScheduleListenerLog \"<list of days>\""
+  echo "    This is a list of number enclosed within "" and separated by"
+  echo "    a space. The numbers 1 to 7 can be used. 1 represents Monday"
+  echo "    and 7 represents Sunday. If the current day is within the"
+  echo "    list when the script is called listener logs will be rotated"
+  echo "    otherwise listener logs will not be rotated."
+  echo "    Default is \"${ROTATE_SCHEDULE_LISTENER_LOG[@]}\""
+  echo ""
+  echo "-rotateScheduleAlertLog \"<list of days>\""
+  echo "    This is a list of number enclosed within "" and seprated by"
+  echo "    a space. The numbers 1 to 7 can be used. 1 represents Monday"
+  echo "    and 7 represents Sunday. If the current day is within the"
+  echo "    list when the script is called database alert logs will be"
+  echo "    rotated otherwise database alert logs will not be rotated."
+  echo "    Default is \"${ROTATE_SCHEDULE_ALERT_LOG[@]}\""
+  echo ""
+  echo "-haPrefix <Path to HA Directory>"
+  echo "    This is used when running in a HA cluster environment (AIX). Setting"
+  echo "    this will tell the script to look for oraInst.loc under this prefix"
+  echo "    Default this has no value and will search for oraInst.loc in the"
+  echo "    \"normal\" places. Will typically be something like /ha/xxxx if set."
+  echo ""
+  echo "-maxNumberOfRmFiles <number of files>"
+  echo "    This is used when removing files using xargs. Value will be put on"
+  echo "    xargs as a -n option"
+  echo "    Can be used to \"bee less IO aggressive\" Default is ${MAX_NUMBER_OF_RM_FILES}."
+}
+
+#
+# find_who_i_am
+#
+# Purpose: Find out what user I'm running as.
+#
+# Prereq:  None specific
+find_who_i_am()
+{
+  WHO_I_AM=`whoami`
+  if [ "${WHO_I_AM}" = "" ]
+  then
+    echo "   ERROR: Can't figure out what user I'm running as"
+    exit 1
+  else
+    [ -z $DEBUG  ] || echo "  DEBUG: Running as user $WHO_I_AM"
+  fi
+}
+
+# 
+# build_environment_names 
+# 
+# Purpose: Build some environment names based on parameters 
+#          given to script plus other variables needed 
+# 
+# Prereq:  None specific
+build_environment_names() 
+{ 
+  SHORT_HOST_NAME=${HOSTNAME%%.*} 
+  DOMAIN_NAME=${HOSTNAME#*.}
+  TODAY_STRING=`date  +%F`
+  NOW_STRING=`date  +%F_%H.%M.%S`
+  YEAR_MONTH_STRING=`date  +%Y-%m`
+  DAY_NUMBER=`date  +%u`
+  # The hostname without domain
+  SHORT_HOST_NAME=${HOSTNAME%%.*}
+  [ -z $DEBUG ] || echo "  DEBUG: Short host name: ${SHORT_HOST_NAME}"
+  [ -z $DEBUG ] || echo "  DEBUG: Domain name: $DOMAIN_NAME"
+  [ -z $DEBUG ] || echo "  DEBUG: Today: $TODAY_STRING"
+  [ -z $DEBUG ] || echo "  DEBUG: Current Day number: $DAY_NUMBER"
+} 
+
+# 
+# check_if_should_run 
+# 
+# Purpose: Will determine if current day are within this array
+# 
+# Prereq:  Called with day number and name of string holding the day array
+#          along with [@] (f.x. ROTATE_SCHEDULE_ALERT_LOG[@]  ) 
+check_if_should_run()
+{
+  [ -z $DEBUG  ] || echo "  DEBUG: Current Day number: $1"
+  declare -a daysToRun=("${!2}")  
+  [ -z $DEBUG  ] || echo "  DEBUG: Days to run: ${daysToRun[@]}"
+  for days_to_run in "${daysToRun[@]}"
+  do
+    if [ $days_to_run -eq $1 ]
+    then
+      return 0
+    fi
+  done
+  return 1
+}
+
+#
+# parse_arguments
+#
+# Purpose: Parses all the arguments received on command line and sets
+#          elevant environment variables from that
+#
+# Prereq:  Should be caled wit al parameters recived on command line
+#          typicaly "$@"
+
+parse_arguments()
+{
+  while [ $# -gt 0 ]
+  do
+    ALL_PARAMETERS="$ALL_PARAMETERS $1"
+    case $1 in
+      -help)                             show_help;exit;;
+      -action)                    shift; ACTION=$1;;
+      -debug)                            DEBUG=0;;
+      -lock)                             USE_LOCK="YES";;
+      -daysToKeepListenerLog)     shift; DAYS_TO_KEEP_LISTENER_LOG=$1;;
+      -compressListenerLog)       shift; COMPRESS_LISTENER_LOG=$1;;
+      -hoursShortpPolicyListener) shift; HOURS_SHORTP_POLICY_LISTENER=$1;;
+      -hoursLongpPolicyListener)  shift; HOURS_LONGP_POLICY_LISTENER=$1;;
+      -hoursShortpPolicyDb)       shift; HOURS_SHORTP_POLICY_DB=$1;;
+      -hoursLongpPolicyDb)        shift; HOURS_LONGP_POLICY_DB=$1;;
+      -daysToKeepTraceFiles)      shift; DAYS_TO_KEEP_TRACE_FILES=$1;;
+      -daysToKeepAlertLog)        shift; DAYS_TO_KEEP_ALERT_LOG=$1;;
+      -compressAlertLog)          shift; COMPRESS_ALERT_LOG=$1;;
+      -daysToKeepAuditFiles)      shift; DAYS_TO_KEEP_AUDIT_FILES=$1;;
+      -rotateScheduleListenerLog) shift; ROTATE_SCHEDULE_LISTENER_LOG=($1);;
+      -rotateScheduleAlertLog)    shift; ROTATE_SCHEDULE_ALERT_LOG=($1);;
+      -haPrefix)                  shift; HA_PREFIX=$1;;
+      -pathToBackupAuditFiles)    shift; PATH_TO_BACKUP_AUDIT_FILES=$1;;
+      -maxNumberOfRmFiles)        shift; MAX_NUMBER_OF_RM_FILES=$1;;        
+      # Here end add your extra parameters
+      *)	    echo "   ERROR: Parameter $1 given to shell script not recognized";exit 1;;
+    esac;
+    shift
+  done
+}
+
+#
+# print_arguments
+#
+# Purpose: Will print all parameters in debug mode
+#
+# Prereq:  All environment variables related to parameters
+#          should have been set to show anything usefull
+print_arguments()
+{
+  [ -z $DEBUG ] || echo "  DEBUG: ACTION=$ACTION"
+  [ -z $DEBUG ] || echo "  DEBUG: DEBUG=$DEBUG"
+  [ -z $DEBUG ] || echo "  DEBUG: DAYS_TO_KEEP_LISTENER_LOG=$DAYS_TO_KEEP_LISTENER_LOG"
+  [ -z $DEBUG ] || echo "  DEBUG: COMPRESS_LISTENER_LOG=$COMPRESS_LISTENER_LOG"
+  [ -z $DEBUG ] || echo "  DEBUG: HOURS_SHORTP_POLICY_LISTENER=$HOURS_SHORTP_POLICY_LISTENER"
+  [ -z $DEBUG ] || echo "  DEBUG: HOURS_LONGP_POLICY_LISTENER=$HOURS_LONGP_POLICY_LISTENER"
+  [ -z $DEBUG ] || echo "  DEBUG: HOURS_SHORTP_POLICY_DB=$HOURS_SHORTP_POLICY_DB"
+  [ -z $DEBUG ] || echo "  DEBUG: HOURS_LONGP_POLICY_DB=$HOURS_LONGP_POLICY_DB"
+  [ -z $DEBUG ] || echo "  DEBUG: DAYS_TO_KEEP_ALERT_LOG=$DAYS_TO_KEEP_ALERT_LOG"
+  [ -z $DEBUG ] || echo "  DEBUG: DAYS_TO_KEEP_TRACE_FILES=$DAYS_TO_KEEP_TRACE_FILES"
+  [ -z $DEBUG ] || echo "  DEBUG: COMPRESS_ALERT_LOG=$COMPRESS_ALERT_LOG"
+  [ -z $DEBUG ] || echo "  DEBUG: DAYS_TO_KEEP_AUDIT_FILES=$DAYS_TO_KEEP_AUDIT_FILES"
+  [ -z $DEBUG ] || echo "  DEBUG: ROTATE_SCHEDULE_LISTENER_LOG=$ROTATE_SCHEDULE_LISTENER_LOG"
+  [ -z $DEBUG ] || echo "  DEBUG: ROTATE_SCHEDULE_ALERT_LOG=$ROTATE_SCHEDULE_ALERT_LOG"
+  [ -z $DEBUG ] || echo "  DEBUG: HA_PREFIX=$HA_PREFIX"
+  [ -z $DEBUG ] || echo "  DEBUG: PATH_TO_BACKUP_AUDIT_FILES=$PATH_TO_BACKUP_AUDIT_FILES"
+}
+
+
+
+#
+# check_arguments
+#
+# Purpose: Checks all the arguments received on command line
+#
+# Prereq:  ACTION environment variable should have been set
+check_arguments()
+{
+  if [ -z "${ACTION}" ]  # Is this variable defined?
+  then
+    echo "  ERROR: parameter -action has to be given"
+    show_help
+    exit 1
+  fi
+  case $ACTION in
+    run)  :;;
+    dryrun)  DRY_RUN=0;;
+    *)	    echo "  ERROR: Parameter $ACTION given to -action has to be either run or dryrun"; exit 1;;
+  esac
+  #echo "check_arguments: TBI"
+  :
+}
+
+# 
+# find_os_environment 
+# 
+# Purpose: Will find the os type and set environment variable accordingly 
+# 
+# Prereq: None  specific
+find_os_environment() 
+{ 
+  OS_ENVIRONMENT=`uname -s`
+  case ${OS_ENVIRONMENT} in
+    AIX) :  ;;
+    Linux) : ;;
+    *) echo "   ERROR: OS Environment is not either Linux or AIX)"; exit 1;;
+  esac
+  [ -z $DEBUG  ] || echo "  DEBUG: Running under ${OS_ENVIRONMENT}"
+} 
+
+#
+# find_orainst_loc
+#
+# Purpose: Finds the first oraInst.loc file in the list and put it in ORA_INST_LOC
+#          environment variable
+#
+# Prereq:  Environment variable array ORA_INST_LOC_POSSIBLE_LOCATIONS should have
+#          been set to possible locations
+find_orainst_loc()
+{
+  # Have to add some code here that will find ora_inst_loc on HA Clusters
+  # probably we could figure out form some of the environment variables 
+  # set by the agent, as it will also be installed under the /ha/<ha host name>
+  # For testing puposes we should pobably add an option called haClusterName. If specified we will search below this path.
+  # Theese ate located under /ha/<ha host name>
+  for temp_possible_ora_inst_loc in "${ORA_INST_LOC_POSSIBLE_LOCATIONS[@]}"
+  do
+    # If HA_PREFIX set add it in front
+    if [ "$HA_PREFIX" = "" ]
+    then
+      possible_ora_inst_loc=$temp_possible_ora_inst_loc
+    else
+      possible_ora_inst_loc=${HA_PREFIX}$temp_possible_ora_inst_loc
+    fi
+    if [ -f ${possible_ora_inst_loc} ]
+    then 
+      ORA_INST_LOC=${possible_ora_inst_loc}
+      break
+    fi
+  done
+  if [ "${ORA_INST_LOC}" = "" ]
+  then
+    echo "  ERROR: No oraInst.loc file found amongst the (${ORA_INST_LOC_POSSIBLE_LOCATIONS})"
+    if [ "$HA_PREFIX" = "" ]
+    then
+      echo ""
+    else
+      echo "         that is located unter HA prefix $HA_PREFIX"
+    fi
+    exit 1
+  else
+    [ -z $DEBUG  ] || echo "  DEBUG: Using oraInst.loc file ${ORA_INST_LOC}"
+  fi
+}
+
+#
+# find_oratab
+#
+# Purpose: Finds the first oratab file in the list and sets environment 
+#          varaiable ORA_TAB to that
+#
+# Prereq:  Environment variable array ORA_TAB_POSSIBLE_LOCATIONS should have
+#          been set to possible locations
+find_oratab()
+{
+  for possible_ora_tab in "${ORA_TAB_POSSIBLE_LOCATIONS[@]}"
+  do
+    if [ -f ${possible_ora_tab} ]
+    then 
+      ORA_TAB=${possible_ora_tab}
+      break
+    fi
+  done
+  if [ "${ORA_TAB}" = "" ]
+  then
+    echo "   ERROR: No oratab file found amongst the (${ORA_TAB_POSSIBLE_LOCATIONS})"
+    exit 1
+  else
+    [ -z $DEBUG  ] || echo "  DEBUG: Using oratab file ${ORA_TAB}"
+  fi
+}
+
+#
+# find_inventory_loc
+#
+# Purpose: Finds the inventory_loc and set environment variable
+#          INVENTORY_LOC accordingly
+#
+# Prereq:  Environment variable INVENTORY_LOC should have been set
+
+find_inventory_loc() 
+{ 
+  INVENTORY_LOC=`sed -n "s/inventory_loc=\(.*\)/\1/p" $ORA_INST_LOC` 
+  if [ "$INVENTORY_LOC" = "" ] 
+  then 
+    echo "    ERROR: No inventory_loc found in file $ORA_INST_LOC" 
+    exit 1 
+  else
+    [ -z $DEBUG  ] || echo "  DEBUG: Using inventory_loc ${INVENTORY_LOC}"
+  fi 
+} 
+
+
+#
+# find_total_oracle_home_list
+#
+# Purpose: Finds all the oracle homes in the inventory - if any -
+#          that is not not delete and sets the environment variable array
+#          ORACLE_HOME_LIST
+#
+# Prereq:  Requires that environment variables INVENTORY_LOC has been set
+find_total_oracle_home_list() 
+{ 
+  # Filter out the ones that have been deleted (REMOVED="T")
+  ORACLE_HOME_LIST=` sed -n -e "/REMOVED=\"T\"/d" -e "s/<HOME\ NAME.*LOC=\"\([^\"]*\).*/\1/p" ${INVENTORY_LOC}/ContentsXML/inventory.xml 2>/dev/null` 
+  if [ "$ORACLE_HOME_LIST" = "" ] 
+  then 
+    [ -z $DEBUG  ] || echo "  DEBUG: No ORACLE_HOMES found in file ${INVENTORY_LOC}/ContentsXML/inventory.xml" 
+  else
+    [ -z $DEBUG  ] || echo "  DEBUG: Oracle homes found:"
+    [ -z $DEBUG  ] || echo "${ORACLE_HOME_LIST}"
+  fi 
+} 
+
+#
+# find_base_home_alert_listner_lists_we_can_handle
+#
+# Purpose: Finds all the oracle homes and the the oracle bases that we can handle
+#          we need to be the owner and it needs to be an 11 db-> home
+#          finds also list of alert logs and listener logs that should be handled
+#          Also finds listener ADRCI "homes" that may need to cleaned.
+#          CAN_HANDLE_ORACLE_BASE_LIST will contain list of ORACLE_BASE we can handle (will be one)
+#          CAN_HANDLE_ORACLE_HOME_LIST will contain list of ORACLE_HOME we can handle
+#          CAN_HANDLE_ORACLE_ALERT_LIST will contain a list of all alert logs found that we can handle
+#          CAN_HANDLE_ORACLE_LISTENER_LIST will contain a list of listeners that we can handle
+#          CAN_HANDLE_ORACLE_ADRCI_BASE_LIST will contains a list of ADRCI bases that contains listener logs we should purge (and mgmtfb)
+# Prereq:  Need the environment variable ORACLE_HOME_LIST to be filled with a list
+#          of possible ORALE_HOMES. Also need variable WHO_I_AM, OS_ENVIRONMENT
+find_base_home_alert_listner_lists_we_can_handle()
+{
+  FOUND_ORACLE_BASE_LIST=""
+  FOUND_ORACLE_HOME_LIST=""
+  FOUND_ORACLE_ALERT_LIST=""
+  FOUND_ORACLE_LISTENER_LIST=""
+  FOUND_ORACLE_ADRCI_BASE_LIST=""
+  # Find the GRID home, if we find this in the list below we will only handle that Oracle Home
+  FOUND_ORACLE_GRID_HOME=$(find_grid_home)
+  # Loop over the ORACLE_HOME list and find out what the ORACLE_BASE is
+  # Filter out ORACLE_BASE and ORACLE_HOMES we don't own or that don't have oraclebase executeable
+  for oracle_home in $ORACLE_HOME_LIST
+  do
+    # Try to find the ORACLE_BASE - should work for Version of database higher then 11 
+    current_oracle_base=`env -i LD_LIBRARY_PATH=${oracle_home}/lib ORACLE_HOME=${oracle_home} PATH=${oracle_home}/bin:$PATH ${oracle_home}/bin/orabase 2>/dev/null`
+    if [ "$current_oracle_base" = "" ]
+    then
+      # We don't have access to the file or the DB is not an 11 DB and it's not there
+      [ -z $DEBUG  ] || echo "  DEBUG: ORACLE_HOME in $oracle_home don't have orabase or do not allow us to execute it - skipping the ORACLE_HOME"
+      # Don't handle this ORACLE_HOME home
+      continue
+    else
+      # Go on as ORACLE_BASE could be determined, find the owner of the utility to figure out if we are the owner of the ORACLE_HOME
+      case ${OS_ENVIRONMENT} in
+        AIX)
+          current_oracle_owner=`istat ${oracle_home}/oui | sed -n -e "s/Owner[^(]*(\([^)]*\).*/\1/p" 2>/dev/null`;;
+        Linux)
+          current_oracle_owner=`stat -c "%U" ${oracle_home}/oui 2>/dev/null`;; 
+      esac
+      if [ "$current_oracle_owner" != "$WHO_I_AM" ]
+      then
+        # We don't own the file then don't handle that ORACLE_HOME
+        [ -z $DEBUG  ] || echo "  DEBUG: ORACLE_HOME in $oracle_home is not owned by $WHO_I_AM but by $current_oracle_owner - skipping it"
+        # Don't handle this home
+        continue
+      fi
+      # Are there any alert logs in this ORACLE_HOME  /u01/app/oracle/diag/rdbms/db1/db1/trace/alert_db1.log
+      ALERT_LOGS=`find $oracle_home/admin/*/bdump/alert*.log   2>/dev/null`
+      # Are there any alert logs in this ORACLE_BASE - if it's defined 
+      if [ "${current_oracle_base}" != "" ]
+      then
+        ALERT_LOGS="`find ${current_oracle_base}/diag/rdbms/*/*/trace/alert*.log 2>/dev/null`
+$ALERT_LOGS"      
+      fi
+      # Are there any listner logs in this ORACLE_HOME or ORACLE_BASE
+      ORACLE_HOME_LISTENER_LOGS=`find $oracle_home/log/diag/tnslsnr/${SHORT_HOST_NAME}/listener*/trace/listener*.log $oracle_home/log/diag/tnslsnr/${SHORT_HOST_NAME}/asmnet*lsnr_asm//trace/asmnet*lsnr_asm/.log $oracle_home/log/diag/tnslsnr/${SHORT_HOST_NAME}/mgmtlsnr/trace/mgmtlsnr.log 2>/dev/null`
+      ORACLE_BASE_LISTENER_LOGS=`find ${current_oracle_base}/diag/tnslsnr/${SHORT_HOST_NAME}/listener*/trace/listener*.log ${current_oracle_base}/diag/tnslsnr/${SHORT_HOST_NAME}/asmnet*lsnr_asm/trace/asmnet*lsnr_asm.log ${current_oracle_base}/diag/tnslsnr/${SHORT_HOST_NAME}/mgmtlsnr/trace/mgmtlsnr.log 2>/dev/null`
+      # Build op possible ADRCI locations (ORACLE_BASE and ORACLE_HOME)
+      if [ "$ORACLE_BASE_LISTENER_LOGS" != "" ]
+      then
+        FOUND_ORACLE_ADRCI_BASE_LIST="${FOUND_ORACLE_ADRCI_BASE_LIST}${oracle_home}:${current_oracle_base}
+"
+      fi
+      if [ "$ORACLE_HOME_LISTENER_LOGS" != "" ]
+      then
+        FOUND_ORACLE_ADRCI_BASE_LIST="${FOUND_ORACLE_ADRCI_BASE_LIST}${oracle_home}:${oracle_home}/log
+"
+      fi
+      # Build up the list of LISTENER log files to handle
+      FOUND_ORACLE_LISTENER_LIST="${FOUND_ORACLE_LISTENER_LIST}${ORACLE_HOME_LISTENER_LOGS}
+$ORACLE_BASE_LISTENER_LOGS
+"      
+      # Build up the list of alert logs to handle
+      FOUND_ORACLE_ALERT_LIST="${FOUND_ORACLE_ALERT_LIST}${ALERT_LOGS}
+"  
+      # Build up the list of ORACLE_HOMES we can handle
+      FOUND_ORACLE_HOME_LIST="${FOUND_ORACLE_HOME_LIST}${oracle_home}
+"      
+      if [ "$FOUND_ORACLE_GRID_HOME" = "$oracle_home" ]
+      then
+        # This user holds the CRS home, we wil only accept the GRID_HOME as ORACLE to be cleaned
+        ONLY_HOME_TO_ACCEPT="$FOUND_ORACLE_GRID_HOME"
+      fi
+      # Build up the list ORACLE_BASES we can handle
+      FOUND_ORACLE_BASE_LIST="${FOUND_ORACLE_BASE_LIST}${current_oracle_base}
+"      
+    fi
+  done
+  CAN_HANDLE_ORACLE_BASE_LIST=`echo "$FOUND_ORACLE_BASE_LIST" |sed '/^$/d'| sort -u`
+  if [ "$ONLY_HOME_TO_ACCEPT" = "" ]
+  then
+    CAN_HANDLE_ORACLE_HOME_LIST=`echo "$FOUND_ORACLE_HOME_LIST" |sed '/^$/d'| sort -u`
+    TEMP_CAN_HANDLE_ORACLE_ADRCI_BASE_LIST=`echo "$FOUND_ORACLE_ADRCI_BASE_LIST" |sed '/^$/d'| sort -u`    
+  else
+    CAN_HANDLE_ORACLE_HOME_LIST=$ONLY_HOME_TO_ACCEPT
+    current_oracle_base=`env -i LD_LIBRARY_PATH=${ONLY_HOME_TO_ACCEPT}/lib ORACLE_HOME=${ONLY_HOME_TO_ACCEPT} PATH=${ONLY_HOME_TO_ACCEPT}/bin:$PATH ${ONLY_HOME_TO_ACCEPT}/bin/orabase 2>/dev/null`
+    TEMP_CAN_HANDLE_ORACLE_ADRCI_BASE_LIST="${ONLY_HOME_TO_ACCEPT}:${current_oracle_base}"    
+  fi
+  CAN_HANDLE_ORACLE_ALERT_LIST=`echo "$FOUND_ORACLE_ALERT_LIST" |sed '/^$/d'| sort -u`
+  CAN_HANDLE_ORACLE_LISTENER_LIST=`echo "$FOUND_ORACLE_LISTENER_LIST" |sed '/^$/d'| sort -u`
+  UNIQUE_ORACLE_ADRCI_BASE_LIST=`echo "$TEMP_CAN_HANDLE_ORACLE_ADRCI_BASE_LIST" | cut -d: -f2 | sort -u`
+  for adrci_base in $UNIQUE_ORACLE_ADRCI_BASE_LIST
+  do
+    for possible_entry in $TEMP_CAN_HANDLE_ORACLE_ADRCI_BASE_LIST
+    do
+      extract_adrci_base=${possible_entry##*:}
+      if [ "$extract_adrci_base" = "$adrci_base" ]
+      then
+        # Found a enrry we can use
+        CAN_HANDLE_ORACLE_ADRCI_BASE_LIST="$CAN_HANDLE_ORACLE_ADRCI_BASE_LIST $possible_entry"
+        # Stop finding more
+        break
+      fi
+    done
+  done 
+  # This list will vary on the same system depending in f.x. the alert logs or listener logs have been created since last time the tool was run
+  echo "   INFO: CAN_HANDLE_ORACLE_BASE_LIST=$CAN_HANDLE_ORACLE_BASE_LIST"
+  echo "   INFO: CAN_HANDLE_ORACLE_HOME_LIST=$CAN_HANDLE_ORACLE_HOME_LIST"
+  echo "   INFO: CAN_HANDLE_ORACLE_ALERT_LIST=$CAN_HANDLE_ORACLE_ALERT_LIST"
+  echo "   INFO: CAN_HANDLE_ORACLE_LISTENER_LIST=$CAN_HANDLE_ORACLE_LISTENER_LIST"
+  echo "   INFO: CAN_HANDLE_ORACLE_ADRCI_BASE_LIST=$CAN_HANDLE_ORACLE_ADRCI_BASE_LIST"
+}
+
+# 
+# clean_audit_files_in_homes
+#
+# Purpose: Will clean out and backup old audit files located under ORACLE_HOME
+# 
+clean_audit_files_in_homes() 
+{ 
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: clean_audit_files need to be called with ORACLE_HOME to be cleaned as parameter" 
+    exit 1 
+  else 
+    # Is there an audit directory 
+    if [ -d $1/rdbms/audit ] 
+    then 
+      echo "   INFO: Finding *.aud and .xml files from $1/rdbms/audit older than +${DAYS_TO_KEEP_AUDIT_FILES} days"
+      # First we need to to find all subdirectories of audit (in case of plugable)
+      AUDIT_DIRECTORIES_FOUND=$(find $1/rdbms/audit -maxdepth 1 -type d  2>/dev/null)
+      # now loop over all the directories 
+      for audit_directory in $AUDIT_DIRECTORIES_FOUND
+      do
+        audit_directory_escaped=${audit_directory//\//\\\/}
+        if [ "$1/rdbms/audit" == "$audit_directory" ]
+        then
+          # This is the top level audit, set extra_injstance_name to "#"
+          extra_instance_name="#"
+        else
+          # This is a plugable, get the diretory s we can add it to the instance name
+          extra_instance_name="${audit_directory##*/}"
+        fi
+        [ -z $DRY_RUN  ] || echo " DRYRUN: find $audit_directory -maxdepth 1 \( -name \"*.xml\" -o -name \"*.aud\" \) -mtime +${DAYS_TO_KEEP_AUDIT_FILES} >/tmp/aud_files_to_handle_$$ 2>/dev/null"
+        # Find the audit files we want to backup and remove
+        find $audit_directory -maxdepth 1 \( -name "*.xml" -o -name "*.aud" \) -mtime +${DAYS_TO_KEEP_AUDIT_FILES} >/tmp/aud_files_to_handle_$$ 2>/dev/null
+        # We want to back them up on a per db instance level (we don't know the db name) Find unique instance names
+        INSTANCE_NAMES_FOUND=`cat /tmp/aud_files_to_handle_$$ | sed -n "s/${audit_directory_escaped}\/\(.*\)_[^_]*_[^_]*_[^_]*.\(aud\|xml\)/\1/p" | sort -u`
+        # Now loop over the instances
+        for instance in $INSTANCE_NAMES_FOUND
+        do
+          if [ "${extra_instance_name}" == "#" ]
+          then
+            echo "   INFO: Handling instance ${instance}"
+          else
+            echo "   INFO: Handling plugable id ${extra_instance_name} on instance ${instance}"
+          fi          
+        	# find the files for the instance and back them up
+        	cat /tmp/aud_files_to_handle_$$ | grep ${audit_directory}/${instance}_ >/tmp/aud_files_for_${instance}_${extra_instance_name}
+        	# make sure we have a catalog to put rhe files in
+        	mkdir -p ${PATH_TO_BACKUP_AUDIT_FILES}/${YEAR_MONTH_STRING}
+        	chmod 775 ${PATH_TO_BACKUP_AUDIT_FILES}/${YEAR_MONTH_STRING}
+        	# Now back them up
+          echo "   INFO: Zip Audit Files start time: `date  +\"%Y-%m-%d_%H.%M.%S_%z\"`"
+          [ -z $DRY_RUN  ] || echo " DRYRUN: cat /tmp/aud_files_for_${instance}_${extra_instance_name} | zip -q -@  ${PATH_TO_BACKUP_AUDIT_FILES}/${YEAR_MONTH_STRING}/${instance}_${extra_instance_name}.${SHORT_HOST_NAME}.audit.${NOW_STRING}.zip"
+          [ ! -z $DRY_RUN  ] || cat /tmp/aud_files_for_${instance}_${extra_instance_name} | zip -q -@  ${PATH_TO_BACKUP_AUDIT_FILES}/${YEAR_MONTH_STRING}/${instance}_${extra_instance_name}.${SHORT_HOST_NAME}.audit.${NOW_STRING}.zip
+          RESULT=$?
+          if [ $RESULT -eq 0 ]
+          then	
+        	  # Now remove them (look in file)
+            echo "   INFO: Remove Audit Files start time: `date  +\"%Y-%m-%d_%H.%M.%S_%z\"`"
+            [ -z $DRY_RUN  ] ||  echo " DRYRUN: cat /tmp/aud_files_for_${instance}_${extra_instance_name} | xargs -n ${MAX_NUMBER_OF_RM_FILES} rm"
+            [ ! -z $DRY_RUN  ] ||  cat /tmp/aud_files_for_${instance}_${extra_instance_name} | xargs -n ${MAX_NUMBER_OF_RM_FILES}  rm
+        	  # Remove working file
+        	fi
+        	rm /tmp/aud_files_for_${instance}_${extra_instance_name} 
+        done
+        # Remove working file
+        rm /tmp/aud_files_to_handle_$$
+      done
+    else
+      echo "   INFO: $1/rdbms/audit does not exists - skipping removing audit files there"
+    fi 
+  fi 
+} 
+
+# 
+# clean_audit_files_in_bases
+#
+# Purpose: Will clean ot old audit files located under ORACLE_BASE
+# 
+clean_audit_files_in_bases() 
+{ 
+  # TODO Consider using this to avoid to many spawns
+  # find … -print0 | xargs -0 –no-run-if-empty -n ${MAX_NUMBER_OF_RM_FILES} — rm.
+  #set -x
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: clean_audit_files need to be called with ORACLE_BASE to be cleaned as parameter" 
+    exit 1 
+  else 
+    # Is there an admin directory 
+    if [ -d $1/admin ] 
+    then 
+      # TBD Probably need to rewrite this to work with plugable (see the ORACLE_HOME cleanup for how this could be done)
+      echo "   INFO: Removing *.aud and *.xml files from $1/admin/*/adump/ older than +${DAYS_TO_KEEP_AUDIT_FILES} days"
+      # First we need to to find all subdirectories of audit (in case of plugable)
+      AUDIT_DIRECTORIES_FOUND=$(find $1/admin/*/adump -maxdepth 1 -type d  2>/dev/null)
+      # now loop over all the directories 
+      for audit_directory in $AUDIT_DIRECTORIES_FOUND
+      do
+        # Used when / is not "allowed" in names and needs to be escaped
+        audit_directory_escaped=${audit_directory//\//\\\/}
+        if [[ $audit_directory =~ $base/admin/.*/adump$ ]]
+        then
+          # This is the top level audit, set extra_instance_name to "#"
+          extra_instance_name="#"
+        else
+          # This is a plugable, get the diretory so we can add it to the instance name
+          extra_instance_name="${audit_directory##*/}"
+        fi
+        # Find the audit files we want to backup and remove      
+        [ -z $DRY_RUN  ] || echo " DRYRUN: find $audit_directory -maxdepth 1 \( -name "*.xml" -o -name "*.aud" \) -mtime +${DAYS_TO_KEEP_AUDIT_FILES} >/tmp/aud_files_to_handle_$$ 2>/dev/null"
+        find $audit_directory -maxdepth 1 \( -name "*.xml" -o -name "*.aud" \)  -mtime +${DAYS_TO_KEEP_AUDIT_FILES} >/tmp/aud_files_to_handle_$$ 2>/dev/null
+        # We want to back them up on a per db instance level (we don't know the db name) Find unique instance names
+        INSTANCE_NAMES_FOUND=`cat /tmp/aud_files_to_handle_$$ | sed -n "s/${audit_directory_escaped}\/\(.*\)_[^_]*_[^_]*_[^_]*.\(aud\|xml\)/\1/p" | sort -u`
+        # Now loop over the instances
+        for instance in $INSTANCE_NAMES_FOUND
+        do
+          if [ "${extra_instance_name}" == "#" ]
+          then
+            echo "   INFO: Handling instance ${instance}"
+          else
+            echo "   INFO: Handling plugable id ${extra_instance_name} on instance ${instance}"
+          fi
+        	# find the files for the instance and back them up
+        	cat /tmp/aud_files_to_handle_$$ | grep ${audit_directory}/${instance}_ >/tmp/aud_files_for_${instance}_${extra_instance_name}
+        	# make sure we have a catalog to put rhe files in
+        	mkdir -p ${PATH_TO_BACKUP_AUDIT_FILES}/${YEAR_MONTH_STRING}
+        	chmod 775 ${PATH_TO_BACKUP_AUDIT_FILES}/${YEAR_MONTH_STRING}        	
+          [ -z $DRY_RUN  ] || echo " DRYRUN: cat /tmp/aud_files_for_${instance} | zip -q -@  ${PATH_TO_BACKUP_AUDIT_FILES}/${YEAR_MONTH_STRING}/${instance}_${extra_instance_name}.${SHORT_HOST_NAME}.audit.${NOW_STRING}.zip"
+          [ ! -z $DRY_RUN  ] || cat /tmp/aud_files_for_${instance}_${extra_instance_name} | zip -q -@  ${PATH_TO_BACKUP_AUDIT_FILES}/${YEAR_MONTH_STRING}/${instance}_${extra_instance_name}.${SHORT_HOST_NAME}.audit.${NOW_STRING}.zip
+          RESULT=$?
+          if [ $RESULT -eq 0 ]
+          then	
+        	  # Now back them up
+            # Now remove them (look in file)
+        	  [ -z $DRY_RUN  ] ||  echo " DRYRUN: cat /tmp/aud_files_for_${instance}_${extra_instance_name} | xargs -n ${MAX_NUMBER_OF_RM_FILES} rm -f"
+        	  [ ! -z $DRY_RUN  ] ||  cat /tmp/aud_files_for_${instance}_${extra_instance_name} | xargs -n ${MAX_NUMBER_OF_RM_FILES} rm -f
+        	fi
+        	# Remove working file
+        	rm /tmp/aud_files_for_${instance}_${extra_instance_name}
+        done
+        # Remove working file
+        rm /tmp/aud_files_to_handle_$$
+      done
+# g48180: added 2021-06-02
+      if [ -d /u01/app/grid/crsdata/*/acfs ]
+      then
+        echo "   INFO:  Remove /u01/app/grid/crsdata/*/acfs/acfs.diag_vol-*-incident-*.bin files older than a day"
+          [ -z $DRY_RUN  ] || echo " DRYRUN: find /u01/app/grid/crsdata/*/acfs -name acfs.diag_vol-*-incident-*.bin -mtime +1 -exec rm -f {} \; >/dev/null 2>/dev/null"
+          [ ! -z $DRY_RUN  ] || find /u01/app/grid/crsdata/*/acfs -name acfs.diag_vol-*-incident-*.bin -mtime +1 -exec rm -f {} \; >/dev/null 2>/dev/null
+      else
+        echo "   INFO: /u01/app/grid/crsdata/*/acfs does not exists - skipping"
+      fi
+    else
+      echo "   INFO: $1/rdbms/audit does not exists - skipping removing audit files there"
+    fi 
+  fi 
+  #set +x
+} 
+
+# 
+# clean_trace_files_in_bases
+#
+# Purpose: Will clean out old trace files located under ORACLE_BASE
+# 
+clean_trace_files_in_bases() 
+{ 
+  #set -x
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: clean_trace_files_in_bases need to be called with ORACLE_BASE to be cleaned as parameter" 
+    exit 1 
+  else 
+    # Is there an diag directory 
+    if [ -d $1/diag ] 
+    then 
+      echo "   INFO: Removing *.trc and *.trm files from $1/*...*/trace/ older than +${DAYS_TO_KEEP_TRACE_FILES} days"
+      # Find the files we want to delete and delete them      
+      [ -z $DRY_RUN  ] || echo " DRYRUN: find $1/diag -path \*/trace/\*.tr? -mtime +${DAYS_TO_KEEP_TRACE_FILES} -exec rm -f {} \; >/dev/null 2>/dev/null"
+      [ ! -z $DRY_RUN  ] || find $1/diag -path \*/trace/\*.tr? -mtime +${DAYS_TO_KEEP_TRACE_FILES} -exec rm -f {} \; >/dev/null 2>/dev/null
+    else
+      echo "   INFO: $1/diag does not exists - skipping removing trace files there"
+    fi 
+  fi 
+  #set +x
+} 
+
+
+# 
+# clean_trace_files_in_homes
+#
+# Purpose: Will clean out old trace files located under ORACLE_HOME
+# 
+clean_trace_files_in_homes() 
+{ 
+  #set -x
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: clean_trace_files_in_homes need to be called with ORACLE_HOME to be cleaned as parameter" 
+    exit 1 
+  else 
+    # Is there an rdbms/log directory 
+    if [ -d $1/rdbms/log ] 
+    then 
+      echo "   INFO: Removing *.trc and *.trm files from $1/rdbms/log older than +${DAYS_TO_KEEP_TRACE_FILES} days"
+      # Find the files we want to delete and delete them      
+      [ -z $DRY_RUN  ] || echo " DRYRUN: find $1/rdbms -path \*/trace/\*.tr? -mtime +${DAYS_TO_KEEP_TRACE_FILES} -exec rm -f {} \; >/dev/null 2>/dev/null"
+      [ ! -z $DRY_RUN  ] || find $1/rdbms -path \*/log/\*.tr? -mtime +${DAYS_TO_KEEP_TRACE_FILES} -exec rm -f {} \; >/dev/null 2>/dev/null
+    else
+      echo "   INFO: $1/rdbms does not exists - skipping removing trace files there"
+    fi 
+  fi 
+# g48180: added 2021-05-26
+# Is network/log/sqlnet.log file there
+  if [ -f $1/network/log/sqlnet.log ]
+  then
+    echo "   INFO: Removing network/log/sqlnet.log"
+    [ -z $DRY_RUN  ] || echo " DRYRUN: rm -f $1/network/log/sqlnet.log"
+    [ ! -z $DRY_RUN  ] || rm -f $1/network/log/sqlnet.log
+  else
+    echo "   INFO: $1/network/log/sqlnet.log does not exists - skipping removing sqlnet.log file there"
+  fi
+  #set +x
+} 
+
+
+# 
+# adrci_lsnr_purge
+#
+# Purpose: Will purge listener logs in oracle homes and setup set up long and short policies on listener
+# 
+# Prereq:  Call with one combined parameter consisting of ORACLE_HOME and ADRCI_BASE separated with :
+adrci_lsnr_purge() 
+{ 
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: adrci_lsnr_purge need to be called with ORACLE_HOME:ORACLE_ADRCI_BASE to be cleaned as parameter" 
+    exit 1 
+  else 
+    # First get the ORACLE_BASE and ORACLE_HOME
+    extract_adrci_base=${oracle_adrci_entry##*:}
+    extract_oracle_home=${oracle_adrci_entry%%:*}
+    # Only find listener homes
+    for adr_lsnr_home in `env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH adrci exec="set base $extract_adrci_base; show homes"|grep 'listener\|asmnet.*lsnr_asm\|mgmtlsnr'` 
+    do 
+      echo "   INFO: Purge ADRCI listener log entries in ${extract_adrci_base}/$adr_lsnr_home" 
+      #[ -z $DRY_RUN  ] || echo " DRYRUN: env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH $extract_oracle_home/bin/adrci exec=\"set base $extract_adrci_base; set home $adr_lsnr_home; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_LISTENER}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_LISTENER}\); purge\"" 
+      #[ ! -z $DRY_RUN  ] || env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH $extract_oracle_home/bin/adrci exec="set base $extract_adrci_base; set home $adr_lsnr_home; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_LISTENER}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_LISTENER}\); purge" 
+      [ -z $DRY_RUN  ] || echo " DRYRUN: env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH $extract_oracle_home/bin/adrci exec=\"set base $extract_adrci_base; set home $adr_lsnr_home;migrate schema; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_LISTENER}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_LISTENER}\); purge\"" 
+      [ ! -z $DRY_RUN  ] || env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH $extract_oracle_home/bin/adrci exec="set base $extract_adrci_base; set home $adr_lsnr_home; migrate schema; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_LISTENER}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_LISTENER}\); purge" 
+    done 
+  fi
+} 
+
+
+# 
+# adrci_db_purge
+#
+# Purpose: Will purge db logs in oracle homes and setup set up long and short policies on db's
+# 
+# Prereq:  Call with one combined parameter consisting of ORACLE_HOME and ADRCI_BASE separated with :
+adrci_db_purge() 
+{ 
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: adrci_db_purge need to be called with ORACLE_HOME:ORACLE_ADRCI_BASE to be cleaned as parameter" 
+    exit 1 
+  else 
+    # First get the ORACLE_BASE and ORACLE_HOME
+    extract_adrci_base=${oracle_adrci_entry##*:}
+    extract_oracle_home=${oracle_adrci_entry%%:*}
+    # Only find listener homes
+    for adr_db_home in `env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH adrci exec="set base $extract_adrci_base; show homes"|grep 'rdbms'` 
+    do 
+      echo "   INFO: Purge ADRCI db log entries in ${extract_db_base}/$adr_lsnr_home" 
+      #[ -z $DRY_RUN  ] || echo " DRYRUN: env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH $extract_oracle_home/bin/adrci exec=\"set base $extract_adrci_base; set home $adr_lsnr_home; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_LISTENER}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_LISTENER}\); purge\"" 
+      #[ ! -z $DRY_RUN  ] || env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH $extract_oracle_home/bin/adrci exec="set base $extract_adrci_base; set home $adr_lsnr_home; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_LISTENER}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_LISTENER}\); purge" 
+      [ -z $DRY_RUN  ] || echo " DRYRUN: env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH $extract_oracle_home/bin/adrci exec=\"set base $extract_adrci_base; set home $adr_lsnr_home;migrate schema; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_LISTENER}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_LISTENER}\); purge\"" 
+      [ ! -z $DRY_RUN  ] || env -i LD_LIBRARY_PATH=$extract_oracle_home/lib:$extract_oracle_home ORACLE_HOME=$extract_oracle_home PATH=$extract_oracle_home/bin:$PATH $extract_oracle_home/bin/adrci exec="set base $extract_adrci_base; set home $adr_lsnr_home; migrate schema; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_LISTENER}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_LISTENER}\); purge" 
+    done 
+  fi
+} 
+
+
+# 
+# adrci_db_setup
+#
+# Purpose: Will set up long and short policies on databases
+# 
+# Prereq:  Callw with ORACLE_HOME as parameter  
+adrci_db_setup() 
+{ 
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: adrci_db_setup need to be called with ORACLE_HOME as parameter" 
+    exit 1 
+  else 
+    # Only find db homes
+    for adr_db_home in `env -i LD_LIBRARY_PATH=$1/lib:$1 ORACLE_HOME=$1 PATH=$1/bin:$PATH adrci exec="show homes"|grep rdbms` 
+    do 
+      echo "   INFO: Setup ADRCI db control parameters in $adr_db_home" 
+      [ -z $DRY_RUN  ] || echo " DRYRUN: env -i LD_LIBRARY_PATH=$1/lib:$1 ORACLE_HOME=$1 PATH=$1/bin:$PATH $1/bin/adrci exec=\"set home $adr_db_home; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_DB}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_DB}\)\"" 
+      [ ! -z $DRY_RUN  ] || env -i LD_LIBRARY_PATH=$1/lib:$1 ORACLE_HOME=$1 PATH=$1/bin:$PATH $1/bin/adrci exec="set home $adr_db_home; set control \(SHORTP_POLICY=${HOURS_SHORTP_POLICY_DB}\); set control \(LONGP_POLICY=${HOURS_LONGP_POLICY_DB}\)" 
+    done 
+  fi
+} 
+
+
+
+#
+# rotate_alert_log
+#
+# Purpose: Will rotate alert logs. We can just move them as DB will recreate alert file
+# 
+# Prereq:  Call with alert log file name as parameter
+rotate_alert_log()
+{
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: rotate_alert_log need to be called with alert log file as parameter" 
+    exit 1 
+  fi 
+  # Check if we already have rotated today
+  ALERT_FILE_NAME=`basename $1`
+  ALERT_DIR_NAME=`dirname $1`
+  if [ -f "${1}.${TODAY_STRING}.gz" -o -f "${1}.${TODAY_STRING}.gz" ]
+  then 
+    # Have already made a rotation today
+    echo "   INFO: Rotate alert log $1 have already been done today - skipping"
+  else 
+    # Ok we need to rotate
+    # First move, DB will create the file again
+    [ -z $DRY_RUN  ] || echo " DRYRUN: mv $1 ${1}.${TODAY_STRING}"
+    [ ! -z $DRY_RUN  ] || mv $1 ${1}.${TODAY_STRING} 
+    if [ "$COMPRESS_ALERT_LOG" = "yes" ]
+    then
+      # Also compress
+      echo "   INFO: Rotated and compressed alert log to ${1}.${TODAY_STRING}.gz"
+      [ -z $DRY_RUN  ] || echo " DRYRUN: gzip ${1}.${TODAY_STRING}"
+      [ ! -z $DRY_RUN  ] ||gzip ${1}.${TODAY_STRING}
+    else
+      echo "   INFO: Rotated alert log to $1.${TODAY_STRING}"
+    fi
+  fi 
+  # Now remove old alert logs
+  echo "   INFO: Remove alert logs named ${ALERT_DIR_NAME}/${ALERT_FILE_NAME}.* and older than ${DAYS_TO_KEEP_ALERT_LOG} days"
+  [ -z $DRY_RUN  ] || echo " DRYRUN: find $ALERT_DIR_NAME -name \"${ALERT_FILE_NAME}.*\" -mtime +${DAYS_TO_KEEP_ALERT_LOG} -exec rm -f {} \; -exec echo {} \; 2>/dev/null"
+  [ -z $DRY_RUN  ] || echo " DRYRUN: Files to be deleted: `find $ALERT_DIR_NAME -name \"${ALERT_FILE_NAME}.*\" -mtime +${DAYS_TO_KEEP_ALERT_LOG} -exec echo {} \; 2>/dev/null`"
+  [ ! -z $DRY_RUN  ] || find $ALERT_DIR_NAME -name "${ALERT_FILE_NAME}.*" -mtime +${DAYS_TO_KEEP_ALERT_LOG} -exec rm -f {} \; -exec echo {} \; 2>/dev/null
+}
+
+#
+# rotate_listener_log
+#
+# Purpose: Will rotate listener logs. We can just move them as we only support 11 and later with the script
+# 
+# Prereq:  Call with listener log file name as parameter
+rotate_listener_log()
+{
+  if [ "$1" = "" ] 
+  then 
+    echo "  ERROR: rotate_listener_log need to be called with listener log file as parameter" 
+    exit 1 
+  fi 
+  # Check if we already have rotated today
+  LISTENER_FILE_NAME=`basename $1`
+  LISTENER_DIR_NAME=`dirname $1`
+  if [ -f "${1}.${TODAY_STRING}.gz" -o -f "${1}.${TODAY_STRING}.gz" ]
+  then 
+    # Have already made a rotation today
+    echo "   INFO: Rotate alert log $1 have already been done today - skipping"
+  else 
+    # Ok we need to rotate
+    # First move, Listner in Oracle 11g will create the file again
+    [ -z $DRY_RUN  ] || echo " DRYRUN: mv $1 ${1}.${TODAY_STRING}"
+    [ ! -z $DRY_RUN  ] || mv $1 ${1}.${TODAY_STRING}
+    if [ "$COMPRESS_ALERT_LOG" = "yes" ]
+    then
+      # Also compress
+      echo "   INFO: Rotated and compressed listener log to ${1}.${TODAY_STRING}.gz"
+      [ -z $DRY_RUN  ] || echo " DRYRUN: gzip ${1}.${TODAY_STRING}"
+      [ ! -z $DRY_RUN  ] ||gzip ${1}.${TODAY_STRING}
+    else
+      echo "   INFO: Rotated listener log to $1.${TODAY_STRING}"    
+    fi
+  fi 
+  # Now remove old alert logs
+  echo "   INFO: Remove listener logs named ${LISTENER_DIR_NAME}/${LISTENER_FILE_NAME}.* and older than ${DAYS_TO_KEEP_LISTENER_LOG} days"
+  [ -z $DRY_RUN  ] || echo " DRYRUN: find $LISTENER_DIR_NAME -name \"${LISTENER_FILE_NAME}.*\" -mtime +${DAYS_TO_KEEP_LISTENER_LOG} -exec rm -f {} \; -exec echo {} \; 2>/dev/null"
+  [ -z $DRY_RUN  ] || echo " DRYRUN: Files to be deleted: `find $LISTENER_DIR_NAME -name \"${LISTENER_FILE_NAME}.*\" -mtime +${DAYS_TO_KEEP_LISTENER_LOG} -exec echo {} \; 2>/dev/null`"
+  [ ! -z $DRY_RUN  ] || find $LISTENER_DIR_NAME -name "${LISTENER_FILE_NAME}.*" -mtime +${DAYS_TO_KEEP_LISTENER_LOG} -exec rm -f {} \; -exec echo {} \; 2>/dev/null
+}
+
+configure_defaults
+parse_arguments "$@"
+print_arguments
+check_arguments
+
+# Enable trap before calling the locking
+create_lock_dir "$USE_LOCK"
+trap remove_lock_dir EXIT SIGHUP SIGINT SIGTERM
+
+build_environment_names
+find_os_environment
+find_who_i_am
+find_oratab
+find_orainst_loc
+find_inventory_loc
+#find_grid_home_info
+# Find the total list of ORACLE_HOMES
+find_total_oracle_home_list
+# Find all relevant Oracle Homes on this Server that we should handle
+
+# For now we only handle 11 DB -> and 11 Listener ->
+# We handle both grid and oracle user
+find_base_home_alert_listner_lists_we_can_handle
+if [ "${CAN_HANDLE_ORACLE_HOME_LIST}" != "" ]
+then
+  # There are ORACLE_HOMES We can handle
+  for oracle_home in $CAN_HANDLE_ORACLE_HOME_LIST 
+  do 
+    clean_audit_files_in_homes $oracle_home 
+    clean_trace_files_in_homes $oracle_home
+    # Only do this if global lock="YES" as we in that case use shared placement of diag
+    # Also do it on grid home as we can have mgmtdb there
+    if [ "$global_lock" == "YES" -o "$FOUND_ORACLE_GRID_HOME" = "$oracle_home" ]
+    then
+      # We should somehow change this to work with only an instance at time.
+      # We rerun this many times. Will have to rethink TBD. M;aybe create
+      # separate step that only do this one time
+      adrci_db_setup   $oracle_home
+    fi
+  done
+fi
+if [ "${CAN_HANDLE_ORACLE_BASE_LIST}" != "" ]
+then
+  # There are ORACLE_BASES We can handle
+  for oracle_base in $CAN_HANDLE_ORACLE_BASE_LIST 
+  do 
+    clean_audit_files_in_bases $oracle_base
+    clean_trace_files_in_bases $oracle_base
+  done
+fi
+# Only do this if global lock="YES" as we in that case use shared placement of alert logs
+if [ "${CAN_HANDLE_ORACLE_ALERT_LIST}" != ""  -a "$global_lock" == "YES" ]
+then
+  # There are alert logs that we can handle
+  # also check if the day is specified as a day to rotate logs
+  if ( check_if_should_run $DAY_NUMBER ROTATE_SCHEDULE_ALERT_LOG[@] )
+  then
+    echo "   INFO: Alert logs rotate scheduled for today"
+    for oracle_alert_log in $CAN_HANDLE_ORACLE_ALERT_LIST 
+    do 
+      rotate_alert_log $oracle_alert_log 
+    done
+  else
+    echo "   INFO: Alert logs rotate not scheduled for today"
+  fi
+fi
+if [ "${CAN_HANDLE_ORACLE_LISTENER_LIST}" != "" ]
+then
+  # There are listener logs that we can handle
+  # also check if the day is specified as a clean day
+  if ( check_if_should_run $DAY_NUMBER ROTATE_SCHEDULE_LISTENER_LOG[@] )
+  then
+    echo "   INFO: Listener rotate scheduled for today"
+    for oracle_listener_log in $CAN_HANDLE_ORACLE_LISTENER_LIST 
+    do 
+      rotate_listener_log $oracle_listener_log 
+    done
+  else
+    echo "   INFO: Listener rotate not scheduled for today"
+  fi
+fi
+if [ "${CAN_HANDLE_ORACLE_ADRCI_BASE_LIST}" != "" ]
+then
+  # There are ADRCI listener logs that we can handle
+  for oracle_adrci_entry in $CAN_HANDLE_ORACLE_ADRCI_BASE_LIST
+  do
+    adrci_lsnr_purge "$oracle_adrci_entry"
+    # mgmtdb
+    adrci_db_purge "$oracle_adrci_entry"
+  done
+fi
+
+echo "   INFO: END Time: `date  +\"%Y-%m-%d_%H.%M.%S_%z\"`"

@@ -1,0 +1,1618 @@
+#!/bin/bash
+# This script is used to update listener.ora and tnsnames.ora on standard
+# databases on Exadata and probably other RAC systems in the future
+# run the script with -h to getfurther information
+# 
+# 1.0.0   2015-12-12 asger.solvang@nordea.com     Initial version
+# 1.0.1   2015-12-13 asger.solvang@nordea.com     Added more comments and cleaned up
+# 1.0.2   2015-12-13 asger.solvang@nordea.com     Problems with case of unique db name
+# 1.0.3   2015-12-15 asger.solvang@nordea.com     Wrote wrong content to listener.ora
+# 1.0.4   2015-12-21 asger.solvang@nordea.com     Listener reload missing
+# 1.0.5   2015-12-21 asger.solvang@nordea.com     Remove output
+# 1.0.6   2016-02-05 asger.solvang@nordea.com     Fixed problem where cmp did not see missing file and 
+#                                                 if instances are not defined on all nodes we had problems
+# 1.0.7   2016-04-08 asger.solvang@nordea.com     Removed debuging information 
+# 1.0.8   2016-05-02 asger.solvang@nordea.com     Added various ENVS variables to static registration
+# 1.0.9   2016-08-10 asger.solvang@nordea.com     Preparing for shared TNS_ADMIN
+# 1.0.10  2016-08-10 asger.solvang@nordea.com     Further changes for shared TNS_ADMIN
+# 1.0.11  2016-08-15 asger.solvang@nordea.com     Now only runs "one time" for tnsnames.ora is running using clustwred TNS_ADMIN
+# 1.0.12  2016-08-16 asger.solvang@nordea.com     Added possibility to create entry in listener.ora for manualt static entry for duplication and added dry run parameter
+# 1.0.13  2016-08-19 asger.solvang@nordea.com     Changed to do the matching for listemer.ora sid_list entries to be based on global db name
+# 1.0.14  2016-08-19 asger.solvang@nordea.com     Added action "remove" to remove entries
+# 1.0.15  2016-08-22 asger.solvang@nordea.com     Fixed a couple of bugs found while testing
+# 1.0.16  2016-08-24 asger.solvang@nordea.com     Preparing for more generic use (do multiple updates to listener.ora f.x. in one run)
+# 1.0.17  2016-08-24 asger.solvang@nordea.com     More or less working function that will create _dgmgrl entries for all databases in listener.ora
+# 1.0.18  2016-08-24 asger.solvang@nordea.com     Added fixes for creating _dgmgrl entries for all databases in listener.ora
+# 1.0.19  2016-08-31 asger.solvang@nordea.com     More checks of valid parameters constellations
+# 1.0.20  2016-12-02 asger.solvang@nordea.com     Put evrything into one script again
+# 1.0.21  2016-12-02 asger.solvang@nordea.com     First version that seems to work, added also IFILE
+# 1.0.22  2017-01-07 asger.solvang@nordea.com     Wrong help and had to run config command using the right ORACLE_HOME, also skip checking homes when running duplicate
+# 1.0.23  2017-01-12 asger.solvang@nordea.com     Tried to solve problem of agent screwing up listener.ora
+# 1.0.24  2017-01-12 asger.solvang@nordea.com     Solved problem of agent screwing up listener.ora
+# 1.0.25  2017-01-13 asger.solvang@nordea.com     Locking not working
+# 1.0.26  2017-02-08 asger.solvang@nordea.com     Don't need databaseuniquename when only creating duplicate entries
+# 1.0.27  2017-03-27 asger.solvang@nordea.com     Has to wait 75 seconds in between listener reloads to avoid service loss
+# 1.0.28  2017-04-04 asger.solvang@nordea.com     Trying to allow to delete entries without database being there, also limiting needed parameters when deleting
+# 1.0.29  2017-04-04 asger.solvang@nordea.com     Some syntax typos and a wrong handling of dup_entries un tnsnames.ora
+# 1.0.30  2018-02-01 asger.solvang@nordea.com     Don't use include when running on old systems (e.g. tnsnames.ora inside Oracle Homes)
+# 1.0.31  2018-06-30 asger.solvang@nordea.com     Fixed fiding grid home
+# 1.0.32  2018-10-26 asger.solvang@nordea.com     Extended with --allDatabasesInCluster do avoid specifing all when all is really needed
+# 1.0.33  2019-07-01 asger.solvang@nordea.com     Added option --dontReloadListener to avoid reloading the listener
+# 1.0.34  2020-04-01 asger.solvang@nordea.com     Changed to work with NON RAC databases
+
+# WISHLIST: Maybe enable that one can choose between shared TNS_ADMIN and not shared plus specify the path in case one want to be in more control 
+#           As it is mow it's either shared if tnsnames.ora is available, or in the oracle_home of the database home
+SVERSION="1.0.34"
+# Used for makeing backup of files and timestamping in general
+NOW_STRING=`date  +%F_%H.%M.%S`
+echo "   INFO: Script version $SVERSION (${NOW_STRING})"
+# Location of a clustered tnsnames.ora. If the file tnsnames.ora exists in this directory we assume that databases uses a shared TNS_ADMIN
+# In this case we add also TNS_ADMIN environment to the cluster configuratiomn for the database we create
+# and the variable USING_SHARED_TNS_ADMIN will be set to "Y" 
+# TBD
+CLUSTERED_TNS_ADMIN=/clustershare/network/admin
+# Name of tnsname.ora include file or empty if not used
+TNS_NAME_INCLUDE_FILE_NAME="nordea_tnsnames.ora"
+# New line
+NEW_LINE=$'\n'
+# The script name that is running
+SCRIPT_NAME=${0##*/}
+# The relative path to the script
+SCRIPT_PATH=${0%/*}
+# Build full path to script
+case "$SCRIPT_PATH" in
+  /*)
+    # Full path given, use that
+    SCRIPT_PATH=$SCRIPT_PATH;;
+  *)
+    # Relative path given, build full path
+    SCRIPT_PATH=$PWD/$SCRIPT_PATH;;
+esac
+# Default static type mode
+STATIC_TYPE="dataguard"
+# Location of oratab used to find the GRID ORACLE_HOME later
+ORA_TAB=/etc/oratab
+# Currently all entries we build will use this port, may we can expose it 
+# later as parameter if needed
+LISTENER_PORT=1521
+# Directory used for locking. E.g. only one person can run the script at one time
+# We will use the cluster file system if it exists, otherwise use the location of the script
+if [ -d "$CLUSTERED_TNS_ADMIN" ]
+then
+  LOCK_DIR=${CLUSTERED_TNS_ADMIN}/.lock_dir_for_tnsnames_and_listener_changes
+else
+  LOCK_DIR=${SCRIPT_PATH}/.lock_dir_for_tnsnames_and_listener_changes
+fi
+
+#
+# write_usage
+#
+# Purpose: Give the user an idea about how to use the script
+#
+write_usage()
+{
+  cat << EOF
+$0 is used to update listener.ora and tnsnames.ora on RAC databases on
+Exadata. With this script it's possible to ensure necessary entries in the
+two files are in place for creating f.x. Data Guard setup. Will also reload 
+listeners after changes to static entries.
+
+The script can maintain 4 kind of entries: local,static,remote,duplicate.
+See below for futher explanation of the various entries.
+
+Usage:
+  $0 addorupdate|remove tnsconf
+Required parameters:
+  --entries <Comma separated list of entries to handle or the word all>
+            local:       Will handle a local tnsnames entry pointing to the
+                         Database unique name on the cluster where the command
+                         is being run
+            static:      Will handle a local listner entry that is does static 
+                         registration of the instance running on the local
+                         node
+            remote:      Will handle a remote tnsnames entry pointing to the 
+                         Remote database unique name on the remote cluster 
+                         specified by the -remoteScanListener
+            duplicate:   Will handle a local tnsnames entry pointing to an 
+                         instance on a remote node specified by -remoteNodeVip
+            all:         Will do all of the above (local, static,remote and
+                         duplicate
+  --databaseUniqueName <Comma separated list of Unique Database name(s) of the
+                       local databases> | --allDatabasesInCluster
+            This parameter is required when specifying either all, static or
+            local. If multiple comma separated names are given then all
+            databases specified will be processed. Only works for action
+            addorupdate. This also requires --entries to be specified
+            to one or both local and static. Also local will also work only
+            when used with a shared tnsnames.ora. --staticType must be dataguard
+            if --entries includes static.
+  --remoteDatabaseUniqueName <The unique name of the remote database>. 
+            This parameter is required when specifying either all, remote or
+            duplicate to the --entries parameter 
+  --remoteScanListener <The scan listener DNS name of the remote cluster> 
+            This parameter is required when specifying either all or remote 
+            to the -entries parameter 
+  --remoteNodeVip <The VIP on the remote cluster node where RMAN connects>
+            This parameter is required when specifying either all or duplicate 
+            to the -entries parameter 
+
+The scripts also takes some optional parameters. They should normally NOT be
+used.
+
+Optional parameters:
+  --clusterNodes <Comma separated list of nodes in the cluster>
+            Default is to do the changes on all nodes. In specific cases one
+            can specify the node or the nodes in the cluster that the operation
+            should be done on 
+  --staticType <One of the following types>
+            Does specify what kind of static registration will be created in the
+            listener.ora when "-entries static (or all)" is specified
+            dataguard    The default. Will create static registrations in
+                         listener.ora on all specified nodes and requires that
+                         the database is registered in the cluster. The entry
+                         will be named <database unique name>_DGMGRL
+            duplicate    Will create a static registration in listener.ora on
+                         the local node only and does not require that the
+                         database is registered in the cluster. The entry will
+                         be named <database unique name>_DUPL. Requires the two
+                         parameters -databaseSID and -databaseOracleHome to be
+                         specified if the database is not registred in the 
+                         cluster.
+  --databaseSID <The database SID of the local instances of the Database>
+            This parameter is required when specifying either all, static or
+            local and the database does not exist in in the cluster. If
+            parameter is specified then the static entry is only created on the
+            node where the script is run. 
+  --databaseOracleHome <The database Oracle Home of the local Database>
+            This parameter is required when specifying either all, static or
+            local and the database does not exist in in the cluster. If
+            parameter is specified then the static entry is only created on the
+            node where the script is run.
+  --dryRun  Do all the processing except don't update the tnsnames.ora and
+            listener.ora files. Instead write the files that would have been
+            updated to /tmp with added hostname and timestamp.
+  --dontReloadListener
+            Used to avoid reload the listener.ora when the static configuration are
+            changed. Typically used when patching a lot of databases. Remember
+            at the end of patching then to maually reload the listeners (with 75s
+            between)
+  -h|--help 
+            Will show this help
+
+EOF
+}
+
+
+#
+# string_contain
+#
+# Purpose: Will check if string argument 1 is in argument2
+# Arguments: The section part to print
+# Return: 0 if ok 1 otherwise
+#
+string_contain()
+{
+  [ -z "${2##*$1*}" ] && [ -z "$1" -o -n "$2" ]
+}
+
+#
+# Purpose: Test if user is the one specified as parameter
+#
+check_for_permission()
+{
+  local input_user
+  input_user=$1
+  if [ `id -un` != "$input_user" ]
+  then
+    echo " ERROR: No access rights. Need to be run as user $1"
+    exit 1
+  fi
+}
+
+
+#
+# create_lock_dir
+#
+# Purpose: Try to create the lock dir. If it fails give an error and exit
+#
+create_lock_dir()
+{
+  # If we can't create then maybe someone else is using script (should be on a shared file system)
+  if ! mkdir $LOCK_DIR
+  then
+     echo " ERROR: Could not get lock on $LOCK_DIR. Somebody else might be running the script. If"
+     echo "        you are sure nobody else runs the script then remove the above directory and rerun"
+     exit 1
+  fi
+}
+
+#
+# remove_lock_dir
+#
+# Purpose: Remove the lock dir. Should be called from trap, so we arealways sure the script finishes with this
+#
+remove_lock_dir()
+{
+  rmdir $LOCK_DIR
+}
+
+#
+# convert_to_lower
+#
+# Purpose: Used to convert a string to lower case
+#
+# Parameters:
+#          Input string to convert
+# Output:
+#          Input string converted to lower case
+convert_to_lower()
+{
+  #echo $1 | tr [:upper:] [:lower:]
+  echo $1 | tr '[A-Z]' '[a-z]'
+}
+
+#
+# convert_to_upper
+#
+# Purpose: Used to convert a string to upper case
+#
+# Parameters:
+#          Input string to convert
+# Output:
+#          Input string converted to upper case
+convert_to_upper()
+{
+  #echo $1 | tr [:lower:] [:upper:]
+  echo $1 | tr '[a-z]' '[A-Z]'
+}
+
+# Find Grid Home - complicated as we can't assume in the future /etc/oratab will have an ASM entry
+find_grid_home()
+{
+  # Where is the file that tells us where the oracle inventory is 
+  local ORAINST_LOC="/etc/oraInst.loc"
+  # If the file is there we can try to find the ASM home
+  if [ -f $ORAINST_LOC ]
+  then
+    # Look up the oracle inventory location
+    local ORAINVENTORY_LOCATION=`cat $ORAINST_LOC 2>>/dev/null | sed -n -e 's/inventory_loc=\(.*\)/\1/p' 2>>/dev/null`
+    if [ "$ORAINVENTORY_LOCATION" != "" ]
+    then
+      # If we wound the oracle inventory location look for grid home by looking for OraGI name 
+      GRID_HOME=`grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null | sed -n -e '/<HOME NAME=.*CRS="true"/s/.*LOC=\"\([^\"]*\)\".*CRS="true".*/\1/p' 2>>/dev/null`
+    fi
+  fi
+  if [ "$GRID_HOME" != "" ]
+  then
+    echo "$GRID_HOME"
+  fi
+}
+
+#
+# build_environment_names
+#
+# Purpose: Build some environment names based on parameters
+#          given to script plus other variables needed
+#
+build_environment_names()
+{
+  #set -x
+  # The hostname without domain
+  SHORT_HOST_NAME=${HOSTNAME%%.*}
+  # Domainame
+  DOMAIN_NAME=${HOSTNAME#*.}
+  # Build a couple of variable holding all the nodes or the
+  # the ones that have been specified as parameter
+  # Was CLUSTER_NODES explicitely not asked for?
+  # Find the GRID ORACLE_HOME 
+  GRID_ORACLE_HOME=$(find_grid_home)
+  # Set CLUSTER_NODES if not set also build RAC_NODES as comma separated string
+  if [ "$CLUSTER_NODES" = "" ]
+  then
+    # Get the cluster name
+    GRID_CLUSTER_NAME=`$GRID_ORACLE_HOME/bin/cemutlo -n`
+    # Get ASM Instance on this box
+    GRID_ASM_INSTANCE=`ps -ef | grep pmon_+ASM | grep asm_ | sed "s/.*\(+ASM.*\)/\1/"`
+    # Get a list of all nodes in cluster
+    RAC_NODES=`$GRID_ORACLE_HOME/bin/olsnodes`
+    RAC_NODES=`echo $RAC_NODES`
+    for RAC_NODE in $RAC_NODES
+    do
+      if [ "$CLUSTER_NODES" = "" ]
+      then
+        CLUSTER_NODES="$RAC_NODE"
+      else
+        CLUSTER_NODES="$CLUSTER_NODES,$RAC_NODE"
+      fi
+    done
+  else
+    for RAC_NODE in ${CLUSTER_NODES//,/ }
+    do
+      if [ "$RAC_NODES" = "" ]
+      then
+        RAC_NODES="$RAC_NODE"
+      else
+        RAC_NODES="$RAC_NODES $RAC_NODE"
+      fi
+    done
+  fi
+  # Do we run in a shared tns_admin environment
+  #set -x
+  if [ -f ${CLUSTERED_TNS_ADMIN}/tnsnames.ora ]
+  then
+    export TNS_ADMIN=${CLUSTERED_TNS_ADMIN}
+    USING_SHARED_TNS_ADMIN="Y"
+  fi  
+  #set +x
+}
+
+#
+# tnsnames_check_arguments
+#
+# Purpose: checks if all arguments given on command line is valid
+#
+tnsconf_check_arguments()
+{
+  if [ -z "${ACTION}" ]
+  then
+    echo " ERROR: --action has to be given or ACTION env variable should be set"
+    exit 1
+  else
+    case $ACTION in
+      addorupdate) : ;;
+      remove) : ;;
+      *)            echo " ERROR: --action parameter $ACTION given to script not recognized";exit 1;;
+    esac;      
+  fi
+  if [ -z "${ENTRIES}" ]
+  then
+    echo " ERROR: --entries has to be given or ENTRIES env variable should be set"
+    exit 1
+  else  
+    # If ALL then set them implicit
+    case $ENTRIES in 
+      [Aa][Ll][Ll])
+        ENTRIES="remote,local,static,duplicate"
+        ;;
+    esac
+    for ENTRY in ${ENTRIES//,/ }
+    do
+      #echo "ENTRY:$ENTRY"
+      case $ENTRY in
+        [Rr][Ee][Mm][Oo][Tt][Ee])
+         REMOTE_SPECIFIED="Y"
+          ;;
+        [Ll][Oo][Cc][Aa][Ll])
+         LOCAL_SPECIFIED="Y"
+          ;;
+        [Ss][Tt][Aa][Tt][Ii][Cc])
+         STATIC_SPECIFIED="Y"
+          ;;
+        [Dd][Uu][Pp][Ll][Ii][Cc][Aa][Tt][Ee])
+         DUPLICATE_SPECIFIED="Y"
+          ;;
+        *)    echo " ERROR: --entries parameter $ENTRY not known. Should be one or more of remote,local,static,duplicate or it should be all";exit 1;;
+      esac  
+    done
+  fi
+  
+  # Let's check the ALL_DATABASES_IN_CLUSTER, if "Y" then DATABASE_UNIQUE_NAME should not be specified
+  if [ "$ALL_DATABASES_IN_CLUSTER" = "Y" -a "$DATABASE_UNIQUE_NAME" != "" ]
+  then
+    echo "  ERROR: --databaseUniqueName and --allDatabasesInCluster can not both be specified";
+    exit 1
+  fi  
+  # If allDatabasesInCluster has been specified then find all databases
+  if [ "$ALL_DATABASES_IN_CLUSTER" = "Y" ]
+  then
+    # Find all databases in cluster and puth together seprated by comma
+    while read SINGLE_DATABASE_UNIQUE_NAME; do
+      if [ "$DATABASE_UNIQUE_NAME" = "" ]
+      then
+        DATABASE_UNIQUE_NAME="${SINGLE_DATABASE_UNIQUE_NAME}"
+      else
+        DATABASE_UNIQUE_NAME="${DATABASE_UNIQUE_NAME},${SINGLE_DATABASE_UNIQUE_NAME}"
+      fi
+    done < <(export ORACLE_HOME=$GRID_ORACLE_HOME;$GRID_ORACLE_HOME/bin/srvctl config database )    
+  fi  
+  # if we are not using a sharded TNS_ADMIN then we need to know the ORACLE_HOME of the "local" database if we update the local tnsnames.ora in the oracle_home
+  # If we we work on local then we always need know th local db name 
+  if [ \( "$DATABASE_UNIQUE_NAME" = "" -a \( "$DATABASE_ORACLE_SID" = "" -o "$DATABASE_ORACLE_HOME" = "" \) \) -a \( "$LOCAL_SPECIFIED" = "Y"  -o "$STATIC_SPECIFIED" = "Y"  -o \( \( "$REMOTE_SPECIFIED" = "Y" -o "$DUPLICATE_SPECIFIED" = "Y" \) -a "$USING_SHARED_TNS_ADMIN" != "Y" \) \) ]
+  then
+    echo "  ERROR: Database Unique Name or database sid and database oracle home have to be specified";
+    exit 1
+  fi
+  if [ -z "${REMOTE_DATABASE_UNIQUE_NAME}" -a \( ! -z "${REMOTE_SPECIFIED}" -o ! -z "${DUPLICATE_SPECIFIED}" \) ]  # Is this variable defined?
+  then
+    echo " ERROR: --remoteDatabaseUniqueName has to be given or REMOTE_DATABASE_UNIQUE_NAME env variable should be set"
+    exit 1
+  fi
+  if [ -z "${CLUSTER_NODES}" ]
+  then
+    echo " ERROR: --clusterNodes has to be given or CLUSTER_NODES env variable should be set"
+    exit 1
+  fi
+  if [ -z "${REMOTE_SCAN_LISTENER}" -a ! -z "${REMOTE_SPECIFIED}" -a "$ACTION" = "addorupdate" ]
+  then
+    echo " ERROR: --remoteScanListener has to be given or REMOTE_SCAN_LISTENER env variable should be set"
+    exit 1
+  fi
+  if [ -z "${REMOTE_NODE_VIP}"  -a ! -z "${DUPLICATE_SPECIFIED}" -a "$ACTION" = "addorupdate" ]
+  then
+    echo " ERROR: --remoteNodeVip has to be given or REMOTE_NODE_VIP env variable should be set"
+    exit 1
+  fi
+  case $STATIC_TYPE in
+     [Dd][Aa][Tt][Aa][Gg][Uu][Aa][Rr][Dd])
+      STATIC_TYPE="dataguard"
+       ;;
+     [Dd][Uu][Pp][Ll][Ii][Cc][Aa][Tt][Ee])
+      STATIC_TYPE="duplicate"
+       ;;
+     *)    echo " ERROR: --staticType parameter $STATIC_TYPE not known. Should be one or of dataguard or duplicate";exit 1;;
+  esac 
+  # Check if database unique name is multiple (comma separated)
+  NUMBER_OF_DATABASES=0
+  for ENTRY in ${DATABASE_UNIQUE_NAME//,/ }
+  do
+    (( NUMBER_OF_DATABASES++ ))
+    # do check that the datbase exist if we add it multiple times
+    if [ "${STATIC_TYPE}" == "dataguard" -a "${ACTION}" == "addorupdate" ]
+    then
+      local ORACLE_HOME="`get_oracle_home_for_database $ENTRY`"
+      (export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl config database -d ${ENTRY}) >/dev/null
+      if [ $? -ne 0 ]
+      then
+        echo "  ERROR: Local database \"$ENTRY\" not found";
+        exit 1
+      fi
+    fi
+  done  
+  if [ $NUMBER_OF_DATABASES -gt 1 ]
+  then
+    # Special operation where we will update maybe listener.ora and tnsnames.ora with multiple registrations
+    # located in cluster registry
+    # Save the datbases in another variable as we use the original one later
+    DATABASE_UNIQUE_NAMES="$DATABASE_UNIQUE_NAME"
+    # First test if action is addorupdate
+    if [  "${ACTION}" != "addorupdate" ]
+    then 
+      echo "  ERROR: action can only be \"addorupdate\" when multiple Database Unique Names are specified";
+      exit 1
+    fi
+    # Test if other than local or static is specified
+    if [  "${REMOTE_SPECIFIED}" = "Y" -o "${DUPLICATE_SPECIFIED}" = "Y" ]
+    then 
+      echo "  ERROR: When multiple Database Unique Names is specified, then --entries can only be one or more of \"local,static\"";
+      exit 1
+    fi
+    if [  "${STATIC_SPECIFIED}" = "Y" -a "${STATIC_TYPE}" != "dataguard" ]
+    then 
+      echo "  ERROR: When multiple Database Unique Names is specified, and --entries contains static then --staticType have to be \"dataguard\"";
+      exit 1
+    fi
+    
+    # If local is specified check that we use shared tnsnames.ora
+    if [ "$USING_SHARED_TNS_ADMIN" != "Y" -a "$LOCAL_SPECIFIED" = "Y" ]
+    then
+      echo "  ERROR:  When multiple Database Unique Names is specified and not using shared tnsnames.ora then -entries can not be \"local\"";
+      exit 1
+    fi
+    # Probabaly it should work now
+    FIX_ENTRIES_FOR_ALL_DATABASES="Y"
+  fi
+}
+
+#
+# get_oracle_home_for_database
+#
+# Purpose: Will find the ORACLE_HOME for the given database in the CLUSTER REGISTRY
+#
+# Parameters:
+#          Unique name of the database
+# Output:
+#          Oracle_home for database
+get_oracle_home_for_database()
+{
+  local DATABASE_UNIQUE_NAME=$1
+  if [ "$DATABASE_ORACLE_HOME" != "" ]
+  then
+    echo "$DATABASE_ORACLE_HOME"
+  else
+    echo "`export ORACLE_HOME=$GRID_ORACLE_HOME;$GRID_ORACLE_HOME/bin/srvctl config database -verbose | grep -i "^${DATABASE_UNIQUE_NAME}[[:space:]]"| cut -f 2`"
+  fi  
+}
+
+#
+# get_instance_for_database_on_hostname
+#
+# Purpose: Will find the INSTANCE name for a databae on a given host
+#
+# Parameters:
+#          Unique name of the database
+#          Hostname of where to look for instance name
+# Output:
+#          Instance name of the Database on the host
+get_instance_for_database_on_hostname()
+{
+  # Rewritten to work with non RAC
+  #set -x
+  local DATABASE_UNIQUE_NAME=$1
+  local INSTANCE_HOSTNAME=$2
+  if [ "$DATABASE_UNIQUE_NAME" = "" ]
+  then
+    echo "  ERROR: Database Unique name can not be empty - should have been checked initially in script!!!";
+    exit 1
+  fi
+  local ORACLE_HOME="`get_oracle_home_for_database $DATABASE_UNIQUE_NAME`"
+  local INSTANCES_ON_NODES="$(export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status database -d $DATABASE_UNIQUE_NAME)"
+  local INSTANCE_ON_NODE=$(echo "${INSTANCES_ON_NODES}" | sed -n -e "s/Instance[[:blank:]]\([^ ]*\)[[:blank:]]*is running on node[[:blank:]]*${INSTANCE_HOSTNAME}/\1/p")
+  # Return instance name or empty if none found
+  echo "${INSTANCE_ON_NODE}"
+}
+#get_instance_for_database_on_hostname()
+#{
+#  #set -x
+#  local DATABASE_UNIQUE_NAME=$1
+#  local INSTANCE_HOSTNAME=$2
+#  if [ "$DATABASE_UNIQUE_NAME" = "" ]
+#  then
+#    echo "  ERROR: Database Unique name can not be empty - should have been checked initially in script!!!";
+#    exit 1
+#  fi
+#  local ORACLE_HOME="`get_oracle_home_for_database $DATABASE_UNIQUE_NAME`"
+#  local INSTANCE_ON_NODE="`export ORACLE_HOME=$ORACLE_HOME;$ORACLE_HOME/bin/srvctl status instance -d $DATABASE_UNIQUE_NAME -n $INSTANCE_HOSTNAME`"
+#  # If we found an instance return it, otherwise if we 
+#  # have specified SID directly then return it burt only for local node
+#  #set +x
+#  if [ $? -eq 0 ]
+#  then
+#    echo "`echo "${INSTANCE_ON_NODE}" | cut -d \" \" -f 2`"
+#  else
+#        echo ""
+#  fi  
+#}
+
+
+#
+# load_tns_files
+#
+# Purpose: Will fetch relevant tns files from relevant hosts
+#
+load_tns_files()
+{
+  echo "   INFO:        CLUSTER_NODES=$CLUSTER_NODES"
+  first_node="Y"
+  # if we are not using shard TNS_ADMIn then we need to know the ORACLE_HOME if we update the local tnsnames.ora
+  # If we we work on local then we need to find a couple of values
+  # If fixinfg all entries then we can ignore the ORACLE_HOME as it does not make any sense
+  # Only if we are adding or updating is this relevant
+  if [ "$ACTION" = "addorupdate" ]
+  then
+    if [ \( "$FIX_ENTRIES_FOR_ALL_DATABASES" != "Y" -a \( "$STATIC_SPECIFIED" = "Y" -o "$LOCAL_SPECIFIED" = "Y" \) \) -o \( \( "$REMOTE_SPECIFIED" = "Y" -o "$DUPLICATE_SPECIFIED" = "Y" \) -a "$USING_SHARED_TNS_ADMIN" != "Y" \)  ]
+    then
+      ORACLE_HOME="`get_oracle_home_for_database $DATABASE_UNIQUE_NAME`"
+      #echo "ORACLE_HOME=$ORACLE_HOME"
+      if [ "$ORACLE_HOME" = "" ]
+      then
+        echo "  ERROR: ORACLE_HOME not found for database $DATABASE_UNIQUE_NAME"
+        exit 1   
+      fi
+      echo "   INFO:          ORACLE_HOME=$ORACLE_HOME"
+      SCAN_VIP="`export ORACLE_HOME=$GRID_ORACLE_HOME;${GRID_ORACLE_HOME}/bin/srvctl config scan -netnum 1 | sed -n \"s/SCAN[[:blank:]]*name:[[:blank:]]*\([^,]*\),.*/\1/p\"`"
+      echo "   INFO:       LOCAL_SCAN_VIP=$SCAN_VIP"
+    fi
+  fi
+  node_counter=0
+  # On all nodes we want to do changes on
+  for RAC_NODE in $RAC_NODES; do  
+    RAC_NODE_NAME[$node_counter]=$RAC_NODE
+    if [ "$STATIC_SPECIFIED" = "Y" ]
+    then
+      echo "   INFO: Fetching ${GRID_ORACLE_HOME}/network/admin/listener.ora from $RAC_NODE"
+      LISTENER_ORA_TEXT[$node_counter]="`get_file_from_host $RAC_NODE ${GRID_ORACLE_HOME}/network/admin/listener.ora`${NEW_LINE}"
+      NEW_LISTENER_ORA_TEXT[$node_counter]="${LISTENER_ORA_TEXT[$node_counter]}"
+      # Used for debugging problems
+      echo "${LISTENER_ORA_TEXT[$node_counter]}" >/tmp/listener.ora_org_${RAC_NODE_NAME[$node_counter]}
+    fi
+    # First test if we use a clustered TNS_ADMIN, then use that location otherwise use the one in Oracle Home
+    if [ "$USING_SHARED_TNS_ADMIN" == "Y" ]
+    then
+      USED_TNS_ADMIN="$CLUSTERED_TNS_ADMIN"
+    else
+      USED_TNS_ADMIN="${ORACLE_HOME}/network/admin"
+      # Don't use include when running on old systems
+      TNS_NAME_INCLUDE_FILE_NAME=""
+    fi      
+    if [ "$LOCAL_SPECIFIED" = "Y" -o "$REMOTE_SPECIFIED" = "Y" -o "$DUPLICATE_SPECIFIED" = "Y" ]
+    then    
+      # Only do it on first node if running using clustered TNS_ADMIN
+      if [ \( "$first_node" = "Y" -a "$USING_SHARED_TNS_ADMIN" = "Y" \) -o "$USING_SHARED_TNS_ADMIN" != "Y" ]
+      then
+        echo "   INFO: Fetching ${USED_TNS_ADMIN}/tnsnames.ora from $RAC_NODE"
+        TNSNAMES_ORA_TEXT[$node_counter]="`get_file_from_host $RAC_NODE ${USED_TNS_ADMIN}/tnsnames.ora`${NEW_LINE}"
+        TNSNAMES_ORA_TEXT[$node_counter]=$( echo "${TNSNAMES_ORA_TEXT[$node_counter]}" | sed -e '/[[:space:]]*IFILE.*/d')
+        TNSNAMES_ORA_TEXT[$node_counter]="${TNSNAMES_ORA_TEXT[$node_counter]}
+"
+        NEW_TNSNAMES_ORA_TEXT[$node_counter]="${TNSNAMES_ORA_TEXT[$node_counter]}"
+        #echo -n "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}" >/tmp/good.txt
+        #NEW_TNSNAMES_ORA_TEXT[$node_counter]=$( echo -n "${TNSNAMES_ORA_TEXT[$node_counter]}" | sed -e '/[[:space:]]*IFILE.*/d')
+        #echo -n "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}" >/tmp/bad.txt
+        # Used for debugging problems
+        echo "${TNSNAMES_ORA_TEXT[$node_counter]}" >/tmp/tnsnames.ora_org_${RAC_NODE_NAME[$node_counter]}
+      fi
+    fi
+    first_node="N"
+    (( node_counter++ ))
+  done
+}
+
+
+#
+# execute_multiple_steps
+#
+# Purpose: Will execute the nessecary steps to implement the changes on all databases registred in the cluster
+#          Will only work when we use shared tns admin
+#
+execute_multiple_steps()
+{
+  # Get a list of all the datbase unique names
+  while read DATABASE_UNIQUE_NAME ORACLE_HOME; do
+    # is it one of the ones we want to do something to
+    for ENTRY in ${DATABASE_UNIQUE_NAMES//,/ }
+    do
+      if [ "$ENTRY" = "$DATABASE_UNIQUE_NAME" ]
+      then
+        # For each of then set correct environment variables and call execute_steps for each database
+        execute_steps
+      fi
+    done  
+  done < <(export ORACLE_HOME=$GRID_ORACLE_HOME;$GRID_ORACLE_HOME/bin/srvctl config database -verbose | cut -f 1,2 )
+}
+
+
+#
+# execute_steps
+#
+# Purpose: Will execute the nessecary steps to implement the changes
+#
+execute_steps()
+{
+  node_counter=0
+  # On all nodes we want to do changes on, right now we assume it's addorupdate
+  # later we need to do different things depending on action (e.g. remove)
+  first_node="Y"
+  for RAC_NODE in $RAC_NODES; do  
+    # Build instance array
+    #set -x    
+    if [ "$STATIC_SPECIFIED" = "Y" ]
+    then
+      if [ "$DATABASE_ORACLE_SID" != "" ] 
+      then
+        if [ "$RAC_NODE" = "$SHORT_HOST_NAME" ]
+        then
+          RAC_INSTANCE_NAME[$node_counter]="$DATABASE_ORACLE_SID"
+        fi
+      else
+        if [ "$ACTION" = "addorupdate" ]
+        then
+          RAC_INSTANCE_NAME[$node_counter]="`get_instance_for_database_on_hostname "$DATABASE_UNIQUE_NAME" "$RAC_NODE"`"
+        fi
+      fi
+    fi
+    #set +x
+    # Loop around what we will do
+    echo -n "   INFO: Handling entries on node $RAC_NODE for $DATABASE_UNIQUE_NAME: "
+    for ENTRY in ${ENTRIES//,/ }
+    do
+      case $ENTRY in
+        [Rr][Ee][Mm][Oo][Tt][Ee])
+          # Only do it on first node if running using clustered TNS_ADMIN
+          if [ \( "$first_node" = "Y" -a "$USING_SHARED_TNS_ADMIN" = "Y" \) -o "$USING_SHARED_TNS_ADMIN" != "Y" ]
+          then          
+            # Make sure we have the remote entry in the tnsnames.ora file 
+            NEW_REMOTE_TNSNAMES_ENTRY[$node_counter]="`convert_to_upper ${REMOTE_DATABASE_UNIQUE_NAME}` =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = ${REMOTE_SCAN_LISTENER})(PORT = ${LISTENER_PORT}))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = `convert_to_lower ${REMOTE_DATABASE_UNIQUE_NAME}`)
+    )
+  )
+
+"
+            echo -n "remote "
+            # Find the entry if it's there and "remove and replace" it if it's there  
+            split_tns_data "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}" "${REMOTE_DATABASE_UNIQUE_NAME}"
+            case "$ACTION" in
+              addorupdate)
+                NEW_TNSNAMES_ORA_TEXT[$node_counter]="${before_filter_buffer}${NEW_REMOTE_TNSNAMES_ENTRY[$node_counter]}${after_filter_buffer}"
+                ;;
+              remove)
+                NEW_TNSNAMES_ORA_TEXT[$node_counter]="${before_filter_buffer}${after_filter_buffer}"
+                ;;
+              esac
+            # Used for debugging
+            echo -n "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}" >/tmp/tnsnames.ora_new_${RAC_NODE_NAME[$node_counter]}_after_remote
+          fi
+          ;;
+        [Ll][Oo][Cc][Aa][Ll])
+          # Only do it on first node if running using clustered TNS_ADMIN
+          if [ \( "$first_node" = "Y" -a "$USING_SHARED_TNS_ADMIN" = "Y" \) -o "$USING_SHARED_TNS_ADMIN" != "Y" ]
+          then          
+            # Make sure we have the local entry in the tnsnames.ora file 
+            NEW_TNSNAMES_ENTRY[$node_counter]="`convert_to_upper ${DATABASE_UNIQUE_NAME}` =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = ${SCAN_VIP})(PORT = ${LISTENER_PORT}))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = `convert_to_lower ${DATABASE_UNIQUE_NAME}`)
+    )
+  )
+
+"
+            echo -n "local "
+            # Find the entry if it's there and "remove and replace" it if it's there  
+            split_tns_data "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}" "${DATABASE_UNIQUE_NAME}"
+            case "$ACTION" in
+              addorupdate)
+                NEW_TNSNAMES_ORA_TEXT[$node_counter]="${before_filter_buffer}${NEW_TNSNAMES_ENTRY[$node_counter]}${after_filter_buffer}"
+                ;;
+              remove)            
+                NEW_TNSNAMES_ORA_TEXT[$node_counter]="${before_filter_buffer}${after_filter_buffer}"
+                ;;
+              esac
+            # Used for debugging
+            echo -n "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}" >/tmp/tnsnames.ora_new_${RAC_NODE_NAME[$node_counter]}_after_local
+          fi
+          ;;
+        [Ss][Tt][Aa][Tt][Ii][Cc])
+          echo -n "static "
+            # Is this a dataguard or duplicate entry
+            case "$STATIC_TYPE" in
+              dataguard)
+                CALCULATED_GLOBAL_DBNAME="`convert_to_lower ${DATABASE_UNIQUE_NAME}_DGMGRL`";;
+              duplicate)
+                CALCULATED_GLOBAL_DBNAME="`convert_to_lower ${DATABASE_UNIQUE_NAME}_DUPL`";;
+            esac;
+          if [ "${RAC_INSTANCE_NAME[$node_counter]}" = "" ]
+          then
+            # No Instance on node, keeep listener.ora the same
+            #NEW_LISTENER_ORA_TEXT[$node_counter]="${NEW_LISTENER_ORA_TEXT[$node_counter]}"
+            NEW_SID_DESC_ENTRY[$node_counter]=""
+          else
+            # There  is an instance on the node, find new content
+            # Make sure we have the static registration entry in the listener.ora file 
+            NEW_SID_DESC_ENTRY[$node_counter]="
+    (SID_DESC =
+      (SID_NAME = ${RAC_INSTANCE_NAME[$node_counter]})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (GLOBAL_DBNAME = ${CALCULATED_GLOBAL_DBNAME})
+      (ENVS = \"TNS_ADMIN=${USED_TNS_ADMIN}\") 
+    )"
+              
+          fi
+            # Get the  SID_LIST_LISTENER entry
+            split_tns_data "${NEW_LISTENER_ORA_TEXT[$node_counter]}" "SID_LIST_LISTENER"
+            if [ "$filter_buffer" = "" ]
+            then
+              # Ouch no SID_LIST_LISTNER_ENTRY found, just add entry
+              SID_LIST="${NEW_SID_DESC_ENTRY[$node_counter]}"
+              # add extra newline to separate just in case, it's only done once anyhow so wont grow
+              before_filter_buffer="${before_filter_buffer}"
+            else
+              # replace
+              # Extract the SID_LIST
+              SID_LIST="`echo "$filter_buffer" | sed  'H;1h;$!d;x;s/.*SID_LIST[[:space:]]*=\n\(.*\))/\1/'`"
+              case "$ACTION" in
+                addorupdate)              
+                  # Now add/update sid_list
+                  SID_LIST=`replace_sid_desc "$SID_LIST" "${CALCULATED_GLOBAL_DBNAME}" "${NEW_SID_DESC_ENTRY[$node_counter]}"`
+                  ;;
+                remove)
+                  SID_LIST=`replace_sid_desc "$SID_LIST" "${CALCULATED_GLOBAL_DBNAME}" ""`
+                  ;;
+              esac                  
+            fi
+            #echo "SID_LIST=>>${SID_LIST}<<"
+            if [ "$SID_LIST" == "" ]
+            then
+              # Empty list remove everything
+              NEW_LISTENER_ORA_TEXT[$node_counter]="${before_filter_buffer}${after_filter_buffer}"              
+            else
+              NEW_LISTENER_ORA_TEXT[$node_counter]="${before_filter_buffer}SID_LIST_LISTENER =
+  (SID_LIST =
+${SID_LIST}
+  )
+${after_filter_buffer}"
+            fi
+            # Used for debugging
+            echo -n "${NEW_LISTENER_ORA_TEXT[$node_counter]}" >/tmp/listener.ora_new_${RAC_NODE_NAME[$node_counter]}_after_static
+#          fi
+          ;;
+        [Dd][Uu][Pp][Ll][Ii][Cc][Aa][Tt][Ee])
+          # Only do it on first node if running using clustered TNS_ADMIN
+          if [ \( "$first_node" = "Y" -a "$USING_SHARED_TNS_ADMIN" = "Y" \) -o "$USING_SHARED_TNS_ADMIN" != "Y" ]
+          then          
+            # Make sure we have the entry used for duplicating in the tnsnames.ora file 
+            NEW_DUP_TNSNAMES_ENTRY[$node_counter]="`convert_to_upper ${REMOTE_DATABASE_UNIQUE_NAME}_DUP` =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = ${REMOTE_NODE_VIP})(PORT = ${LISTENER_PORT}))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = `convert_to_lower ${REMOTE_DATABASE_UNIQUE_NAME}`_DGMGRL)
+    )
+  )
+
+"
+            echo -n "duplicate "
+            # Find the entry if it's there and "remove and replace" it if it's there  
+            split_tns_data "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}" "${REMOTE_DATABASE_UNIQUE_NAME}_DUP"
+            case "$ACTION" in
+              addorupdate)
+                NEW_TNSNAMES_ORA_TEXT[$node_counter]="${before_filter_buffer}${NEW_DUP_TNSNAMES_ENTRY[$node_counter]}${after_filter_buffer}"
+                ;;
+              remove)
+                NEW_TNSNAMES_ORA_TEXT[$node_counter]="${before_filter_buffer}${after_filter_buffer}"
+                ;;
+            esac
+            # Used for debugging
+            echo -n "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}" >/tmp/tnsnames.ora_new_${RAC_NODE_NAME[$node_counter]}_after_duplicate
+          fi
+          ;;    
+      esac
+    done
+    if [ \( "$first_node" = "Y" -a "$USING_SHARED_TNS_ADMIN" = "Y" \) -o "$USING_SHARED_TNS_ADMIN" != "Y" ]
+    then        
+      if [ "$TNS_NAME_INCLUDE_FILE_NAME" != "" ]
+      then
+        # Add ifile at the end
+        NEW_TNSNAMES_ORA_TEXT[$node_counter]="${NEW_TNSNAMES_ORA_TEXT[$node_counter]}IFILE=${USED_TNS_ADMIN}/$TNS_NAME_INCLUDE_FILE_NAME
+"
+      fi
+    fi
+    echo ""
+    first_node="N"
+    (( node_counter++ ))
+  done
+}
+
+#
+# save_files
+#
+# Purpose: Will save the files after the changes
+#
+save_files()
+{
+  node_counter=0
+  first_node="Y"
+  for RAC_NODE in $RAC_NODES; do      
+    # If we have been thinking about updating this at all then check if we should replace it
+    # Only do it on first node if running using clustered TNS_ADMIN
+    if [ \( "$LOCAL_SPECIFIED" = "Y" -o "$REMOTE_SPECIFIED" = "Y" -o "$DUPLICATE_SPECIFIED" = "Y" \) -a \( \( "$first_node" = "Y" -a "$USING_SHARED_TNS_ADMIN" = "Y" \) -o "$USING_SHARED_TNS_ADMIN" != "Y" \) ]
+    then
+      write_file_on_host ${RAC_NODE} ${USED_TNS_ADMIN}/tnsnames.ora_NEW "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}"
+      ssh ${RAC_NODE} cmp -s  ${USED_TNS_ADMIN}/tnsnames.ora ${USED_TNS_ADMIN}/tnsnames.ora_NEW 
+      if [ $? -eq 1 -o $? -eq 2 ]
+      then
+        # The content has changed
+        if [ "$DRY_RUN" = "Y" ]
+        then
+          # Do the dryrun update
+          echo "   INFO: Dry Run Updating ${USED_TNS_ADMIN}/tnsnames.ora on ${RAC_NODE} (put in /tmp/tnsnames.ora_new_${RAC_NODE_NAME[$node_counter]}_dryrun on $HOSTNAME)"
+          write_file_on_host ${HOSTNAME} /tmp/tnsnames.ora_new_${RAC_NODE_NAME[$node_counter]}_dryrun "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}"
+        else
+          # Do the real update
+          echo "   INFO: Updating ${USED_TNS_ADMIN}/tnsnames.ora on ${RAC_NODE}"
+          # Backup 
+          ssh $RAC_NODE "cp -p ${USED_TNS_ADMIN}/tnsnames.ora ${USED_TNS_ADMIN}/tnsnames.ora_${NOW_STRING}"
+          write_file_on_host ${RAC_NODE} ${USED_TNS_ADMIN}/tnsnames.ora "${NEW_TNSNAMES_ORA_TEXT[$node_counter]}"
+        fi
+      else
+        echo "   INFO: No changes for ${USED_TNS_ADMIN}/tnsnames.ora on ${RAC_NODE}"
+      fi
+      # Remove new version file
+      ssh ${RAC_NODE} rm ${USED_TNS_ADMIN}/tnsnames.ora_NEW 
+    fi
+    # If we have been thinking about updating this at all then check if we should replace it
+    if [ "$STATIC_SPECIFIED" = "Y" ]
+    then
+      # first check if the listener.ora owner is the same as the user we run as now
+      LISTENER_ORA_OWNER=`stat -c "%U" "${GRID_ORACLE_HOME}/network/admin/listener.ora"`
+      if [ "$USER" == "$LISTENER_ORA_OWNER" ]
+      then
+      # We are using the same user. do as we did before execute directly the update script
+        writefile_listener ${RAC_NODE} ${GRID_ORACLE_HOME} ${GRID_ORACLE_HOME}/network/admin/listener.ora ${NOW_STRING} "$DRY_RUN" "${NEW_LISTENER_ORA_TEXT[$node_counter]}" "$DONT_RELOAD_LISTENER"
+      else
+        # if DONT_RELOAD_LISTENER is "Y" then set extraparam
+        if [ "$DONT_RELOAD_LISTENER" = "Y" ]
+        then
+          local extraparam="--dontReloadListener"
+        else
+          local extraparam=""
+        fi           
+        # we are running as another user (probably grid), execute using sudo to the special update script
+        # First create some temp file on remote server we can parse on - as we can't transfer a file en a call to bash - well I could not figure out
+        echo -n "${NEW_LISTENER_ORA_TEXT[$node_counter]}"  > /tmp/listener.ora_new_${RAC_NODE_NAME[$node_counter]}_to_grid_user
+        #echo "sudo -u $LISTENER_ORA_OWNER ${SCRIPT_NAME}  writefile listener --hostName=\"${RAC_NODE}\" --oracleHome=\"${GRID_ORACLE_HOME}\" --fileName=\"${GRID_ORACLE_HOME}/network/admin/listener.ora\" --nowString=\"${NOW_STRING}\" --dryRun=\"$DRY_RUN\" --fileContent=\"${NEW_LISTENER_ORA_TEXT[$node_counter]}\""
+        if [ "$DRY_RUN" = "Y" ]
+        then
+          sudo -u $LISTENER_ORA_OWNER ${SCRIPT_NAME} writefile listener --hostName="${RAC_NODE}" --oracleHome="${GRID_ORACLE_HOME}" --fileName="${GRID_ORACLE_HOME}/network/admin/listener.ora" --nowString="${NOW_STRING}" --dryRun --fileWithContent="/tmp/listener.ora_new_${RAC_NODE_NAME[$node_counter]}_to_grid_user $extraparam"
+        else
+          sudo -u $LISTENER_ORA_OWNER ${SCRIPT_NAME} writefile listener --hostName="${RAC_NODE}" --oracleHome="${GRID_ORACLE_HOME}" --fileName="${GRID_ORACLE_HOME}/network/admin/listener.ora" --nowString="${NOW_STRING}" --fileWithContent="/tmp/listener.ora_new_${RAC_NODE_NAME[$node_counter]}_to_grid_user $extraparam"
+        fi
+      fi
+    fi
+    first_node="N"
+    (( node_counter++ ))
+  done
+}
+
+writefile_listener()
+{
+  local LISTENER_HOSTNAME	
+  local LISTENER_ORACLE_HOME	
+  local LISTENER_FILE_NAME
+  local LISTENER_NOW_STRING
+  local LISTENER_DRY_RUN
+  local LISTENER_FILE_CONTENT
+  local LISTENER_ORA_OWNER
+  local DONT_RELOAD_LISTENER
+  LISTENER_HOSTNAME=$1	
+  LISTENER_ORACLE_HOME=$2	
+  LISTENER_FILE_NAME=$3
+  LISTENER_NOW_STRING=$4
+  LISTENER_DRY_RUN="$5"
+  LISTENER_FILE_CONTENT="$6"
+  DONT_RELOAD_LISTENER="$7"
+  LISTENER_ORA_OWNER=`stat -c "%U" "${LISTENER_FILE_NAME}"`
+  if [ "$USER" != "$LISTENER_ORA_OWNER" ]
+  then
+    echo " ERROR: Only ${LISTENER_ORA_OWNER} user is allowed to run this"
+    exit 1
+  fi  
+  write_file_on_host ${LISTENER_HOSTNAME} ${LISTENER_FILE_NAME}_NEW "${LISTENER_FILE_CONTENT}"
+  ssh  ${LISTENER_HOSTNAME} cmp -s ${LISTENER_FILE_NAME} ${LISTENER_FILE_NAME}_NEW 
+  if [ $? -eq 1 ]
+  then
+    # The content has changed
+    if [ "$LISTENER_DRY_RUN" = "Y" ]
+    then
+      # Do the dryrun update
+      echo "   INFO: Dry Run Updating ${LISTENER_FILE_NAME} on ${RAC_NODE} (put in /tmp/listener.ora_${LISTENER_HOSTNAME}_${LISTENER_NOW_STRING}_dryrun on $HOSTNAME)"
+      write_file_on_host ${HOSTNAME} /tmp/listener.ora_${LISTENER_HOSTNAME}_${LISTENER_NOW_STRING}_dryrun "${LISTENER_FILE_CONTENT}"
+    else
+  	  # Do the real update
+      echo "   INFO: Updating ${LISTENER_FILE_NAME} on ${LISTENER_HOSTNAME}"
+      # Backup 
+      ssh $LISTENER_HOSTNAME "cp -p ${LISTENER_FILE_NAME} ${LISTENER_FILE_NAME}_${LISTENER_NOW_STRING}"
+      write_file_on_host ${LISTENER_HOSTNAME} ${LISTENER_FILE_NAME} "${LISTENER_FILE_CONTENT}"
+      # Reload listener
+      if [ "$DONT_RELOAD_LISTENER" != "Y" ]
+      then
+        echo "   INFO: reload listener on $LISTENER_HOSTNAME"
+        ssh $LISTENER_HOSTNAME "export ORACLE_HOME=$LISTENER_ORACLE_HOME;$LISTENER_ORACLE_HOME/bin/lsnrctl reload >/dev/null"
+        # Wait for 75 seconds to allow for dynamic services to be registred again
+        echo "   INFO: Will wait for 75 seconds before reloading next listener"
+        sleep 75
+      else
+        echo "   INFO: skip reload listener on $LISTENER_HOSTNAME as --dontReloadListener is specified"
+      fi
+      # Should check for errors here TBD - like many other places!
+    fi
+  else
+    echo "   INFO: No changes for ${LISTENER_FILE_NAME} on ${LISTENER_HOSTNAME}"
+  fi
+  # Remove new version file 
+  ssh ${LISTENER_HOSTNAME} rm ${LISTENER_FILE_NAME}_NEW 
+}  
+
+
+#
+# get_file_from_host
+#
+# Purpose: Will get a file from a remote host in the cluster
+#
+# Parameters:
+#          Hostname of where to get file
+#          File name to get with full path
+# Output:
+#          Content of the file
+get_file_from_host()
+{
+  local HOSTNAME=$1  
+  local FILE_NAME=$2
+  ssh $HOSTNAME cat $FILE_NAME
+}
+
+#
+# write_file_on_host
+#
+# Purpose: Will write a file to a remote host in the cluster
+#
+# Parameters:
+#          Hostname of where to write file
+#          File name to write with full path
+#          Content of the file
+write_file_on_host()
+{
+  local HOSTNAME=$1  
+  local FILE_NAME=$2
+  local FILE_CONTENT="$3"
+  # Save new content
+  # Seems like we need the extra newline or the "agent" will delete the last )  
+  echo "$FILE_CONTENT" | ssh $HOSTNAME "awk 1 > ${FILE_NAME}"
+}
+
+#
+# Parse arguments
+#
+# Purpose: Parses all the arguments received on command line
+#
+parse_arguments()
+{
+  if [ $# -eq 0 ]
+  then
+    write_usage
+    exit
+  fi
+  # First check action is one we know off
+  VALID_ACTION_LIST="addorupdate remove writefile -h --help "
+  if string_contain "$1 " "$VALID_ACTION_LIST"
+  then
+    ACTION=$1
+  else
+    echo " ERROR: Action parameter \"$1\" given to script not recognized"
+    exit 1
+  fi
+  if [ "$ACTION" = "-h" -o "$ACTION" = "--help" ]
+  then
+    write_usage
+    exit
+  fi
+  shift
+  if [ $# -eq 0 ]
+  then
+    echo " ERROR: Action parameter \"$ACTION\" given to script needs to be followed by an object"
+    exit 1
+  fi
+  # Depending on action various objects might be specified
+  case $1 in
+    tnsconf) OBJECT="tnsconf";VALID_ACTION_LIST="addorupdate remove ";;
+    listener) OBJECT="listener";VALID_ACTION_LIST="writefile ";;
+    *)            echo " ERROR: Object parameter $1 given to script not recognized";exit 1;;
+  esac;
+  shift  
+  # first check if we support combination
+  if ! string_contain  "$ACTION " "$VALID_ACTION_LIST" 
+  then
+    echo " ERROR: The action \"$ACTION\" is not not supported for object \"$OBJECT\". Actions allowed is \"$VALID_ACTION_LIST\""
+    exit 1
+  fi  
+  case $OBJECT in
+    tnsconf)
+      check_for_permission oracle
+      case $ACTION in
+        addorupdate|remove)
+          while [ $# -gt 0 ]
+          do
+            ALL_PARAMETERS="$ALL_PARAMETERS $1"
+            case $1 in
+              -h) write_usage; exit;;
+              -help|--help) write_usage; exit;;
+              -databaseUniqueName|--databaseUniqueName) shift; DATABASE_UNIQUE_NAME=$1;;
+              -remoteDatabaseUniqueName|--remoteDatabaseUniqueName) shift; REMOTE_DATABASE_UNIQUE_NAME=$1;;
+              -clusterNodes|--clusterNodes) shift; CLUSTER_NODES=$1;;
+              -remoteScanListener|--remoteScanListener) shift; REMOTE_SCAN_LISTENER=$1;;
+              -remoteNodeVip|--remoteNodeVip) shift; REMOTE_NODE_VIP=$1;;
+              -entries|--entries) shift; ENTRIES=$1;;
+              #-action) shift; ACTION=$1;;
+              -staticType|--staticType) shift; STATIC_TYPE=$1;;
+              -databaseOracleHome|--databaseOracleHome) shift; DATABASE_ORACLE_HOME=$1;;
+              -databaseSID|--databaseSID) shift; DATABASE_ORACLE_SID=$1;;
+              -dryRun|--dryRun) DRY_RUN="Y";;
+              -dontReloadListener|--dontReloadListener) DONT_RELOAD_LISTENER="Y";;
+              -allDatabasesInCluster|--allDatabasesInCluster) ALL_DATABASES_IN_CLUSTER="Y";;
+              *)            echo "  ERROR: Parameter $1 given to script not recognized";exit 1;;
+            esac;
+            shift
+          done
+          build_environment_names
+          tnsconf_check_arguments
+          ;;
+      esac
+      ;;
+    listener)
+      case $ACTION in
+        writefile)
+          TEMP=`getopt -o "" --name "$0" --long hostName:,oracleHome:,fileName:,nowString:,dryRun,fileWithContent:,dontReloadListener  -- "$@"`
+          eval set -- "$TEMP"          
+          while true ; do
+            case "$1" in
+              --hostName) INPUT_HOST_NAME="$2";shift 2;;
+              --oracleHome) INPUT_ORACLE_HOME="$2";shift 2;;
+              --fileName) INPUT_FILE_NAME="$2";shift 2 ;;
+              --nowString) INPUT_NOW_STRING="$2"; shift 2 ;;
+              --dryRun) INPUT_DRY_RUN="Y";shift;;
+              --fileWithContent) INPUT_FILE_WITH_CONTENT="$2"; shift 2;;
+              --dontReloadListener) DONT_RELOAD_LISTENER="Y"; shift ;;
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$INPUT_HOST_NAME" == "" ]
+          then
+            echo " ERROR: --hostName need to be specified"
+            exit 1
+          fi          
+          if [ "$INPUT_ORACLE_HOME" == "" ]
+          then
+            echo " ERROR: --oracleHome need to be specified"
+            exit 1
+          fi          
+          if [ "$INPUT_FILE_NAME" == "" ]
+          then
+            echo " ERROR: --fileName need to be specified"
+            exit 1
+          fi          
+          if [ "$INPUT_FILE_WITH_CONTENT" == "" ]
+          then
+            echo " ERROR: --fileWithContent need to be specified"
+            exit 1
+          else
+            # Load file
+            INPUT_FILE_CONTENT=$(<${INPUT_FILE_WITH_CONTENT})
+          fi    
+          ;;
+      esac
+      ;;
+  esac
+          
+
+      
+}
+
+#
+# replace_sid_desc
+#
+# Purpose: will replace SID_DESC for a give SID_NAME
+#
+# Parameters:
+#          SID_LIST
+#          GLOBAL_DB_NAME_SEARCH
+#          NEW_SID_DESC
+# Description:
+# GLOBAL_DB_NAME_SEARCH contains the GLOBAL DB NAME to look for
+# SID_LIST is the total list of SID_DESC's
+# NEW_SID_DESC is the entry that will be put instead of the existing one.
+# if empty it will be removed. If entry is not found it will be added.
+#
+# Below are shown examples of variables with content content that could be used
+# and the call it self
+#
+#GLOBAL_DB_NAME_SEARCH="asger_DGMGRL"
+#SID_LIST="    (SID_DESC =
+#      (SId_NAME=wvpc1)
+#      (ORACLE_HOME=/u01/app/oracle/product/11.2.0/dbhome_2 )
+#      (GLOBAL_DBNAME=wvpc_DGMGRL)
+#    )
+#    (SID_DESC = 
+#       (GLOBAL_DBNAME = CALXT2) #ASGER
+#       (ENVS = "TNS_ADMIN=/u01/app/11.2.0.4/grid/network/admin") 
+#       (ORACLE_HOME = /u01/app/11.2.0.4/grid) 
+#       (SID_NAME = dm12calxt1)
+#    )"
+#NEW_SID_DESC="
+#    (SID_DESC =
+#      (SId_NAME = asger1)
+#      (ORACLE_HOME = /ASGER_HOME )
+#      (GLOBAL_DBNAME = asger_DGMGRL)
+#      (ENVS = "TNS_ADMIN=/ASGER_HOME/network/admin") 
+#    )"
+#
+#SID_LIST=`replace_sid_desc "$SID_LIST" "$GLOBAL_DB_NAME_SEARCH" "$NEW_SID_DESC"`
+replace_sid_desc()
+{
+  local SID_LIST="$1"
+  local GLOBAL_DB_NAME_SEARCH="$2"
+  local NEW_SID_DESC="$3"
+  local last_level=0
+  local level0_buffer=""
+  local level0_prebuffer=""
+  local level1_buffer=""
+  local level1_prebuffer=""
+  local level2_buffer=""
+  local output_buffer=""
+  local sid_desc_found=1  
+  local STATE=LEVEL0
+  local SUB_STATE="NEWLINE"
+  local levelcount=0
+  local d=""
+  local char=""
+  local FOUND_SID_NAME=""
+  local FOUND_ORACLE_HOME=""
+  local FOUND_GLOBAL_DBNAME=""
+  local property_name=""
+  local property_value=""
+  while IFS= read -d '' -n1 char
+  do
+    #echo "##$char##$STATE##$SUB_STATE##$levelcount##$last_level"
+    case $STATE in
+      LEVEL0)
+        if [ $last_level -eq 1 ]
+        then
+          level0_buffer="${level0_buffer}${level1_buffer}${level1_prebuffer}"
+          level0_prebuffer=""
+        fi
+        case $char in
+          "(") (( levelcount++ ))
+            level1_prebuffer="${level0_prebuffer}${char}"
+            level1_buffer=""
+            STATE=LEVEL1;;
+          ")") (( levelcount-- ))
+            echo "Error"
+            exit 1
+            ;;
+          *)
+            level0_prebuffer="${level0_prebuffer}${char}"
+            ;;
+        esac
+        last_level=0
+        ;;
+      LEVEL1)
+        if [ $last_level -eq 2 ]
+        then
+          level1_buffer="${level1_buffer}${level2_buffer}"
+          level1_prebuffer=""
+        fi
+        case $char in
+          "(") (( levelcount++ ))
+            level2_buffer="${level1_prebuffer}${char}"
+            STATE=LEVEL2
+            SUB_STATE=NEW_LINE
+            ;;
+          ")") (( levelcount-- ))
+            # Is this the entry we are looking for ?
+            #if [ "$GLOBAL_DB_NAME_SEARCH" = "$FOUND_GLOBAL_DBNAME" ]
+            # MAybe use
+            if [ "`convert_to_lower $GLOBAL_DB_NAME_SEARCH`" = "`convert_to_lower $FOUND_GLOBAL_DBNAME`" ]     
+            then
+              sid_desc_found=0
+              #echo "#Match"
+              # Do we want to delete it or recreate it
+              if [ "$NEW_SID_DESC" = "" ]
+              then
+                # Delete it
+                #echo "#Delete"
+                level1_buffer=""
+                level1_prebuffer=""
+              else
+                #echo "#Update"
+                # Update it
+                level1_buffer="$NEW_SID_DESC"
+                level1_prebuffer=""
+              fi
+            else
+              level1_prebuffer="${level1_prebuffer}${char}"
+            fi
+            STATE=LEVEL0
+            #echo "level1_buffer=>$level1_buffer<"
+            #echo "FOUND_GLOBAL_DBNAME=$FOUND_GLOBAL_DBNAME"
+            #echo "FOUND_ORACLE_HOME=$FOUND_ORACLE_HOME"
+            #echo "FOUND_SID_NAME=$FOUND_SID_NAME"
+            #echo "FOUND_ENVS=$FOUND_ENVS"
+            ;;
+          *)
+            level1_prebuffer="${level1_prebuffer}${char}"
+            ;;
+        esac
+        last_level=1
+        ;;
+      LEVEL2)
+        case $char in
+          "(") (( levelcount++ ))
+            echo "Error in levelcount on level 2"
+            exit 1;;
+          ")") (( levelcount-- ))
+            level2_buffer="${level2_buffer}${char}"
+            STATE=LEVEL1
+            #echo "level2_buffer=>$level2_buffer<"
+            #echo "property_name=>$property_name<"
+            #echo "property_value=>$property_value<"
+            case $property_name in
+              [Ss][Ii][Dd]_[Nn][Aa][Mm][Ee])
+                FOUND_SID_NAME=$property_value
+                ;;
+              [OO][Rr][Aa][Cc][Ll][Ee]_[Hh][Oo][Mm][Ee])
+                FOUND_ORACLE_HOME=$property_value
+                ;;
+              [Gg][Ll][Oo][Bb][Aa][Ll]_[Dd][Bb][Nn][Aa][Mm][Ee])
+                #echo "FOUND_GLOBAL_DBNAME"
+                FOUND_GLOBAL_DBNAME=$property_value
+                ;;
+              [Ee][Nn][Vv][Ss])
+                #echo "FOUND_GLOBAL_DBNAME"
+                FOUND_ENVS=$property_value
+                ;;
+            esac
+            ;;
+          *)
+            level2_buffer="${level2_buffer}${char}"
+            # Now look for VARIABLES
+            case $SUB_STATE in
+              "NEW_LINE")            
+                 case $char in
+                   [[:space:]])
+                     :
+                     ;;
+                   *)
+                     property_name=${char}
+                     SUB_STATE="PROPERTY"
+                     ;;
+                  esac
+                  ;;
+              "PROPERTY")
+                 case $char in
+                   [[:space:]])
+                     :
+                     ;;
+                  "=")
+                    SUB_STATE="PARAMETER"
+                    property_value=""
+                    ;;
+                  *)
+                    property_name="${property_name}${char}"
+                    ;;
+                 esac
+                 ;;
+              "PARAMETER")
+                 case $char in
+                   [[:space:]])
+                     :
+                     ;;
+                  *)
+                    property_value="${property_value}${char}"
+                    ;;
+                 esac
+                 ;;
+            esac
+            ;;
+        esac
+        last_level=2
+        ;;
+    esac
+  done < <(echo "$SID_LIST")
+  if [ $sid_desc_found -eq 1 ]
+  then
+    # Entry not found - add it at the end
+    level0_buffer="${level0_buffer}${NEW_SID_DESC}"
+  fi
+  echo "$level0_buffer"
+}
+
+
+#
+# split_tns_data
+#
+# Purpose: Will find a tns entry on the outer level and split the
+#          content in 3 pieces. Before entry, the entry found and after the entry
+#
+# Parameters:
+#          TNS_FILE_CONTENT
+#          TNS_NAME_TO_FILTER 
+# Description:
+# TNS_FILE_CONTENT contains the content of listenere.ora or tnsnames.ora file
+# that should be split
+# TNS_NAME_TO_FILTER is the entry in the tnsnames.ora or listemer.ora to extract
+#
+# Will load a tnsnames.ora or listener.era file and extract it in 3 parts
+# The 3 parts wil be saved in global variables called
+# before_filter_buffer
+# filter_buffer
+# after_filter_buffer
+# The 3 parameters are
+# Everything before the TNS_NAME_TO_FILTER will end up in before_filter_buffer
+# If anything is found for the TNS_NAMES_TO_FILTER then it will be put in
+# filter_buffer otherwise it will be empty
+# The remaining part will end up in after_filter_buffer, which can be empty also
+# if TNS_NAME_TO_FILTER was not found
+split_tns_data()
+{
+  local TNS_FILE_CONTENT=$1
+  local TNS_NAME_TO_FILTER=$2 
+  local NEW_LINE=$'\n'
+  local state=NEWLINE
+  local levelcount=0
+  local tnsnames_id=""
+  local buffer=""
+  local output_mode="NOFILTER"
+  local entry_was_found=1
+  before_filter_buffer=""
+  filter_buffer=""
+  after_filter_buffer=""
+  while IFS= read -d '' -n1 char
+  do
+    #echo "############# state=${state}## char=$char ## outputmode=$output_mode"
+    case $state in
+      "NEWLINE")
+        case $char in
+          "("|")")
+            echo " ERROR: $char not allowed outside comments and entrys. Current Entry=$tnsnames_id"
+            exit 2
+            ;;
+          [[:space:]])
+            if [ "$output_mode" = "NOFILTER" ]
+            then
+              buffer="${buffer}${char}"
+            else
+              filter_buffer="${filter_buffer}${char}"
+            fi
+            ;;
+          "#")
+            buffer="${buffer}${char}"
+            output_mode="NOFILTER"
+            state="COMMENT"
+            ;;
+          *)
+            tnsnames_id=${char}
+            buffer_tnsnames_id=${char}
+            state="TNSID"
+            output_mode="NOFILTER"
+            ;;
+        esac
+        ;;
+      "COMMENT")
+        buffer="${buffer}${char}"
+        if [ "$char" = "$NEW_LINE" ]
+        then
+          state="NEWLINE"
+        fi
+        ;;
+      "TNSID")
+        buffer_tnsnames_id="${buffer_tnsnames_id}${char}"
+        case $char in
+          [[:space:]])
+            ;;
+          "=")
+            state="ENTRY"
+            para_found=1
+            if [ "`convert_to_lower $tnsnames_id`" = "`convert_to_lower $TNS_NAME_TO_FILTER`" ]
+            then
+              output_mode="FILTER"
+              entry_was_found=0
+              before_filter_buffer="$buffer"
+              #echo ">$before_filter_buffer<"
+              buffer=""
+              filter_buffer="${buffer_tnsnames_id}"
+            else
+              buffer="${buffer}${buffer_tnsnames_id}"
+              output_mode="NOFILTER"
+            fi
+            ;;
+          *)
+            tnsnames_id="${tnsnames_id}${char}"    
+            ;;
+        esac
+        ;;
+      "ENTRY")
+        previous_levelcount=$levelcount
+        case $char in
+          "(") (( levelcount++ )); para_found=0;;
+          ")") (( levelcount-- )); para_found=0;;
+          [[:space:]])
+            :
+            ;;
+          *)
+            if [ $para_found -eq 1 -a $levelcount -eq 0 ]
+            then
+              state="WAITFORNEWLINE"
+            fi
+            ;;
+        esac
+        #echo "##########previous_levelcount=$previous_levelcount"
+        if [ $levelcount -lt 0 ]
+        then
+          echo " ERROR : Problem with level count, smaller then 0.  Current Entry (if known)=$tnsnames_id"
+          exit 1
+        fi
+        if [ "$output_mode" = "NOFILTER" ]
+        then
+          buffer="${buffer}${char}"
+        else
+          filter_buffer="${filter_buffer}${char}"
+        fi
+        if [ $previous_levelcount -eq 1 -a $levelcount -eq 0 ]
+        then
+          state="WAITFORNEWLINE"
+        fi
+        ;;
+      "WAITFORNEWLINE")
+        previous_levelcount=$levelcount
+        case $char in
+          "(") (( levelcount++ ));;
+          ")") (( levelcount-- ));;
+        esac
+        #echo "##########previous_levelcount=$previous_levelcount"
+        if [ $levelcount -lt 0 ]
+        then
+          echo " ERROR: $char not allowed outside entrys. Current Entry=$tnsnames_id"
+          exit 1
+        fi
+        if [ "$output_mode" = "NOFILTER" ]
+        then
+          buffer="${buffer}${char}"
+        else
+          filter_buffer="${filter_buffer}${char}"
+        fi
+        if [ "$char" = "$NEW_LINE" ]
+        then
+          if [ "$output_mode" = "FILTER" ]
+          then
+            # Here we save the content up to the found entry
+            #before_filter_buffer="${buffer}"
+            #buffer="${buffer}${TNS_NEW_FILTER_ENTRY}"
+            # Reset buffer so we will have the remaining in the buffer alone 
+            buffer=""
+          fi
+          state="NEWLINE"
+        fi
+        ;;
+    esac
+  done < <(echo -n "$TNS_FILE_CONTENT")
+  if [ $levelcount -ne 0 ]
+  then
+    echo " ERROR: Level mismatch. Entry $tnsnames_id probably is not valid "
+    exit 3
+  fi
+  #echo "entry_was_found=$entry_was_found"
+  if [ $entry_was_found -eq 1 ]
+  then
+    # As nothing was found put it all in before_filter_buffer and a a new line as we will probably add stuff at the end
+    before_filter_buffer="${buffer}"
+  else
+    # Found Add it to the after_filter_buffer
+    after_filter_buffer="${buffer}"
+  fi
+}
+
+#
+# handle_request
+#
+# Purpose: handles the request after arguments have been analyzed checked
+#
+handle_request()
+{
+  case $OBJECT in
+    tnsconf)
+      case $ACTION in
+        addorupdate|remove)
+          # Enable trap before calling the locking
+          create_lock_dir
+          trap remove_lock_dir EXIT SIGHUP SIGINT SIGTERM
+          load_tns_files
+          if [ "$FIX_ENTRIES_FOR_ALL_DATABASES" = "Y" ]
+          then
+            # We need to run though all registred databases
+            execute_multiple_steps
+          else
+            # just working on one database 
+            execute_steps
+          fi
+          save_files
+          ;;
+      esac
+      ;;
+    listener)
+      case $ACTION in    
+        writefile)
+          #echo writefile_listener "$INPUT_HOST_NAME" "$INPUT_ORACLE_HOME" "$INPUT_FILE_NAME" "$INPUT_NOW_STRING" "$INPUT_DRY_RUN" "$INPUT_FILE_CONTENT"
+          writefile_listener "$INPUT_HOST_NAME" "$INPUT_ORACLE_HOME" "$INPUT_FILE_NAME" "$INPUT_NOW_STRING" "$INPUT_DRY_RUN" "$INPUT_FILE_CONTENT" "$DONT_RELOAD_LISTENER"
+          ;;
+      esac
+      ;;
+  esac
+}
+
+# The top level code
+parse_arguments $*
+handle_request

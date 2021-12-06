@@ -1,0 +1,490 @@
+#!/bin/bash
+#set -x
+# Script to cleanup golden gate archive logs #
+# 1.0.0   2017-02-21 asger.solvang@nordea.com     Initial version
+# 1.0.1   2017-02-25 asger.solvang@nordea.com     First full festured version
+# 1.0.2   2017-02-27 asger.solvang@nordea.com     Cleaned up Eror Handling
+# 1.0.3   2017-02-28 asger.solvang@nordea.com     Fixed a few minor typos 
+# 1.0.4   2017-03-20 asger.solvang@nordea.com     Removed sorting columns as they showed up in SQL 
+# 1.0.5   2017-03-20 asger.solvang@nordea.com     Typo in test statement 
+# 1.0.6   2017-03-21 asger.solvang@nordea.com     Now checks if captures exists and upercases input and add by it self the CAP_ part 
+# 1.0.7   2017-03-21 asger.solvang@nordea.com     Now Checks if we run on primary and exists silently if not running there# 1.0.7   2017-03-21 asger.solvang@nordea.com     Now Checks if we run on primary and exists silently if not running there
+# 1.0.8   2017-08-15 asger.solvang@nordea.com     Removed checks for for all nodes up as this is not nessecary
+# 1.0.9   2019-04-01 asger.solvang@nordea.com     Updated to use ndcommon
+# 1.0.10  2019-08-05 asger.solvang@nordea.com     Changed SQL to allow to leaving always 1 day of logs
+# 1.0.11  2019-08-14 asger.solvang@nordea.com     Added that it finds ASM Instance in a new way as we dont know where it runs (flexasm)
+# 1.0.12  2019-10-29 asger.solvang@nordea.com     Added changes to be able to handle 12.2 databases correctly
+source /var/lib/ndcommon/ndcommon
+SVERSION="1.0.12"
+now=$(date +"%F_%T")
+# Date timestamp used for data and log files etc NOW_STRING=`date  +"%F_%H-%M-%S"`
+echo "  INFO: Script version $SVERSION (${now})"
+# Default path to where we store temorary files etc Should on a share that all nodes in cluster can see
+PATH_TO_NDGGCTL_FILES=/clustershare/ndoggctl
+# If needed we have something unique here 
+FILES_PREFIX=$(uuidgen)
+# If we log something do it to this file, currently we don't log much and redirect normaly to /dev/nul
+ndoggctl_var_log_dir="${PATH_TO_NDGGCTL_FILES}/log"
+#ndoggctl_var_log_file="${ndoggctl_var_log_dir}/ndoggctl.log"
+ndoggctl_var_log_file="/dev/null"
+#mkdir -p ${ndoggctl_var_log_dir}
+# Default Minuttes to maximum keep files before deleting them 
+# f.x. 14 days * 1440  min/day = 20160
+# Can be overwritten by using --minuttesToKeepFiles option to script
+MINUTTES_TO_KEEP_FILES=20160
+# The generated name for find ASM files/log files
+FIND_ASM_FILES_AND_LOGMNR_LOGS="find_asm_files_and_logmnr_logs.sql"
+# The generated name for deleting ASM files
+DROP_ASM_FILE_NAME="drop_asm_files.sql"
+# The generated name for deleting ASM files
+DELETE_LOGMNR_LOGS="delete_logmnr_logs.sql"
+
+# Call with ogg consumer name as parameter 1
+# and location of directory to write the various files
+calcualate_sql_for_getting_archive_logs()
+{
+  ogg_consumer_name=$1
+  path_to_generated_files=$2
+  # Here  escape $ with 3 slash
+  # Here escape $ with 3 slashes as that's needed when using it in this context
+  SQL_FOR_GETTING_ARCHIVE_LOGS="WHENEVER OSERROR EXIT 1;
+WHENEVER SQLERROR EXIT SQL.SQLCODE;
+set echo off
+set heading off
+set verify off
+set pagesize 0
+set pages 0
+set trimspool on
+set linesize 400
+set feedback off
+SPOOL ${path_to_generated_files}/${DROP_ASM_FILE_NAME}
+select 'WHENEVER OSERROR EXIT 1;' from dual;
+--select 'WHENEVER SQLERROR EXIT SQL.SQLCODE;' from dual;
+SELECT distinct
+'alter diskgroup '||regexp_replace( NAME,'\+([^/]*).*','\1')||' drop file '''||  NAME ||''';'
+FROM DBA_REGISTERED_ARCHIVED_LOG
+where next_scn < (select min(required_checkpoint_scn) from DBA_CAPTURE where CAPTURE_NAME IN (${ogg_consumer_name}))
+and CONSUMER_NAME IN (${ogg_consumer_name})
+and next_time < sysdate -1
+and next_scn > first_scn
+order by 1;
+spool off
+SPOOL ${path_to_generated_files}/${DELETE_LOGMNR_LOGS}
+select 'WHENEVER OSERROR EXIT 1;' from dual;
+select 'WHENEVER SQLERROR EXIT SQL.SQLCODE;' from dual;
+with found_files as (
+SELECT r.THREAD#, r.SEQUENCE#,
+'delete from system.logmnr_log\\\$ where sequence#=' || r.SEQUENCE# || ' and THREAD#=' || r.THREAD# || ';' run_sql
+FROM DBA_REGISTERED_ARCHIVED_LOG r, DBA_CAPTURE c
+where next_scn < (select min(required_checkpoint_scn) from DBA_CAPTURE where CAPTURE_NAME IN (${ogg_consumer_name}))
+and r.CONSUMER_NAME = c.CAPTURE_NAME
+and c.CAPTURE_NAME IN (${ogg_consumer_name})
+and r.next_time < sysdate -1
+and r.next_scn > r.first_scn
+)
+select distinct (run_sql)
+--,THREAD#, SEQUENCE#
+from found_files
+--order by THREAD#, SEQUENCE#
+;
+spool off
+"
+}
+
+
+#
+# write_usage
+#
+# Purpose: Give the user an idea about how to use the script
+#
+write_usage()
+{
+  cat << EOF
+$0 is used to ...
+
+Usage:
+  $0 clean shippedlogs
+Required parameters:
+  --databaseUniqueName <Unique Database name of the local databases>
+            The name of the database to look in for shipped logs that can
+            be deleted
+  --oggCaptureName <comma separated list of Capture Names>.
+            The Oracle Golden gate capture names that should be used for
+            deciding if we can delete shipped logs (skip the OGG\$CAP_ prefix)
+  --dryRun  
+            Do all the processing except don't do the actual deletes  
+  -h|--help
+            Will show this help
+
+EOF
+}
+
+
+# Will find and instance, host and oracle_home that can be used for 
+# connecting to the database
+# Call with database name as parameter 1
+# Will return 0 if db instance found and
+# set global environment variables
+# FOUND_DB_HOME
+# FOUND_DB_INSTANCE
+# FOUND_DB_INSTANCE_HOST  
+# otherwise will return 1 if no instance found
+# and 2 if database is not found in cluster at all
+find_database_location()
+{
+  GRID_ORACLE_HOME=$(find_grid_home)
+  local db_name
+  local db_home
+  local db_version
+  local db_input=$1
+  local db_instance_status
+  while read db_name db_home db_version; do
+    if [ "$1" == "$db_name" ]
+    then
+      while read LINE2; do
+        #echo $LINE2
+        db_instance_status=`echo "$LINE2" | sed 's/Instance[[:blank:]]*[^ \t]*[[:blank:]]*is[[:blank:]]*\(.*\)[[:blank:]]on[[:blank:]]node.*/\1/' `
+        if [ "$db_instance_status" = "running" ]
+        then
+          # OK we found a running instance
+          FOUND_DB_HOME=$db_home
+          FOUND_DB_INSTANCE=`echo "$LINE2" | sed 's/Instance[[:blank:]]*\([^ \t]*\).*/\1/'`
+          FOUND_DB_INSTANCE_HOST=`echo "$LINE2" | sed 's/.*[[:blank:]]\([^\t]*\)$/\1/' `
+          return 0
+        fi
+      done < <(export ORACLE_HOME=${db_home};${db_home}/bin/srvctl status database -d ${db_name})
+      return 1      
+    fi
+  done < <($GRID_ORACLE_HOME/bin/srvctl config database -verbose)
+  return 2
+} 
+
+# call with host, instance, oracle_home and sql as parameters
+# will run the sql using the values supplied and return output
+run_sql_on_host()
+{
+  local db_instance_host=$1
+  local db_instance=$2
+  local db_home=$3
+  local db_sql="$4"
+  ssh ${db_instance_host} "export ORACLE_SID=${db_instance}; export ORACLE_HOME=${db_home}; echo \"$db_sql\"|${db_home}/bin/sqlplus -S / as sysdba"
+}
+
+# Wil check node access accros nodes
+check_node_access()
+{
+  local nodes_to_check
+  if [ "$1" != "" ]
+  then
+    # We supplied a list use that
+    nodes_to_check=$1
+  else
+    # Check all
+    nodes_to_check=$( get_nodes )
+  fi
+  for node in $nodes_to_check
+  do
+    # Check ssh access
+    timeout 5 ssh $node date >>$ndoggctl_var_log_file 2>&1
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't reach node $node"
+      exit 1
+    fi      
+  done
+}
+
+
+#
+# parse_arguments
+#
+# Purpose: Parses all the arguments received on command line
+# first argument is always action and second is component/object
+#
+parse_arguments()
+{
+  if [ $# -eq 0 ]
+  then
+    write_usage
+    exit
+  fi
+  # First check action is one we know off
+  VALID_ACTION_LIST="clean -h --help "
+  if string_contain "$1 " "$VALID_ACTION_LIST"
+  then
+    ACTION=$1
+  else
+    echo " ERROR: Action parameter \"$1\" given to script not recognized"
+    exit 1
+  fi
+  if [ "$ACTION" = "-h" -o "$ACTION" = "--help" ]
+  then
+    write_usage
+    exit
+  fi
+  shift
+  if [ $# -eq 0 ]
+  then
+    echo " ERROR: Action parameter \"$ACTION\" given to script needs to be followed by an object"
+    exit 1
+  fi
+  # Depending on action various objects might be specified
+  case $1 in
+    shippedlogs) OBJECT="shippedlogs";VALID_ACTION_LIST="clean ";;
+    *)            echo " ERROR: Object parameter $1 given to script not recognized";exit 1;;
+  esac;
+  shift
+  # first check if we support combination
+  if ! string_contain  "$ACTION " "$VALID_ACTION_LIST"
+  then
+    echo " ERROR: The action \"$ACTION\" is not not supported for object\"$OBJECT\". Actions allowed is \"$VALID_ACTION_LIST\""
+    exit 1
+  fi
+  # Now we checked that combination of object/action is valid
+  # Now we for each action/object checks the parameters, we use getopt for that in case there are some parameters
+  case $OBJECT in
+    shippedlogs)
+      case $ACTION in
+        clean)
+          TEMP=`getopt -o "" --name "$0" --long databaseUniqueName:,oggCaptureName:,dryRun -- "$@"`
+          #Bad arguments
+          if [ $? -ne 0 ]; then
+              echo " ERROR: Bad/unknown arguments supplied"
+              exit 1
+          fi          
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --databaseUniqueName) DATABASE_UNIQUE_NAME="$2";shift 2 ;;
+              --oggCaptureName) OGG_CAPTURE_NAME="$2";shift 2 ;;
+              --dryRun) DRY_RUN="Y"; shift ;;                
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$DATABASE_UNIQUE_NAME" == "" ]
+          then
+            echo " ERROR: --databaseUniqueName need to be specified"
+            exit 1
+          fi         
+          if [ "$OGG_CAPTURE_NAME" == "" ]
+          then
+            echo " ERROR: --oggCaptureName need to be specified"
+            exit 1
+          fi
+          # Thake the comma separated list and make an somethingwe can use in an IN SQL function
+          CAPTURE_IN_CONTENT=""
+          TEST_CAPTURES="WHENEVER OSERROR EXIT 1;
+WHENEVER SQLERROR EXIT SQL.SQLCODE;
+DECLARE
+  READ_CAPTURE_NAME varchar2(128);
+  READ_DATABASE_ROLE varchar2(16);
+BEGIN
+  select database_role into READ_DATABASE_ROLE from v\\\$database;
+  if READ_DATABASE_ROLE != 'PRIMARY'  then
+    raise_application_error( -20002, 'The database is not having primary role - can''t cleanup');
+  end if;"
+          for capture_name in `convert_to_upper "${OGG_CAPTURE_NAME//,/ }"`
+          do  
+            TEST_CAPTURES="$TEST_CAPTURES
+  SELECT CAPTURE_NAME INTO READ_CAPTURE_NAME FROM dba_capture where capture_name='OGG\\\$CAP_${capture_name}';"
+            if [ "$CAPTURE_IN_CONTENT" = "" ]
+            then
+              CAPTURE_IN_CONTENT="'OGG\\\$CAP_${capture_name}'"
+            else
+              CAPTURE_IN_CONTENT="${CAPTURE_IN_CONTENT},'OGG\\\$CAP_${capture_name}'"
+            fi
+          done
+TEST_CAPTURES="$TEST_CAPTURES
+EXCEPTION WHEN NO_DATA_FOUND THEN
+  raise_application_error( -20001, 'One or more of the captures ${OGG_CAPTURE_NAME} does not exists in the database');
+END;
+/          
+"
+#echo "$TEST_CAPTURES"
+          ;;
+      esac
+      ;;
+  esac
+  # Now all parameters that should be there are there. We have not yet checked for
+  # that the values make sense. We do this when we handle the individual request
+}
+
+clean_shippedlogs()
+{
+  local database_unique_name=$1
+  local ogg_capture_name=$2
+  #echo "database_unique_name=$database_unique_name"
+  #echo "ogg_capture_name=$ogg_capture_name"
+  # First find out if database is running
+  # will set
+  # FOUND_DB_HOME
+  # FOUND_DB_INSTANCE
+  # FOUND_DB_INSTANCE_HOST    
+  find_database_location $database_unique_name
+  case $? in
+  1)
+    # The DB is here but is not running, we see this as more or less ok
+    echo "WARNING: No running instance found for $database_unique_name, but the database is configured in he cluster"
+    return 0;;
+  2)
+    # No DB here with the name - this is an error
+    echo " ERROR: The database $database_unique_name is not configured in he cluster"
+    return 2;;
+  esac
+  echo "  INFO: Found running instance $FOUND_DB_INSTANCE on host $FOUND_DB_INSTANCE_HOST with ORACLE_HOME=$FOUND_DB_HOME"
+  # We found the database and an instance, assuming we have a local ASM instance we can now start
+  run_sql_on_host "$FOUND_DB_INSTANCE_HOST" "$FOUND_DB_INSTANCE" "$FOUND_DB_HOME" "$TEST_CAPTURES"
+  return_code=$?
+  if [ $return_code -eq 34 ]
+  then
+    echo "Database is not primary. We will silently ignore that"
+    exit 0
+  fi
+  if [ $return_code -eq 33 ]
+  then
+    echo "Captures wrong exit with error"
+    exit 3
+  fi
+  if [ $return_code -ne 0 ]
+  then
+    #echo " ERROR: executing SQL failed. The SQL is:"
+    #echo "$TEST_CAPTURES"
+    exit $return_code
+  fi  
+  # Generate som unique path for the datbase
+  PATH_TO_GENERATED_FILES=${PATH_TO_NDGGCTL_FILES}/${database_unique_name}
+  mkdir -p $PATH_TO_GENERATED_FILES
+  # First get the sql to run against the instance in variable SQL_FOR_GETTING_ARCHIVE_LOGS
+  calcualate_sql_for_getting_archive_logs ${CAPTURE_IN_CONTENT} ${PATH_TO_GENERATED_FILES}
+  # Move all old files and clean up
+  echo "  INFO: Archiving last generated sql files in ${PATH_TO_GENERATED_FILES}"
+  if [ -f ${PATH_TO_GENERATED_FILES}/${FIND_ASM_FILES_AND_LOGMNR_LOGS} ]
+  then
+    mv ${PATH_TO_GENERATED_FILES}/${FIND_ASM_FILES_AND_LOGMNR_LOGS}  ${PATH_TO_GENERATED_FILES}/${FIND_ASM_FILES_AND_LOGMNR_LOGS}.backup_${now}
+  fi  
+  if [ -f ${PATH_TO_GENERATED_FILES}/${DROP_ASM_FILE_NAME} ]
+  then
+    mv ${PATH_TO_GENERATED_FILES}/${DROP_ASM_FILE_NAME}  ${PATH_TO_GENERATED_FILES}/${DROP_ASM_FILE_NAME}.backup_${now}
+  fi
+  if [ -f ${PATH_TO_GENERATED_FILES}/${DELETE_LOGMNR_LOGS} ]
+  then
+    mv ${PATH_TO_GENERATED_FILES}/${DELETE_LOGMNR_LOGS}  ${PATH_TO_GENERATED_FILES}/${DELETE_LOGMNR_LOGS}.backup_${now}
+  fi
+  # Clean out old files
+  echo "  INFO: Clean out log files older than ${MINUTTES_TO_KEEP_FILES} minuttes"
+  find ${PATH_TO_GENERATED_FILES} -type f -mmin +${MINUTTES_TO_KEEP_FILES} -exec rm {} \;
+  # Then create files to be used for deletion by running the script
+  echo "  INFO: Generating new sql cleanup files"
+  ssh $FOUND_DB_INSTANCE_HOST "echo \"$SQL_FOR_GETTING_ARCHIVE_LOGS\" > ${PATH_TO_GENERATED_FILES}/${FIND_ASM_FILES_AND_LOGMNR_LOGS}"
+  run_sql_on_host "$FOUND_DB_INSTANCE_HOST" "$FOUND_DB_INSTANCE" "$FOUND_DB_HOME" "$SQL_FOR_GETTING_ARCHIVE_LOGS"
+  return_code=$?
+  if [ $return_code -ne 0 ]
+  then
+    echo " ERROR: executing SQL failed. The SQL is:"
+    echo "$SQL_FOR_GETTING_ARCHIVE_LOGS"
+    exit $return_code
+  fi  
+  # OK now do the actual deletion - unless we are in a dryrun situation
+  if [ "$DRY_RUN" != "Y" ]
+  then
+    # Prepare deletion of files in ASM
+    # We have to find a node where ASM runs
+    FOUND_ASM_INSTANCE_HOST=$(find_asm_run_node)
+    # We have to find an instance of ASM on that node
+    FOUND_ASM_INSTANCE=$(find_asm_run_sid)
+    if [ "$FOUND_ASM_INSTANCE_HOST" = "" -o "$FOUND_ASM_INSTANCE" = "" ]
+    then 
+      echo " ERROR: Cant find an ASM instance that is running"
+      exit 1
+    fi
+    # Now delete files in ASM
+    run_sql_on_host "$FOUND_ASM_INSTANCE_HOST" "$FOUND_ASM_INSTANCE" "$GRID_ORACLE_HOME" "@${PATH_TO_GENERATED_FILES}/${DROP_ASM_FILE_NAME}"
+    return_code=$?
+    if [ $return_code -ne 0 ]
+    then
+      echo " ERROR: Error deleting files in ASM"
+      exit $return_code
+    fi  
+    echo "  INFO: ASM files deleted successfully - if there were any!"
+    # Now delete entries in log miner - we ignore errors for now, if script errors i will be the return code
+    run_sql_on_host "$FOUND_DB_INSTANCE_HOST" "$FOUND_DB_INSTANCE" "$FOUND_DB_HOME" "@${PATH_TO_GENERATED_FILES}/${DELETE_LOGMNR_LOGS}"
+    return_code=$?
+    if [ $return_code -ne 0 ]
+    then
+      echo " ERROR: Error deleting files in ASM"
+      exit $return_code
+    fi  
+    echo "  INFO: Log Miner entries deleted successfully - if there were any!"
+  else
+    echo "  INFO: Dry Run - no information deleted"
+  fi    
+  echo "    OK: All steps succeeed"
+}
+
+#
+# handle_request
+#
+# Purpose: handles the request after arguments have been analyzed checked
+#
+handle_request()
+{
+  case $OBJECT in
+    shippedlogs)
+      case $ACTION in
+        clean)
+          clean_shippedlogs "$DATABASE_UNIQUE_NAME" "$OGG_CAPTURE_NAME" 
+          ;;
+      esac
+      ;;
+  esac
+}
+
+#
+# build_environment_names
+#
+# Purpose: Build some environment names based on parameters
+#          given to script plus other variables needed
+#
+build_environment_names()
+{
+  #set -x
+  # The hostname without domain
+  SHORT_HOST_NAME=${HOSTNAME%%.*}
+  # Domainame
+  DOMAIN_NAME=${HOSTNAME#*.}
+}
+
+
+
+# Ok do the stuff
+# Script really starts here
+#check_node_access
+check_for_permission oracle
+parse_arguments $*
+build_environment_names
+# The actual work is done here
+#check_node_access
+handle_request
+echo "  INFO: Script finished ($(date +"%F_%T"))"
+
+#select found_log_files.name, found_log_files.log_db_unique_name
+#from
+#(
+#select  NAME, upper(regexp_replace(name,'+[^/]*/downstream/([^/]*)/.*','\1')) log_db_unique_name
+# from DBA_REGISTERED_ARCHIVED_LOG
+# where regexp_like(name,'+[^/]*/downstream/([^/]*)/.*','i')
+#union
+# select  NAME, upper(regexp_replace(name,'+[^/]*/([^/]*)/foreign_archivelog/.*','\1')) log_db_unique_name
+# from DBA_REGISTERED_ARCHIVED_LOG
+# where regexp_like(name,'+[^/]*/([^/]*)/foreign_archivelog/.*','i')
+#) found_log_files, v$database database
+#where upper(database.db_unique_name) = found_log_files.log_db_unique_name
+#;
+
+#
+#select  NAME
+# from DBA_REGISTERED_ARCHIVED_LOG
+# where
+# upper(regexp_replace(name,'+[^/]*/downstream/([^/]*)/.*','i')) 
+#;

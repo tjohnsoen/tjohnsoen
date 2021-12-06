@@ -1,0 +1,1418 @@
+#/bin/bash
+# Script to collect data from an Oracle RAC cluster that can be used got charging   
+# 
+# 1.0.1   2019-04-04 asger.solvang@nordea.com     Initial version inherited from ndfinctl version 1.0.12
+# 1.0.2   2019-04-11 asger.solvang@nordea.com     First version that seems to work a little
+# 1.0.3   2019-04-12 asger.solvang@nordea.com     Added that PDB's alone in HA/BCA containers pays for all instances even if no services are there
+# 1.0.4   2019-06-11 asger.solvang@nordea.com     Added possibility to only upload files     
+# 1.0.5   2019-06-24 asger.solvang@nordea.com     Fixed issue with selecting max from "to many" instances in history view and added check for all nodes available     
+# 1.0.6   2019-08-07 asger.solvang@nordea.com     Increased timeout to 10 seconds for ssh test     
+# 1.0.7   2019-08-08 asger.solvang@nordea.com     Increased timeout to 30 seconds for ssh test     
+# 1.0.8   2020-01-06 asger.solvang@nordea.com     Use cursor_sharing=force and cleanup of lock dirs in case of node failures
+
+# Source the common functions
+source /var/lib/ndcommon/ndcommon
+SVERSION="1.0.8"
+echo "   INFO: Script version $SVERSION (`date  +%F_%H.%M.%S`)"
+# Associative array to hold information about services
+declare -A global_preferred_instances
+declare -A global_available_instances
+declare -A global_service_role
+declare -A global_pluggable_database_name
+declare -A global_reason
+declare -A global_database
+declare -A global_instanse
+declare -A global_oracle_home
+#
+# Date timestamp used for data and log files etc
+# f.x. 2016-12-21_23-12-56
+NOW_STRING=`date  +"%F_%H-%M-%S"`
+# USed for SQL inserts
+NOW_STRING_DATE_TYPE="to_date('${NOW_STRING}','YYYY-MM-DD_HH24-MI-SS')"
+NOW_STRING_DATE_TYPE_IN_SQL="to_date(''${NOW_STRING}'',''YYYY-MM-DD_HH24-MI-SS'')"
+SCHEMA_TO_INSERT_INTO="DB_ORA_RAW"
+# Default Minutes to maximum keep files before removing them (SQL, log, request files etc)
+# f.x. 7 days * 1440  min/day = 10080
+# Can be overwritten by using --minutesToKeepFiles option to script
+MINUTES_TO_KEEP_FILES=10080
+# While testing use lower value, but comment out later
+# MINUTES_TO_KEEP_FILES=4
+# Default path to where we store information and have configuration files
+PATH_TO_NDCHARGECTL_FILES=/clustershare/ndchargectl
+
+# Here escape $ with 3 slashes as that's needed when using it in this context
+IS_DB_CDB_SQL="set heading off
+set feedback off
+whenever sqlerror exit 1
+select CDB 
+  from V\\\$DATABASE;
+"
+PARAMETER_SQL_PLUS="set heading off
+set feedback off
+whenever sqlerror exit 1
+select name||'='||value 
+from v\\\$parameter
+where name in ('cpu_count','sga_max_size','pga_aggregate_target','memory_max_target','use_large_pages')
+union
+select 'archive_pr_day_mb='||round(sum(blocks * block_size)/(7*1024*1024))
+      from v\\\$archived_log
+      where first_time > sysdate -7
+      and standby_dest = 'NO';
+exit;
+"
+# Here escape $ with 3 slash
+ASM_TOTAL_DISK_USAGE="set heading off
+set feedback off
+select 'DISKGROUP='||lower(name)||',GB_TOTAL='||round(total_mb/1024/decode(type,'EXTERNAL',1,'EXTERN',1,'NORMAL',2,'HIGH',3))||',GB_FREE='||round(free_mb/1024/decode(type,'EXTERNAL',1,'EXTERN',1,'NORMAL',2,'HIGH',3))||',USABLE_GB_FREE='||round(USABLE_FILE_MB/1024)
+from v\\\$asm_diskgroup;
+"
+
+# Here escape $ with 3 slash
+ASM_DATABASE_DISK_USAGE="set heading off
+set feedback off
+whenever sqlerror exit 1
+SELECT
+    'DBNAME='||lower(dbname)||',DISKGROUP='||lower(gname)||',GB_USED='||round(SUM(space)/1024/1024/1024) gb_used
+FROM
+    (
+        SELECT
+            gname,
+            regexp_substr(full_alias_path, '[[:alnum:]_]*',1,4) dbname,
+            file_type,
+            space,
+            aname,
+            system_created,
+            alias_directory
+        FROM
+            (
+                SELECT
+                    concat('+'||gname, sys_connect_by_path(aname, '/')) full_alias_path,
+                    system_created,
+                    alias_directory,
+                    file_type,
+                    space,
+                    level,
+                    gname,
+                    aname
+                FROM
+                    (
+                        SELECT
+                            b.name            gname,
+                            a.parent_index    pindex,
+                            a.name            aname,
+                            a.reference_index rindex ,
+                            a.system_created,
+                            a.alias_directory,
+                            c.type file_type,
+                            c.space / decode(c.redundancy,'UNPROT',1,'MIRROR',2,'HIGH',3) space
+                        FROM
+                            v\\\$asm_alias a,
+                            v\\\$asm_diskgroup b,
+                            v\\\$asm_file c
+                        WHERE
+                            a.group_number = b.group_number
+                        AND a.group_number = c.group_number(+)
+                        AND a.file_number = c.file_number(+)
+                        AND a.file_incarnation = c.incarnation(+) ) START WITH (mod(pindex, power(2, 24))) = 0
+                AND rindex IN
+                    (
+                        SELECT
+                            a.reference_index
+                        FROM
+                            v\\\$asm_alias a,
+                            v\\\$asm_diskgroup b
+                        WHERE
+                            a.group_number = b.group_number
+                        AND (
+                                mod(a.parent_index, power(2, 24))) = 0
+                    ) CONNECT BY prior rindex = pindex )
+        WHERE
+            NOT file_type IS NULL
+            and system_created = 'Y' )
+GROUP BY
+    dbname,
+    gname
+ORDER BY
+    dbname,
+    gname;
+exit;
+"
+# Add DATABASE_ROLE, DB_NAME, DB_UNIQUE_NAME, INSTANCE_NAME, SERVER_HOST
+
+# Here escape $ with 3 slash
+PDB_INFO_SQL="set heading off
+set feedback off
+set linesize 2000
+set serveroutput on
+whenever sqlerror exit 1
+declare
+  CURSOR c_pdb_parameter(i_con_id NUMBER, i_parameter_name VARCHAR2) IS 
+    select case vsp.type when 'string' then regexp_replace(value\\\$,'''(.*)''','\1') else value\\\$ end as value 
+    from pdb_spfile\\\$ ps, v\\\$PDBS vp, v\\\$spparameter vsp
+    where ps.pdb_uid=vp.con_uid
+    and vsp.name=ps.name
+    and ps.name=i_parameter_name
+    and vp.con_id=i_con_id;
+  v_value varchar2(255);
+  --Database/instance specific
+  v_db_name varchar2(255):=SYS_CONTEXT('USERENV','DB_NAME');
+  v_database_role varchar2(255):=SYS_CONTEXT('USERENV','DATABASE_ROLE');
+  v_server_host varchar2(255):=SYS_CONTEXT('USERENV','SERVER_HOST');
+  v_db_unique_name varchar2(255):=SYS_CONTEXT('USERENV','DB_UNIQUE_NAME');
+  v_instance_name varchar2(255):=SYS_CONTEXT('USERENV','INSTANCE_NAME');
+  v_rdbms_version varchar2(255);
+  --SPFILE
+  v_memory_max_target number(16);
+  v_sga_max_size number(16);
+  v_pga_aggregate_target number(16);
+  v_pga_aggregate_limit number(16);
+  v_sga_target number(16);
+  v_sga_min_size number(16);
+  v_db_cache_size number(16);
+  v_shared_pool_size number(16);
+  v_cpu_count number(16);
+  v_max_iops number(16);
+  v_max_mbps number(16);
+  -- SPFILE for cdb\\\$root
+  v_0_memory_max_target number(16);
+  v_0_sga_max_size number(16);
+  v_0_pga_aggregate_target number(16);
+  v_0_pga_aggregate_limit number(16);
+  v_0_sga_target number(16);
+  v_0_sga_min_size number(16);
+  v_0_db_cache_size number(16);
+  v_0_shared_pool_size number(16);
+  v_0_cpu_count number(16);
+  v_0_max_iops number(16);
+  v_0_max_mbps number(16);
+  -- History
+  v_max_sga_bytes_24h number(16);
+  v_max_pga_bytes_24h number(16);
+  v_max_buffer_cache_bytes_24h number(16);
+  v_max_shared_pool_bytes_24h number(16);
+  --New
+  v_max_iops_24h number(16);
+  v_max_iombps_24h number(16);
+  v_max_avg_cpu_utilization_24h number(16);
+  -- PDB
+  v_total_size number(16);
+  v_diagnostics_size number(16);
+  v_audit_files_size number(16);
+  v_max_size number(16);
+  v_max_diagnostics_size number(16);
+  v_max_audit_size number(16);  
+begin
+  -- Get version info
+  select version into v_rdbms_version from product_component_version where lower(product) like '%oracle database%' and rownum=1;
+  -- Get all values that will inherit if we have not set any
+  select value into v_0_memory_max_target from v\\\$system_parameter  where name = 'memory_max_target' and con_id=0;
+  select value into v_0_sga_max_size from v\\\$system_parameter  where name = 'sga_max_size' and con_id=0;
+  select value into v_0_pga_aggregate_target from v\\\$system_parameter  where name = 'pga_aggregate_target' and con_id=0;
+  select value into v_0_pga_aggregate_limit from v\\\$system_parameter  where name = 'pga_aggregate_limit' and con_id=0;
+  select value into v_0_sga_target from v\\\$system_parameter  where name = 'sga_target' and con_id=0;
+  select value into v_0_sga_min_size from v\\\$system_parameter  where name = 'sga_min_size' and con_id=0;
+  select value into v_0_db_cache_size from v\\\$system_parameter  where name = 'db_cache_size' and con_id=0;
+  select value into v_0_shared_pool_size from v\\\$system_parameter  where name = 'shared_pool_size' and con_id=0;
+  select value into v_0_cpu_count from v\\\$system_parameter  where name = 'cpu_count' and con_id=0;
+  select value into v_0_max_iops from v\\\$system_parameter  where name = 'max_iops' and con_id=0;
+  select value into v_0_max_mbps from v\\\$system_parameter  where name = 'max_mbps' and con_id=0;
+  -- first loop over all pdbs
+  for rec_pdbs in (select * from v\\\$PDBS )
+  loop
+    v_total_size := rec_pdbs.total_size;    
+    v_diagnostics_size := rec_pdbs.diagnostics_size;
+    v_audit_files_size := rec_pdbs.audit_files_size;
+    v_max_size := rec_pdbs.max_size;
+    v_max_diagnostics_size := rec_pdbs.max_diagnostics_size;
+    v_max_audit_size := rec_pdbs.max_audit_size;
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'memory_max_target');
+      FETCH c_pdb_parameter INTO v_memory_max_target;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_memory_max_target := v_0_memory_max_target;
+      END IF;
+      close c_pdb_parameter;
+    end;
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'sga_max_size');
+      FETCH c_pdb_parameter INTO v_sga_max_size;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_sga_max_size := v_0_sga_max_size;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'pga_aggregate_target');
+      FETCH c_pdb_parameter INTO v_pga_aggregate_target;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_pga_aggregate_target := v_0_pga_aggregate_target;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'pga_aggregate_limit');
+      FETCH c_pdb_parameter INTO v_pga_aggregate_limit;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_pga_aggregate_limit := v_0_pga_aggregate_limit;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'sga_target');
+      FETCH c_pdb_parameter INTO v_sga_target;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_sga_target := v_0_sga_target;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'sga_min_size');
+      FETCH c_pdb_parameter INTO v_sga_min_size;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_sga_min_size := v_0_sga_min_size;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'db_cache_size');
+      FETCH c_pdb_parameter INTO v_db_cache_size;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_db_cache_size := v_0_db_cache_size;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'shared_pool_size');
+      FETCH c_pdb_parameter INTO v_shared_pool_size;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_shared_pool_size := v_0_shared_pool_size;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'cpu_count');
+      FETCH c_pdb_parameter INTO v_cpu_count;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_cpu_count := v_0_cpu_count;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'max_iops');
+      FETCH c_pdb_parameter INTO v_max_iops;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_max_iops := v_0_max_iops;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      open c_pdb_parameter(i_con_id=>rec_pdbs.con_id, i_parameter_name=>'max_mbps');
+      FETCH c_pdb_parameter INTO v_max_mbps;
+      IF c_pdb_parameter%NOTFOUND
+      THEN
+        v_max_mbps := v_0_max_mbps;
+      END IF;
+      close c_pdb_parameter;
+    end;    
+    begin
+      SELECT
+        max(r.sga_bytes) max_sga_bytes_24h,
+        max(r.pga_bytes) max_pga_bytes_24h,
+        max(r.buffer_cache_bytes) max_buffer_cache_bytes_24h ,
+        max(r.shared_pool_bytes) max_shared_pool_bytes_24h,
+        max(r.iops) v_max_iops_24h,
+        max(r.iombps) v_max_iombps_24h,
+        max(r.avg_cpu_utilization) v_max_avg_cpu_utilization_24h        
+      INTO
+        v_max_sga_bytes_24h, v_max_pga_bytes_24h, v_max_buffer_cache_bytes_24h, v_max_shared_pool_bytes_24h,
+        v_max_iops_24h, v_max_iombps_24h, v_max_avg_cpu_utilization_24h
+      FROM   dba_hist_rsrc_pdb_metric r,
+        cdb_pdbs p
+      WHERE  r.con_id = p.con_id
+        and r.end_time > sysdate -1
+        and r.con_id=rec_pdbs.con_id
+        and r.instance_number = (select instance_number from v\\\$instance)
+      GROUP BY p.pdb_name;    
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        v_max_sga_bytes_24h:=0;
+        v_max_pga_bytes_24h:=0;
+        v_max_buffer_cache_bytes_24h:=0;
+        v_max_shared_pool_bytes_24h:=0;
+        v_max_iops_24h:=0;
+        v_max_iombps_24h:=0;
+        v_max_avg_cpu_utilization_24h:=0;
+    end;
+    -- Now we should have anything, make the big insert statement
+    dbms_output.put_line('insert into ${SCHEMA_TO_INSERT_INTO}.ORA_PDB_DATA(
+SHARED_POOL_SIZE
+,PGA_AGGREGATE_TARGET
+,DB_UNIQUE_NAME
+,PGA_AGGREGATE_LIMIT
+,DB_NAME
+,MAX_MBPS
+,CPU_COUNT
+,DATABASE_ROLE
+,MAX_AUDIT_SIZE
+,PDB_NAME
+,SGA_TARGET
+,MAX_PGA_BYTES_24H
+,TOTAL_SIZE
+,MAX_SHARED_POOL_BYTES_24H
+,INSTANCE_NAME
+,SGA_MAX_SIZE
+,MAX_DIAGNOSTICS_SIZE
+,COLLECTION_DATE
+,MAX_SIZE
+,MAX_SGA_BYTES_24H
+,SGA_MIN_SIZE
+,MAX_BUFFER_CACHE_BYTES_24H
+,MAX_IOPS
+,AUDIT_FILES_SIZE
+,MEMORY_MAX_TARGET
+,DIAGNOSTICS_SIZE
+,SERVER_HOST
+,DB_CACHE_SIZE,
+max_iops_24h,
+max_iombps_24h,
+max_avg_cpu_utilization_24h,
+rdbms_version
+) values (
+'||v_shared_pool_size||'   
+,'||v_pga_aggregate_target||'
+,'''||v_db_unique_name||'''
+,'||v_pga_aggregate_limit||'
+,'''||lower(v_db_name)||'''
+,'||v_max_mbps||'
+,'||v_cpu_count||'
+,'''||lower(v_database_role)||'''
+,'||v_max_audit_size||'
+,'''||lower(rec_pdbs.name)||'''
+,'||v_sga_target||'
+,'||v_max_pga_bytes_24h||'
+,'||v_total_size||'
+,'||v_max_shared_pool_bytes_24h||'
+,'''||lower(v_instance_name)||'''
+,'||v_sga_max_size||'
+,'||v_max_diagnostics_size||'
+,${NOW_STRING_DATE_TYPE_IN_SQL}
+,'||v_max_size||'
+,'||v_max_sga_bytes_24h||'
+,'||v_sga_min_size||'
+,'||v_max_buffer_cache_bytes_24h||'
+,'||v_max_iops||'
+,'||v_audit_files_size||'
+,'||v_memory_max_target||'
+,'||v_diagnostics_size||'
+,'''||lower(v_server_host)||'''
+,'||v_db_cache_size||'
+,'||v_max_iops_24h||'
+,'||v_max_iombps_24h||'
+,'||v_max_avg_cpu_utilization_24h||'
+,'''||v_rdbms_version||''');');
+  end loop;
+end;
+/
+"
+
+# Here escape $ with 3 slash
+SERVICE_INFO_SQL="set heading off
+set feedback off
+set linesize 2000
+set serveroutput on
+whenever sqlerror exit 1
+select 'insert into ${SCHEMA_TO_INSERT_INTO}.ora_services (collection_date,db_name,database_role,server_host,db_unique_name,instance_name,pdb_name,service_name) values(${NOW_STRING_DATE_TYPE_IN_SQL},'||
+''''||lower(SYS_CONTEXT('USERENV','DB_NAME'))||''','''||lower(SYS_CONTEXT('USERENV','DATABASE_ROLE'))||''','''||lower(SYS_CONTEXT('USERENV','SERVER_HOST'))||''','''||lower(SYS_CONTEXT('USERENV','DB_UNIQUE_NAME'))||''','''||lower(SYS_CONTEXT('USERENV','INSTANCE_NAME'))||''','''||lower(vas.con_name)||''','''||lower(vas.name)||''');'
+from V\\\$ACTIVE_SERVICES vas, v\\\$INSTANCE vi;
+"
+
+# Here escape $ with 3 slash
+NUMBER_OF_PDBS_IN_DB_SQL="set heading off
+set feedback off
+set linesize 2000
+set serveroutput on
+select count(*) from v\\\$pdbs where lower(NAME)<>'pdb\\\$seed';
+"
+
+# Here escape $ with 3 slash
+PDB_NAME_IN_DB_SQL="set heading off
+set feedback off
+set linesize 2000
+set serveroutput on
+select lower(NAME) from v\\\$PDBS
+where lower(NAME) <> 'pdb\\\$seed'
+and ROWNUM = 1;
+"
+
+#
+# check_ssh
+#
+# Purpose: Used for a simple check om ssh euivalency is working from this node
+#          Maybe extend to also check from the other nodes (e.g. all can reach al)
+#
+#          Will exit error if it fails
+#          xx
+check_ssh()
+{
+  echo "   DEBUG: Entered function: $FUNCNAME"
+  nodes_in_cluster=$( get_nodes )  
+  for node in $nodes_in_cluster
+  do
+    echo -n "    INFO: testing ssh connectivity to ${node}: "
+    timeout 30 ssh ${node} date >>/dev/null 2>&1
+    if [ $? -ne 0 ]
+    then
+      echo -e "\n ERROR: Failed contacting host ${node} using ssh (timeout 30 seconds)"
+      exit 1
+    else
+      echo "OK"
+    fi
+  done
+}
+
+#
+# create_lock_dir
+#
+# Purpose: Try to create the lock dir. If it fails give an error and exit
+#
+create_lock_dir()
+{
+  # If there is a lock dir and it's more than 22 hours old, then remove it
+  if [ -d $LOCK_DIR ]
+  then
+    # Added removal of "old" directories as they can be left when node crashes
+    # Directory exists get create date
+    create_date_since_epoch=$( stat --format="%Z" $LOCK_DIR)
+    if [ $? -eq 0 ]
+    then
+      # Get now in epoch time
+      now_since_epoch=$(date +%s)
+      seconds_old=$((now_since_epoch-create_date_since_epoch))
+      if [ $seconds_old -gt 79200 ]
+      then
+        # 22 hours old, lets remove it
+        echo "Will try to: rmdir $LOCK_DIR as directory is $seconds_old (greater than 79200)"
+        rmdir $LOCK_DIR
+      fi
+    fi
+  fi
+  # If we can't create then maybe someone else is using script (should be on a shared file system)
+  if ! mkdir $LOCK_DIR
+  then
+     echo " ERROR: Could not get lock on $LOCK_DIR. Somebody else might be running the script. If"
+     echo "        you are sure nobody else runs the script then remove the above directory and rerun"
+     exit 1
+  fi
+}
+
+#
+# remove_lock_dir
+#
+# Purpose: Remove the lock dir. Should be called from trap, so we arealways sure the script finishes with this
+#
+remove_lock_dir()
+{
+  rmdir $LOCK_DIR
+}
+
+
+#
+# show_help
+#
+# Purpose: Show some help
+#
+# Prereq:  None specific
+show_help()
+{
+  # Make sure defaults are shown with values specified in the default section
+  # They could have be ovewritten with command line parameters
+  configure_defaults
+  echo "Command: $0"
+  echo "This command will fetch various information for a RAC/ASM cluster."
+  echo "This includes information about databases/instances/disk usage/hosts."
+  echo "For each of these objects a number of attributes will be fetched and"
+  echo "presented in a txt and sql file. If a configuration file named"
+  echo "exacapacity-upload.conf exists in the same directory as the"
+  echo "script it will for each line in that file that should contains a logical"
+  echo "name seprated by a space from the tns_description run SQL*Plus"
+  echo "against the generated sql file. A feature exists that will handle errors"
+  echo "while uploading the file and do a retry until files are either cleaned up"
+  echo "or the upload succeeds."
+  echo ""
+  echo "It will also handle cleaning logs and other files to avoid uncontrolled growth"
+  echo ""  
+  echo "The script has the following options"
+  echo ""    
+  echo "--help"
+  echo "    will show this help."
+  echo ""    
+  echo "--minutesToKeepFiles <minutes>"
+  echo "    This value determines for how long all sql/txt/log files are kept."
+  echo "    Files will be deleted even if they have not been uploaded correctly"
+  echo "    Default is 10080 minutes (7 days)."
+  echo ""
+  echo "--skipUploading"
+  echo "    When this option is set data will not be uploaded for the given run."
+  echo "    Also the cleanup routines are not executed. Used for getting data"
+  echo "    without upload data. Can't be used with --onlyUpload"
+  echo ""
+  echo "--onlyUpload"
+  echo "    When this option is set data will be uploaded for all failed runs."
+  echo "    The cleanup routines are executed as normal. Used for retrying uploading"
+  echo "    failed uploads withour recollecting data. Can't be used with --skipUploading"
+  echo ""
+  echo "--pathToNdchargectlFiles"
+  echo "    This parameter tells where to store files to be uploaded to NIOR."
+  echo "    They will be kept there for --minutesToKeepFiles if something"
+  echo "    initially fails"
+}
+
+#
+# check_arguments
+#
+# Purpose: checks if all arguments given on command line is valid
+#
+check_arguments()
+{
+  if [ "$SKIP_UPLOADING" = "Y" -a "$ONLY_UPLOAD" = "Y" ]
+  then
+    echo "  ERROR: --onlyUpload and --skipUploading can't be used together"
+    exit 1
+  fi    
+  # Check that minutes to keep files is numeric
+  if ! [[ $MINUTES_TO_KEEP_FILES =~ ^[0-9]+$ ]]
+  then
+    echo "  ERROR: parameter give to option --minutesToKeepFiles needs to be a positive integer"
+    exit 1
+  fi
+  if [ ! -d ${PATH_TO_NDCHARGECTL_FILES} ]
+  then
+    echo "  ERROR: --pathToNdchargectlFiles points to a non existing directory (${PATH_TO_NDCHARGECTL_FILES})"
+    exit 1
+  fi
+}
+
+
+#
+# Parse arguments
+#
+# Purpose: Parses all the arguments received on command line
+#
+parse_arguments()
+{
+  while [ $# -gt 0 ]
+  do
+    case $1 in
+      --help)                             show_help;exit;;      
+      --minutesToKeepFiles) shift; MINUTES_TO_KEEP_FILES=$1;;
+      --skipUploading) SKIP_UPLOADING="Y";;
+      --onlyUpload) ONLY_UPLOAD="Y";;
+      --pathToNdchargectlFiles) shift; PATH_TO_NDCHARGECTL_FILES=$1;;
+      *)            echo " ERROR: Parameter $1 given to script not recognized. Use --help option to get help";exit 1;;
+    esac;
+    shift
+  done
+}
+
+#
+# build_environment_names
+#
+# Purpose: Build some environment names based on parameters
+#          given to script plus other variables needed
+#
+build_environment_names()
+{
+  # The hostname without domain
+  SHORT_HOST_NAME=${HOSTNAME%%.*}
+  # Domainame
+  DOMAIN_NAME=${HOSTNAME#*.}
+  # Used when request on command line
+  LOCK_DIR=${PATH_TO_NDCHARGECTL_FILES}/conf/.lock_dir_for_ndchargectl 
+  # The script name that is running
+  SCRIPT_NAME=${0##*/}
+  # The relative path to the script
+  SCRIPT_PATH=${0%/*}
+  case "$SCRIPT_PATH" in
+    /*)
+      # Full patch given, use that
+      SCRIPT_PATH=$SCRIPT_PATH;;
+    *)
+      # Relative path given
+      SCRIPT_PATH=$PWD/$SCRIPT_PATH;;
+  esac
+  # The upload conf file
+  DB_UPLOAD_CONF="${PATH_TO_NDCHARGECTL_FILES}/conf/ndchargectl.conf"
+  # The data files names start with
+  DATA_FILE_START="${PATH_TO_NDCHARGECTL_FILES}/upload/ndchargectl-data"  
+  
+  # Build a couple of variable holding all the nodes or the
+  # the ones that have been specified as parameter
+  # Was CLUSTER_NODES explicitely not asked for?
+  if [ "$CLUSTER_NODES" = "" ]
+  then
+    # Find the GRID ORACLE_HOME (maybe check it's not empty
+    GRID_ORACLE_HOME=$(find_grid_home)
+    # Get the cluster name
+    GRID_CLUSTER_NAME=`$GRID_ORACLE_HOME/bin/cemutlo -n`
+    # Get ASM Instance on this box
+    GRID_ASM_INSTANCE=`ps -ef | grep pmon_+ASM | grep asm_ | sed -n "s/.*\(+ASM[0123456789][0123456789]*\)/\1/p"`
+    # Get the information for some asm instance that we can use for sqlplus
+    # THe asm node
+    ACTIVE_ASM_NODE=$(${GRID_ORACLE_HOME}/bin/srvctl status ASM | sed -n "s/ASM[[:space:]]\+is[[:space:]]\+running[[:space:]]\+on[[:space:]]\+\([^,]*\).*/\1/p")
+    #The ASM SID
+    ACTIVE_ASM_SID=$(ssh ${ACTIVE_ASM_NODE} ps -ef | grep pmon_+ASM | grep asm_ | sed -n "s/.*\(+ASM[0123456789][0123456789]*\)/\1/p")    
+    # Get a list of all nodes in cluster
+    RAC_NODES=`$GRID_ORACLE_HOME/bin/olsnodes`
+    RAC_NODES=`echo $RAC_NODES`
+    for RAC_NODE in $RAC_NODES
+    do
+      if [ "$CLUSTER_NODES" = "" ]
+      then
+        CLUSTER_NODES="$RAC_NODE"
+      else
+        CLUSTER_NODES="$CLUSTER_NODES,$RAC_NODE"
+      fi
+    done
+  else
+    for RAC_NODE in ${CLUSTER_NODES//,/ }
+    do
+      if [ "$RAC_NODES" = "" ]
+      then
+        RAC_NODES="$RAC_NODE"
+      else
+        RAC_NODES="$RAC_NODES $RAC_NODE"
+      fi
+    done
+  fi
+}
+
+collect_data()
+{
+  # Find ASM DISK on CLUSTER
+  #ASM_TOTAL_DISK_USAGE_RESULT=`export ORACLE_SID=${GRID_ASM_INSTANCE}; export ORACLE_HOME=${GRID_ORACLE_HOME}; echo "$ASM_TOTAL_DISK_USAGE"|${GRID_ORACLE_HOME}/bin/sqlplus -S / as sysdba`
+  #echo "$ASM_TOTAL_DISK_USAGE_RESULT"
+  # Find all the databases and homes and versions
+  DISKGROUP_COUNTER=0
+  while read LINE; do
+  	# If empty lines skip them
+  	if [ "$LINE" = "" ]; then continue; fi 
+  	#echo "Line $DISKGROUP_COUNTER: $LINE"
+  	# Parse the line
+  	FIRST_BITE=${LINE%%,*}
+  	LINE=${LINE#*,}
+  	SECOND_BITE=${LINE%%,*}
+  	LINE=${LINE#*,}
+  	THIRD_BITE=${LINE%%,*}
+  	LINE=${LINE#*,}
+  	FOURTH_BITE=${LINE#*,}
+  	ASM_DISKGROUP[$DISKGROUP_COUNTER]=${FIRST_BITE#*=}
+  	ASM_GB_TOTAL[$DISKGROUP_COUNTER]=${SECOND_BITE#*=}
+  	ASM_GB_FREE[$DISKGROUP_COUNTER]=${THIRD_BITE#*=}
+  	ASM_GB_USABLE[$DISKGROUP_COUNTER]=${FOURTH_BITE#*=}
+    (( DISKGROUP_COUNTER++ ))
+  #done < <(ssh ${ACTIVE_ASM_NODE} "export ORACLE_SID=${ACTIVE_ASM_SID}; export ORACLE_HOME=${GRID_ORACLE_HOME}; echo "$ASM_TOTAL_DISK_USAGE"|${GRID_ORACLE_HOME}/bin/sqlplus -S / as sysdba)
+  done < <(ssh ${ACTIVE_ASM_NODE} "export ORACLE_SID=${ACTIVE_ASM_SID}; export ORACLE_HOME=${GRID_ORACLE_HOME}; ${GRID_ORACLE_HOME}/bin/sqlplus -S / as sysdba <<EOF
+$ASM_TOTAL_DISK_USAGE
+EOF
+")
+  # Find ASM DISK on databases
+  #ASM_DATABASE_DISK_USAGE_RESULT=`export ORACLE_SID=${GRID_ASM_INSTANCE}; export ORACLE_HOME=${GRID_ORACLE_HOME}; echo "$ASM_DATABASE_DISK_USAGE"|${GRID_ORACLE_HOME}/bin/sqlplus -S / as sysdba`
+  #echo "$ASM_DATABASE_DISK_USAGE_RESULT"
+  DISKASM_COUNTER=0
+  while read LINE; do
+  	# If empty lines skip them
+  	if [ "$LINE" = "" ]; then continue; fi 
+  	#echo "Line $DISKASM_COUNTER: $LINE"
+  	# Parse the line
+  	FIRST_BITE=${LINE%%,*}
+  	LINE=${LINE#*,}
+  	SECOND_BITE=${LINE%%,*}
+  	LINE=${LINE#*,}
+  	THIRD_BITE=${LINE#*,}
+  	ASM_DB_NAME[$DISKASM_COUNTER]=${FIRST_BITE#*=}
+  	ASM_DB_DISKGROUPL[$DISKASM_COUNTER]=${SECOND_BITE#*=}
+  	ASM_DB_GB_USED[$DISKASM_COUNTER]=${THIRD_BITE#*=}
+    (( DISKASM_COUNTER++ ))
+  #done < <(export ORACLE_SID=${GRID_ASM_INSTANCE}; export ORACLE_HOME=${GRID_ORACLE_HOME}; echo "$ASM_DATABASE_DISK_USAGE"|${GRID_ORACLE_HOME}/bin/sqlplus -S / as sysdba)  
+  done < <(ssh ${ACTIVE_ASM_NODE} "export ORACLE_SID=${ACTIVE_ASM_SID}; export ORACLE_HOME=${GRID_ORACLE_HOME}; ${GRID_ORACLE_HOME}/bin/sqlplus -S / as sysdba <<EOF
+$ASM_DATABASE_DISK_USAGE
+EOF
+")
+
+  
+  # Find stuff like memory on the db nodes
+  node_counter=0
+  for RAC_NODE in $RAC_NODES; do
+    RAC_NODE_NAME[$node_counter]=$RAC_NODE
+    memory_found_kb=`ssh $RAC_NODE cat /proc/meminfo | grep MemTotal: | sed 's/MemTotal:[[:blank:]]*\(.*\)[[:blank:]].*/\1/'`
+    (( RAC_NODE_MEMTOTAL[$node_counter] = $memory_found_kb * 1024 ))
+    #echo "Memory on ${RAC_NODE_NAME[$node_counter]}: ${RAC_NODE_MEMTOTAL[$node_counter]}"
+    RAC_NODE_CPUS[$node_counter]=`ssh $RAC_NODE grep -c processor /proc/cpuinfo`
+    #echo "CPUs on ${RAC_NODE_NAME[$node_counter]}: ${RAC_NODE_CPUS[$node_counter]}"
+    hugepagesize=`ssh $RAC_NODE cat /proc/meminfo | grep Hugepagesize: | sed 's/Hugepagesize:[[:blank:]]*\(.*\)[[:blank:]].*/\1/'`
+    hugepages_total_kb=`ssh $RAC_NODE cat /proc/meminfo | grep HugePages_Total: | sed 's/HugePages_Total:[[:blank:]]*\(.*\)/\1/'`
+    hugepages_free_kb=`ssh $RAC_NODE cat /proc/meminfo | grep HugePages_Free: | sed 's/HugePages_Free:[[:blank:]]*\(.*\)/\1/'`
+    memfree_kb=`ssh $RAC_NODE cat /proc/meminfo | grep MemFree: | sed 's/MemFree:[[:blank:]]*\(.*\)[[:blank:]].*/\1/'`
+    (( RAC_NODE_HUGEPAGES_TOTAL[$node_counter] = $hugepagesize * $hugepages_total_kb * 1024 ))
+    (( RAC_NODE_HUGEPAGES_FREE[$node_counter] = $hugepagesize * $hugepages_free_kb * 1024 ))
+    (( RAC_NODE_MEMFREE[$node_counter] = $memfree_kb * 1024 ))
+    #echo "Hugepage total memory on ${RAC_NODE_NAME[$node_counter]}: ${RAC_NODE_HUGEPAGES_TOTAL[$node_counter]}"
+    (( node_counter++ ))
+  done
+  
+  
+  # Find all the databases and homes and versions
+  DB_COUNTER=0
+  INSTANCE_COUNTER=0
+  while read LINE; do
+    CLUSTER_DB_NAMES[$DB_COUNTER]=`echo "$LINE" | cut -f 1`
+    CLUSTER_DB_HOMES[$DB_COUNTER]=`echo "$LINE" | cut -f 2`
+    CLUSTER_DB_VERSIONS[$DB_COUNTER]=`echo "$LINE" | cut -f 3`
+    (( DB_COUNTER++ ))
+  done < <($GRID_ORACLE_HOME/bin/srvctl config database -verbose)
+  # Find instances
+  for count in ${!CLUSTER_DB_NAMES[*]}
+  do
+    while read LINE2; do
+      CLUSTER_INSTANCE_DB_ID[$INSTANCE_COUNTER]=$count
+      #echo "####"
+      #echo $LINE2
+      CLUSTER_INSTANCE_NAME[$INSTANCE_COUNTER]=`echo "$LINE2" | sed 's/Instance[[:blank:]]*\([^ \t]*\).*/\1/'`
+      #echo ${CLUSTER_INSTANCE_NAME[$INSTANCE_COUNTER]}
+      CLUSTER_INSTANCE_STATUS[$INSTANCE_COUNTER]=`echo "$LINE2" | sed 's/Instance[[:blank:]]*[^ \t]*[[:blank:]]*is[[:blank:]]*\(.*\)[[:blank:]]on[[:blank:]]node.*/\1/' `
+      #echo ${CLUSTER_INSTANCE_STATUS[$INSTANCE_COUNTER]}
+      CLUSTER_INSTANCE_HOST[$INSTANCE_COUNTER]=`echo "$LINE2" | sed 's/.*[[:blank:]]\([^\t]*\)$/\1/' `
+      #echo ${CLUSTER_INSTANCE_HOST[$INSTANCE_COUNTER]}
+      (( INSTANCE_COUNTER++ ))
+    done < <(export ORACLE_HOME=${CLUSTER_DB_HOMES[$count]};${CLUSTER_DB_HOMES[$count]}/bin/srvctl status database -d ${CLUSTER_DB_NAMES[$count]})
+  done
+  # Get relevant parameters for the instances that are active
+  for count in ${!CLUSTER_INSTANCE_DB_ID[@]}
+  do
+    db_id=${CLUSTER_INSTANCE_DB_ID[$count]}
+    #echo ${CLUSTER_INSTANCE_STATUS[$count]}
+    if [ "${CLUSTER_INSTANCE_STATUS[$count]}" = "running" ]
+    then
+      #echo "Check ${CLUSTER_INSTANCE_NAME[$count]} on ${CLUSTER_INSTANCE_HOST[$count]}"
+      PARAMETER_VALUES=`ssh ${CLUSTER_INSTANCE_HOST[$count]} "export ORACLE_SID=${CLUSTER_INSTANCE_NAME[$count]}; export ORACLE_HOME=${CLUSTER_DB_HOMES[$db_id]}; echo \"$PARAMETER_SQL_PLUS\"|${CLUSTER_DB_HOMES[$db_id]}/bin/sqlplus -S / as sysdba"`
+      if [ $? -eq 0 ]
+      then
+        #echo "$PARAMETER_VALUES"
+        #echo $PARAMETER_VALUES | sed 's/.*cpu_count=\([^ \t]*\).*/\1/'
+        CLUSTER_INSTANCE_CPU_COUNT[$count]=`echo $PARAMETER_VALUES | sed 's/.*cpu_count=\([^ \t]*\).*/\1/'`
+        CLUSTER_INSTANCE_SGA_MAX_SIZE[$count]=`echo $PARAMETER_VALUES | sed 's/.*sga_max_size=\([^ \t]*\).*/\1/'`
+        CLUSTER_INSTANCE_PGA_AGGREGATE_TARGET[$count]=`echo $PARAMETER_VALUES | sed 's/.*pga_aggregate_target=\([^ \t]*\).*/\1/'`
+        CLUSTER_INSTANCE_MEMORY_MAX_TARGET[$count]=`echo $PARAMETER_VALUES | sed 's/.*memory_max_target=\([^ \t]*\).*/\1/'`
+        CLUSTER_INSTANCE_USE_LARGE_PAGES[$count]=`echo $PARAMETER_VALUES | sed 's/.*use_large_pages=\([^ \t]*\).*/\1/'`
+        CLUSTER_INSTANCE_ARCHIVE_PR_DAY_MB[$count]=`echo $PARAMETER_VALUES | sed 's/.*archive_pr_day_mb=\([^ \t]*\).*/\1/'`
+      else
+        # Somehow querying the db failed, return empty stuff
+        CLUSTER_INSTANCE_CPU_COUNT[$count]=""
+        CLUSTER_INSTANCE_SGA_MAX_SIZE[$count]=""
+        CLUSTER_INSTANCE_PGA_AGGREGATE_TARGET[$count]=""
+        CLUSTER_INSTANCE_MEMORY_MAX_TARGET[$count]=""
+        CLUSTER_INSTANCE_USE_LARGE_PAGES[$count]=""
+        CLUSTER_INSTANCE_ARCHIVE_PR_DAY_MB[$count]=""
+      fi
+      #set -x
+      IS_DB_CDB=`ssh ${CLUSTER_INSTANCE_HOST[$count]} "export ORACLE_SID=${CLUSTER_INSTANCE_NAME[$count]}; export ORACLE_HOME=${CLUSTER_DB_HOMES[$db_id]}; echo \"$IS_DB_CDB_SQL\"|${CLUSTER_DB_HOMES[$db_id]}/bin/sqlplus -S / as sysdba"`
+      IS_DB_CDB=$(echo $IS_DB_CDB)
+      if [ "$IS_DB_CDB" = "YES" ]
+      then
+        #echo "count=$count, will run on host ${CLUSTER_INSTANCE_HOST[$count]}, instance ${CLUSTER_INSTANCE_NAME[$count]}"
+        # Collect PDB info
+        #echo "DB IS CDB"
+        CLUSTER_INSTANCE_PDB_INFO_INSERT_SQL[$count]=`ssh ${CLUSTER_INSTANCE_HOST[$count]} "export ORACLE_SID=${CLUSTER_INSTANCE_NAME[$count]}; export ORACLE_HOME=${CLUSTER_DB_HOMES[$db_id]}; echo \"$PDB_INFO_SQL\"|${CLUSTER_DB_HOMES[$db_id]}/bin/sqlplus -S / as sysdba"`
+        #echo $?
+        #echo "$PDB_INFO_INSERT_SQL"
+        # Get service information
+        CLUSTER_INSTANCE_SERVICE_INFO_INSERT_SQL[$count]=`ssh ${CLUSTER_INSTANCE_HOST[$count]} "export ORACLE_SID=${CLUSTER_INSTANCE_NAME[$count]}; export ORACLE_HOME=${CLUSTER_DB_HOMES[$db_id]}; echo \"$SERVICE_INFO_SQL\"|${CLUSTER_DB_HOMES[$db_id]}/bin/sqlplus -S / as sysdba"`
+        #echo "${CLUSTER_INSTANCE_SERVICE_INFO_INSERT_SQL[$count]}"
+        # Here add BCA pseudo service to instance if database service is Bca or Ha
+        # First find number of pdb's in database
+        NUMBER_OF_PDBS_IN_DB=`ssh ${CLUSTER_INSTANCE_HOST[$count]} "export ORACLE_SID=${CLUSTER_INSTANCE_NAME[$count]}; export ORACLE_HOME=${CLUSTER_DB_HOMES[$db_id]}; echo \"$NUMBER_OF_PDBS_IN_DB_SQL\"|${CLUSTER_DB_HOMES[$db_id]}/bin/sqlplus -S / as sysdba"`
+        NUMBER_OF_PDBS_IN_DB=$(echo $NUMBER_OF_PDBS_IN_DB)
+        if [ "$NUMBER_OF_PDBS_IN_DB" = "1" ]
+        then
+          # Now test if database is HA/BCA and environment is one of dev/test/preprod/prod (kind of all for now)
+          if [[ ${CLUSTER_DB_NAMES[$db_id]} =~ [hb][0-9]*[stdp][0-9]. ]]
+          then
+            # Find the single pd name
+            PDB_NAME_IN_DB=`ssh ${CLUSTER_INSTANCE_HOST[$count]} "export ORACLE_SID=${CLUSTER_INSTANCE_NAME[$count]}; export ORACLE_HOME=${CLUSTER_DB_HOMES[$db_id]}; echo \"$PDB_NAME_IN_DB_SQL\"|${CLUSTER_DB_HOMES[$db_id]}/bin/sqlplus -S / as sysdba"`
+            PDB_NAME_IN_DB=$(echo $PDB_NAME_IN_DB)            
+            #echo "Add pseudo service"
+            SERVICE_INFO_PSEUDO_SQL="set heading off
+set feedback off
+set linesize 2000
+set serveroutput on
+whenever sqlerror exit 1
+select 'insert into ${SCHEMA_TO_INSERT_INTO}.ora_services (collection_date,db_name,database_role,server_host,db_unique_name,instance_name,pdb_name,service_name) values(${NOW_STRING_DATE_TYPE_IN_SQL},'||
+''''||lower(SYS_CONTEXT('USERENV','DB_NAME'))||''','''||lower(SYS_CONTEXT('USERENV','DATABASE_ROLE'))||''','''||lower(SYS_CONTEXT('USERENV','SERVER_HOST'))||''','''||lower(SYS_CONTEXT('USERENV','DB_UNIQUE_NAME'))||
+''','''||lower(SYS_CONTEXT('USERENV','INSTANCE_NAME'))||''',''${PDB_NAME_IN_DB}'',''pseudo_alone_in_ha_bca'');'
+from dual;
+"
+            CLUSTER_INSTANCE_SERVICE_INFO_PSEUDO_INSERT_SQL[$count]=`ssh ${CLUSTER_INSTANCE_HOST[$count]} "export ORACLE_SID=${CLUSTER_INSTANCE_NAME[$count]}; export ORACLE_HOME=${CLUSTER_DB_HOMES[$db_id]}; echo \"$SERVICE_INFO_PSEUDO_SQL\"|${CLUSTER_DB_HOMES[$db_id]}/bin/sqlplus -S / as sysdba"`
+          fi
+        fi
+      fi
+      #set +x
+    fi;
+  done
+  
+  
+  
+  # We will create two data sets
+  # One will hold the
+  #   database_name, service_name and pdb_name
+  # the other will hold
+  #   database_name, service_name, server, target_state, current_state
+  # Used to store the service info
+  store_service()                
+  {
+    local service=$4
+    global_database[$service]="$1"
+    global_instanse[$service]="$2"
+    global_reason[$service]="$3"
+    global_preferred_instances[$service]="$5"
+    global_available_instances[$service]="$6"
+    global_service_role[$service]="$7"
+    global_pluggable_database_name[$service]="$8"
+    global_oracle_home[$service]="$9"
+    #echo "global_database[$service]: ${global_database[$service]} "
+    #echo "global_instanse[$service]: ${global_instanse[$service]} "
+    #echo "global_reason[$service]: ${global_reason[$service]} "
+    #echo "global_preferred_instances[$service]: ${global_preferred_instances[$service]} "
+    #echo "global_available_instances[$service]: ${global_available_instances[$service]} "
+    #echo "global_service_role[$service]: ${global_service_role[$service]} "
+    #echo "global_pluggable_database_name[$service]: ${global_pluggable_database_name[$service]} "
+    #echo "global_oracle_home[$service]: ${global_oracle_home[$service]} "
+  }
+#  ##/u01/app/18.3.0.0/grid/bin/crsctl status resource -w "TYPE == ora.service.type" -l
+#  #NAME=ora.s0008t1o.wft.svc
+#  #TYPE=ora.service.type
+#  #TARGET=ONLINE
+#  #STATE=ONLINE on db-s001oe04d
+#  #
+#  #NAME=ora.s0008t1o.wft_ro.svc
+#  #TYPE=ora.service.type
+#  #TARGET=OFFLINE
+#  #STATE=OFFLINE
+#  #
+#  #NAME=ora.s0064t1o.rman_s0064t1o.svc
+#  #TYPE=ora.service.type
+#  #TARGET=ONLINE                , ONLINE                , ONLINE                , ONLINE
+#  #STATE=ONLINE on db-s001oe03d, ONLINE on db-s001oe01d, ONLINE on db-s001oe02d, ONLINE on db-s001oe04d
+#  #
+#  #NAME=ora.s0064t1o.s0064t.svc
+#  #TYPE=ora.service.type
+#  #TARGET=ONLINE                , ONLINE                , ONLINE                , ONLINE
+#  #STATE=ONLINE on db-s001oe03d, ONLINE on db-s001oe01d, ONLINE on db-s001oe02d, ONLINE on db-s001oe04d
+#  #
+#  #NAME=ora.s0064t1o.s0064t_ro.svc
+#  #TYPE=ora.service.type
+#  #TARGET=OFFLINE, OFFLINE, OFFLINE, OFFLINE
+#  #STATE=OFFLINE, OFFLINE, OFFLINE, OFFLINE
+#  #
+#  #NAME=ora.z9999t1o.rman_z9999t1o.svc
+#  #TYPE=ora.service.type
+#  #TARGET=ONLINE                , ONLINE                , ONLINE                , ONLINE
+#  #STATE=ONLINE on db-s001oe04d, ONLINE on db-s001oe01d, ONLINE on db-s001oe02d, ONLINE on db-s001oe03d
+#  #
+#  #NAME=ora.z9999t1o.s_stemp_50oi_18121010_s.svc
+#  #TYPE=ora.service.type
+#  #TARGET=ONLINE
+#  #STATE=ONLINE on db-s001oe01d
+#  #
+#  #NAME=ora.z9999t1o.stemps.svc
+#  #TYPE=ora.service.type
+#  #TARGET=ONLINE
+#  #STATE=ONLINE on db-s001oe02d
+#  #
+#  #NAME=ora.z9999t1o.stemps_ro.svc
+#  #TYPE=ora.service.type
+#  #TARGET=OFFLINE
+#  #STATE=OFFLINE
+#  #
+#  #NAME=ora.z9999t1o.z9999t.svc
+#  #TYPE=ora.service.type
+#  #TARGET=ONLINE                , ONLINE                , ONLINE                , ONLINE
+#  #STATE=ONLINE on db-s001oe04d, ONLINE on db-s001oe01d, ONLINE on db-s001oe02d, ONLINE on db-s001oe03d
+#  #
+#  #NAME=ora.z9999t1o.z9999t_ro.svc
+#  #TYPE=ora.service.type
+#  #TARGET=OFFLINE, OFFLINE, OFFLINE, OFFLINE
+#  #STATE=OFFLINE, OFFLINE, OFFLINE, OFFLINE
+#  
+#  ##/u01/app/18.3.0.0/grid/bin/crsctl status resource -w "TYPE == ora.service.type" -p  
+#  #NAME=ora.s9004s1o.s_aj1gb_50oi_19032517_s.svc
+#  #TYPE=ora.service.type
+#  #ACL=owner:oracle:rwx,pgrp:oinstall:r--,other::r--,group:dba:r-x,group:oper:r-x,group:racdba:r-x,user:grid:r-x
+#  #ACTIONS=isJavaService,group:"dba",group:"oper",group:"racdba",user:"grid",user:"oracle"
+#  #ACTION_SCRIPT=
+#  #ACTION_TIMEOUT=60
+#  #ACTIVE_PLACEMENT=0
+#  #AGENT_FILENAME=%CRS_HOME%/bin/oraagent%CRS_EXE_SUFFIX%
+#  #AGENT_PARAMETERS=
+#  #ALLOW_RESTART=default
+#  #AQ_HA_NOTIFICATION=0
+#  #AUTO_START=restore
+#  #CARDINALITY=1
+#  #CHECK_INTERVAL=0
+#  #CHECK_TIMEOUT=30
+#  #CLB_GOAL=LONG
+#  #CLEAN_TIMEOUT=60
+#  #COMMIT_OUTCOME=0
+#  #CSS_CRITICAL=no
+#  #DELETE_TIMEOUT=60
+#  #DESCRIPTION=Oracle Service resource
+#  #DRAIN_ID=
+#  #DRAIN_TIMEOUT=
+#  #DTP=0
+#  #EDITION=
+#  #ENABLED=1
+#  #FAILOVER_DELAY=0
+#  #FAILOVER_METHOD=
+#  #FAILOVER_RESTORE=NONE
+#  #FAILOVER_RETRIES=
+#  #FAILOVER_TYPE=
+#  #FAILURE_INTERVAL=0
+#  #FAILURE_THRESHOLD=0
+#  #GEN_SERVICE_NAME=s_aj1gb_50oi_19032517_s
+#  #GLOBAL=false
+#  #GSM_FLAGS=0
+#  #HOSTING_MEMBERS=
+#  #HUB_SERVICE=
+#  #IGNORE_TARGET_ON_FAILURE=no
+#  #INSTANCE_FAILOVER=1
+#  #INTERMEDIATE_TIMEOUT=0
+#  #LOAD=1
+#  #LOGGING_LEVEL=1
+#  #MANAGEMENT_POLICY=AUTOMATIC
+#  #MAX_LAG_TIME=ANY
+#  #MODIFY_TIMEOUT=60
+#  #NLS_LANG=
+#  #OFFLINE_CHECK_INTERVAL=0
+#  #PLACEMENT=restricted
+#  #PLUGGABLE_DATABASE=p_aj1gb_50oi_19032517_s
+#  #RELOCATE_BY_DEPENDENCY=1
+#  #RELOCATE_KIND=online
+#  #REPLAY_INITIATION_TIME=300
+#  #RESOURCE_GROUP=
+#  #RESTART_ATTEMPTS=0
+#  #RESTART_DELAY=0
+#  #RETENTION=86400
+#  #RF_SERVICE=0
+#  #RLB_GOAL=NONE
+#  #ROLE=PRIMARY PHYSICAL_STANDBY
+#  #SCRIPT_TIMEOUT=60
+#  #SERVER_CATEGORY=
+#  #SERVER_POOLS=ora.s9004s1o_s_aj1gb_50oi_19032517_s
+#  #SERVICE_NAME=s_aj1gb_50oi_19032517_s
+#  #SERVICE_NAME_PQ=
+#  #SERVICE_TYPE=MAIN
+#  #SESSION_NOREPLAY=false
+#  #SESSION_STATE_CONSISTENCY=DYNAMIC
+#  #SQL_TRANSLATION_PROFILE=
+#  #START_CONCURRENCY=0
+#  #START_DEPENDENCIES=hard(ora.s9004s1o.db,type:ora.cluster_vip_net1.type) weak(type:ora.listener.type) pullup(type:ora.cluster_vip_net1.type) pullup:always(ora.s9004s1o.db)
+#  #START_DEPENDENCIES_RTE_INTERNAL=<xml><Cond name="SERVICE_TYPE">MAIN</Cond><Cond name="isCluster">True</Cond><Cond name="isCreatePreconnectSrv">False</Cond><Arg name="database" type="Res">ora.s9004s1o.db</Arg><Cond name="UPDATE_SERVICE_TYPE">False</Cond><Cond name="SERVICE_CARDINALITY">0</Cond><Cond name="ADD_PULLUP_ALWAYS_DB">True</Cond><Cond name="UPDATE_VIP_TYPE">False</Cond><Cond name="DB_MANAGEMENT_POLICY">AUTOMATIC</Cond><Arg name="cluster_vip_net" type="ResList">ora.cluster_vip_net1.type</Arg></xml>
+#  #START_DEPENDENCIES_TEMPLATE=<xml><If cond="SERVICE_TYPE" value="PQ"> <Then>hard(global:<Res>{mainService}</Res>)</Then> <Else>weak(type:ora.listener.type)</Else> </If><If cond="SERVICE_TYPE" value="RF"> <Then>hard(global:<Res>{hubService}</Res>)</Then> </If><If cond="isCluster" value="True"> <Then><If cond="isCreatePreconnectSrv" value="True"> <Then>hard(<Res>global:{service}</Res>)hard(<Res>{database}</Res>)exclusion(<Res>{service}</Res>)<If cond="ADD_PULLUP_ALWAYS_SVC" value="True"> <Then>pullup:always(<Res>global:{service}</Res>)</Then> <Else>pullup(<Res>global:{service}</Res>)</Else> </If></Then> <Else>hard(<Res>{database}</Res>)<If cond="UPDATE_SERVICE_TYPE" value="False"> <Then><If cond="SERVICE_CARDINALITY" value="1"> <Then><If cond="NET_NUM" op="neq" value="-1"> <Then>dispersion(type:ora.service.type)</Then> </If></Then> </If></Then> </If><If cond="ADD_PULLUP_ALWAYS_DB" value="True"> <Then>pullup:always(<Res>{database}</Res>) </Then> <Else>pullup(<Res>{database}</Res>) </Else> </If><If cond="UPDATE_VIP_TYPE" value="False"> <Then><If cond="DB_MANAGEMENT_POLICY" op="neq" value="NORESTART"> <Then>pullup(<ResTypeList>{cluster_vip_net}</ResTypeList>)</Then> </If></Then> </If></Else> </If>hard(<ResTypeList>{cluster_vip_net}</ResTypeList>)</Then> <Else>hard(<Res>{database}</Res>)<If cond="ADD_PULLUP_ALWAYS_DB" value="True"> <Then>pullup:always(<Res>{database}</Res>) </Then> <Else>pullup(<Res>{database}</Res>)</Else> </If></Else> </If><If cond="UPDATE_VIP_TYPE" value="True"> <Then><If cond="DB_MANAGEMENT_POLICY" op="neq" value="NORESTART"> <Then>pullup(<ResTypeList>{cluster_vip_net}</ResTypeList>)</Then> </If></Then> </If><If cond="UPDATE_SERVICE_TYPE" value="True"> <Then><If cond="SERVICE_CARDINALITY" value="1"> <Then>dispersion(type:ora.service.type)</Then> </If></Then> </If></xml>
+#  #START_TIMEOUT=600
+#  #STOP_CONCURRENCY=0
+#  #STOP_DEPENDENCIES=hard(intermediate:ora.s9004s1o.db,type:ora.cluster_vip_net1.type)
+#  #STOP_DEPENDENCIES_RTE_INTERNAL=<xml><Cond name="isCluster">True</Cond><Cond name="isCreatePreconnectSrv">False</Cond><Arg name="database" type="Res">ora.s9004s1o.db</Arg><Arg name="cluster_vip_net" type="ResList">ora.cluster_vip_net1.type</Arg></xml>
+#  #STOP_DEPENDENCIES_TEMPLATE=<xml><If cond="isCluster" value="True"> <Then><If cond="isCreatePreconnectSrv" value="True"> <Then>hard(<Res>global:{service}</Res>)</Then> </If></Then> </If>hard(<Res>intermediate:{database}</Res>)<If cond="isCluster" value="True"> <Then>hard(<ResTypeList>{cluster_vip_net}</ResTypeList>)</Then> </If></xml>
+#  #STOP_OPTION=
+#  #STOP_TIMEOUT=600
+#  #TAF_FAILOVER_DELAY=
+#  #TAF_POLICY=NONE
+#  #TARGET_DEFAULT=default
+#  #TYPE_VERSION=3.2
+#  #UPTIME_THRESHOLD=1h
+#  #USER_WORKLOAD=yes
+#  #USE_STICKINESS=0
+#  #USR_ORA_DISCONNECT=false
+#  #USR_ORA_ENV=
+#  #USR_ORA_FLAGS=
+#  #USR_ORA_OPEN_MODE=
+#  #USR_ORA_OPI=false
+#  #USR_ORA_STOP_MODE=
+#  #WORKLOAD_CPU=0
+#  #WORKLOAD_CPU_CAP=0
+#  #WORKLOAD_MEMORY_MAX=0
+#  #WORKLOAD_MEMORY_TARGET=0
+#  
+#  # Get the static information for the services first. The status we will pick up later as some
+#  # services might have started in the mean time if called from the CRS INSTANCE UP call out.
+#  # We risk not getting evrything right here - but no harm done as things will keep working just
+#  # not as ressource optimized as wished!
+#  # Initiate the state machine to that no service have been found
+#  new_service="NO"  
+#  # Get all the services for the CDB, mix of CDB and PDB services
+#  #set -x
+#  SERVICES_CONFIG="$(export ORACLE_HOME=$VAR_DATABASE_HOME;$VAR_DATABASE_HOME/bin/srvctl config service -db $VAR_DATABASE)"
+#  # Now read the service information and extract relevant stuff, when all information found call store_service to ad
+#  # the found service to the BASH Declarative arrays
+#  while read -r service_line
+#  do
+#    #echo "$service_line"
+#    # Look for relevant information to be used 
+#    case $service_line in
+#      "Service name:"*)
+#        # This marks the beginning of a new record
+#        # Are we in the state machine at a point where we have data (YES) or is it the first record (NO)
+#        if [ "$new_service" = "YES" ]
+#        then
+#          # Store the record found
+#          store_service "$VAR_DATABASE" "$VAR_INSTANCE" "$VAR_REASON" "$read_service_name" "$read_preferred_instances" "$read_available_instances" "$read_service_role" "$read_pluggable_database_name" "$VAR_DATABASE_HOME"
+#        else
+#          # Make sure we remember that we now know that we have read a new service entry and should store it next time
+#          new_service="YES"
+#        fi
+#        # Save new service name found
+#        read_service_name="$( echo ${service_line#*:})"
+#        # Reset values found for previous service entry
+#        read_preferred_instances=""
+#        read_available_instances=""
+#        read_service_role=""
+#        read_pluggable_database_name=""
+#        ;;
+#      "Preferred instances:"*)
+#        # Save information
+#        read_preferred_instances="$( echo ${service_line#*:})"
+#        ;;
+#      "Available instances:"*)
+#        # Save information
+#        read_available_instances="$( echo ${service_line#*:})"
+#        ;;
+#      "Service role:"*)
+#        # Save information
+#        read_service_role="$( echo ${service_line#*:})"
+#        ;;
+#      "Pluggable database name:"*)
+#        # Save information
+#        read_pluggable_database_name="$( echo ${service_line#*:})"
+#        ;;
+#    esac
+#  done <<< "$SERVICES_CONFIG"  
+#  # Store the last record found
+#  store_service "$VAR_DATABASE" "$VAR_INSTANCE" "$VAR_REASON" "$read_service_name" "$read_preferred_instances" "$read_available_instances" "$read_service_role" "$read_pluggable_database_name" "$VAR_DATABASE_HOME"
+  
+  
+  # The sqllite load data is put in this file during analyze and then loaded into schema
+  SQL_DATA_FILE="$PATH_TO_NDCHARGECTL_FILES/upload/ndchargectl-data-${GRID_CLUSTER_NAME}-${NOW_STRING}.sql"
+  # The text data from analysis is put in this file
+  TXT_DATA_FILE="$PATH_TO_NDCHARGECTL_FILES/upload/ndchargectl-data-${GRID_CLUSTER_NAME}-${NOW_STRING}.txt"
+}
+
+
+#
+# print_variables
+#
+# Purpose: Used for debugging
+#
+print_variables()
+{
+  echo "CLUSTER_NODES       =$CLUSTER_NODES"
+  echo "RAC_NODES           =$RAC_NODES"
+  echo "SHORT_HOST_NAME     =$SHORT_HOST_NAME"
+  echo "DOMAIN_NAME         =$DOMAIN_NAME"
+  for count in ${!CLUSTER_DB_NAMES[*]}
+  do
+    echo "{CLUSTER_DB_NAMES[$count]}    =${CLUSTER_DB_NAMES[$count]}"
+    echo "{CLUSTER_DB_HOMES[$count]}    =${CLUSTER_DB_HOMES[$count]}"
+    echo "{CLUSTER_DB_VERSIONS[$count]} =${CLUSTER_DB_VERSIONS[$count]}"
+  done
+}
+
+#
+# print_total_asm
+#
+# Purpose: Will generate the total ASM disk usage in the cluster for each diskgroup
+#
+print_total_asm()
+{
+  for DISKGROUP_COUNTER in ${!ASM_DISKGROUP[@]}
+  do
+    echo "insert into ${SCHEMA_TO_INSERT_INTO}.ora_diskgroups( collection_date,cluster_name,diskgroupname,total_disk,free_disk,free_usable_disk)" >> $SQL_DATA_FILE   
+    echo "values (${NOW_STRING_DATE_TYPE},'${GRID_CLUSTER_NAME}','${ASM_DISKGROUP[$DISKGROUP_COUNTER]}','${ASM_GB_TOTAL[$DISKGROUP_COUNTER]}','${ASM_GB_FREE[$DISKGROUP_COUNTER]}','${ASM_GB_USABLE[$DISKGROUP_COUNTER]}');" >> $SQL_DATA_FILE
+    echo "==========================ASM DISKGROUP======================================" >> $TXT_DATA_FILE
+	echo "             Cluster: ${GRID_CLUSTER_NAME}" >> $TXT_DATA_FILE
+	echo "          Disk group: ${ASM_DISKGROUP[$DISKGROUP_COUNTER]}" >> $TXT_DATA_FILE
+	echo "            GB Total: ${ASM_GB_TOTAL[$DISKGROUP_COUNTER]}" >> $TXT_DATA_FILE
+	echo "             GB Free: ${ASM_GB_FREE[$DISKGROUP_COUNTER]}" >> $TXT_DATA_FILE
+	echo "           GB Usable: ${ASM_GB_USABLE[$DISKGROUP_COUNTER]}" >> $TXT_DATA_FILE
+    echo "=============================================================================" >> $TXT_DATA_FILE
+    (( DISKGROUP_COUNTER++ ))
+  done
+}
+
+#
+# print_total_asm
+#
+# Purpose: Will generate the ASM disk usage for each database
+#
+print_database_asm_usage()
+{
+  for DISKASM_COUNTER in ${!ASM_DB_NAME[@]}
+  do
+    echo "insert into ${SCHEMA_TO_INSERT_INTO}.ora_dbdiskusage( collection_date,cluster_name,databasename,diskgroupname,used_disk)" >> $SQL_DATA_FILE   
+    echo "values (${NOW_STRING_DATE_TYPE},'${GRID_CLUSTER_NAME}','${ASM_DB_NAME[$DISKASM_COUNTER]}','${ASM_DB_DISKGROUPL[$DISKASM_COUNTER]}','${ASM_DB_GB_USED[$DISKASM_COUNTER]}');" >> $SQL_DATA_FILE
+    echo "==========================DATABASE ASM USAGE=================================" >> $TXT_DATA_FILE
+    echo "             Cluster: ${GRID_CLUSTER_NAME}" >> $TXT_DATA_FILE
+    echo "            Database: ${ASM_DB_NAME[$DISKASM_COUNTER]}" >> $TXT_DATA_FILE
+    echo "          Disk group: ${ASM_DB_DISKGROUPL[$DISKASM_COUNTER]}" >> $TXT_DATA_FILE
+    echo "             GB Used: ${ASM_DB_GB_USED[$DISKASM_COUNTER]}" >> $TXT_DATA_FILE
+    echo "=============================================================================" >> $TXT_DATA_FILE  	
+    (( DISKASM_COUNTER++ ))
+  done
+}
+
+#
+# print_hosts
+#
+# Purpose: Will print all host information in cluster
+#
+print_hosts()
+{
+  for node_counter in ${!RAC_NODE_NAME[@]}
+  do
+	  echo "insert into ${SCHEMA_TO_INSERT_INTO}.ora_hosts (collection_date,hostname, memory_installed, memory_free, cpus_installed, hugepages_total, hugepages_free, cluster_name)" >> $SQL_DATA_FILE
+	  echo "values (${NOW_STRING_DATE_TYPE},'${RAC_NODE_NAME[$node_counter]}', '${RAC_NODE_MEMTOTAL[$node_counter]}', '${RAC_NODE_MEMFREE[$node_counter]}', '${RAC_NODE_CPUS[$node_counter]}', '${RAC_NODE_HUGEPAGES_TOTAL[$node_counter]}', '${RAC_NODE_HUGEPAGES_FREE[$node_counter]}', '${GRID_CLUSTER_NAME}');" >> $SQL_DATA_FILE
+    echo "==========================NODE===============================================" >> $TXT_DATA_FILE
+	  echo "                Node: ${RAC_NODE_NAME[$node_counter]}" >> $TXT_DATA_FILE
+	  echo "        Total memory: ${RAC_NODE_MEMTOTAL[$node_counter]}" >> $TXT_DATA_FILE
+	  echo "         Free memory: ${RAC_NODE_MEMFREE[$node_counter]}" >> $TXT_DATA_FILE
+	  echo "           Total CPU: ${RAC_NODE_CPUS[$node_counter]}" >> $TXT_DATA_FILE
+	  echo "     Total Hugepages: ${RAC_NODE_HUGEPAGES_TOTAL[$node_counter]}" >> $TXT_DATA_FILE
+	  echo "      Free Hugepages: ${RAC_NODE_HUGEPAGES_FREE[$node_counter]}" >> $TXT_DATA_FILE
+    echo "             Cluster: ${GRID_CLUSTER_NAME}" >> $TXT_DATA_FILE
+    echo "=============================================================================" >> $TXT_DATA_FILE
+  done
+}
+
+#
+# print_databases
+#
+# Purpose: Will print all database information in cluster
+#
+print_databases()
+{
+  for db_counter in ${!CLUSTER_DB_NAMES[*]}
+  do
+	echo "insert into ${SCHEMA_TO_INSERT_INTO}.ora_databases (collection_date,databasename, oracle_home, oracle_version, io_limit_percent, io_allocation_percent)" >> $SQL_DATA_FILE
+	echo "values (${NOW_STRING_DATE_TYPE},'${CLUSTER_DB_NAMES[$db_counter]}','${CLUSTER_DB_HOMES[$db_counter]}','${CLUSTER_DB_VERSIONS[$db_counter]}',NULL,NULL);" >> $SQL_DATA_FILE
+    echo "==========================DATABASES==========================================" >> $TXT_DATA_FILE
+	echo "            Database: ${CLUSTER_DB_NAMES[$db_counter]}" >> $TXT_DATA_FILE
+	echo "         Oracle Home: ${CLUSTER_DB_HOMES[$db_counter]}" >> $TXT_DATA_FILE
+	echo "      Oracle Version: ${CLUSTER_DB_VERSIONS[$db_counter]}" >> $TXT_DATA_FILE
+    echo "=============================================================================" >> $TXT_DATA_FILE 	
+  done
+}
+
+#
+# print_instances
+#
+# Purpose: Used for printing relevant instance information for db's in the cluster
+#
+print_instances()
+{
+  for count in ${!CLUSTER_INSTANCE_DB_ID[*]}
+  do
+    db_id=${CLUSTER_INSTANCE_DB_ID[$count]}
+    if [ "${CLUSTER_INSTANCE_CPU_COUNT[$count]}" = "" ]
+    then
+      CLUSTER_INSTANCE_CPU_COUNT_NULL="NULL"
+    else
+      CLUSTER_INSTANCE_CPU_COUNT_NULL="'${CLUSTER_INSTANCE_CPU_COUNT[$count]}'"
+    fi
+    if [ "${CLUSTER_INSTANCE_SGA_MAX_SIZE[$count]}" = "" ]
+    then
+      CLUSTER_INSTANCE_SGA_MAX_SIZE_NULL="NULL"
+    else
+      CLUSTER_INSTANCE_SGA_MAX_SIZE_NULL="'${CLUSTER_INSTANCE_SGA_MAX_SIZE[$count]}'"
+    fi
+    if [ "${CLUSTER_INSTANCE_PGA_AGGREGATE_TARGET[$count]}" = "" ]
+    then
+      CLUSTER_INSTANCE_PGA_AGGREGATE_TARGET_NULL="NULL"
+    else
+      CLUSTER_INSTANCE_PGA_AGGREGATE_TARGET_NULL="'${CLUSTER_INSTANCE_PGA_AGGREGATE_TARGET[$count]}'"
+    fi
+    if [ "${CLUSTER_INSTANCE_MEMORY_MAX_TARGET[$count]}" = "" ]
+    then
+      CLUSTER_INSTANCE_MEMORY_MAX_TARGET_NULL="NULL"
+    else
+      CLUSTER_INSTANCE_MEMORY_MAX_TARGET_NULL="'${CLUSTER_INSTANCE_MEMORY_MAX_TARGET[$count]}'"
+    fi
+    if [ "${CLUSTER_INSTANCE_USE_LARGE_PAGES[$count]}" = "" ]
+    then
+      CLUSTER_INSTANCE_USE_LARGE_PAGES_NULL="NULL"
+    else
+      CLUSTER_INSTANCE_USE_LARGE_PAGES_NULL="'${CLUSTER_INSTANCE_USE_LARGE_PAGES[$count]}'"
+    fi
+    if [ "${CLUSTER_INSTANCE_ARCHIVE_PR_DAY_MB[$count]}" = "" ]
+    then
+      CLUSTER_INSTANCE_ARCHIVE_PR_DAY_MB_NULL="NULL"
+    else
+      CLUSTER_INSTANCE_ARCHIVE_PR_DAY_MB_NULL="'${CLUSTER_INSTANCE_ARCHIVE_PR_DAY_MB[$count]}'"
+    fi
+    echo "insert into ${SCHEMA_TO_INSERT_INTO}.ora_instances( collection_date,databasename,instancename,hostname,status,cpu_count,sga_max_size,pga_aggregate_target,memory_max_target,use_large_pages,archive_pr_day)" >> $SQL_DATA_FILE   
+    echo "values (${NOW_STRING_DATE_TYPE},'${CLUSTER_DB_NAMES[$db_id]}','${CLUSTER_INSTANCE_NAME[$count]}','${CLUSTER_INSTANCE_HOST[$count]}','${CLUSTER_INSTANCE_STATUS[$count]}',${CLUSTER_INSTANCE_CPU_COUNT_NULL},${CLUSTER_INSTANCE_SGA_MAX_SIZE_NULL},${CLUSTER_INSTANCE_PGA_AGGREGATE_TARGET_NULL},${CLUSTER_INSTANCE_MEMORY_MAX_TARGET_NULL},${CLUSTER_INSTANCE_USE_LARGE_PAGES_NULL},${CLUSTER_INSTANCE_ARCHIVE_PR_DAY_MB_NULL});" >> $SQL_DATA_FILE
+    echo "===========================INSTANCE==========================================" >> $TXT_DATA_FILE
+    echo "             Cluster: $GRID_CLUSTER_NAME" >> $TXT_DATA_FILE
+    echo "            Database: ${CLUSTER_DB_NAMES[$db_id]}" >> $TXT_DATA_FILE
+    echo "       Database home: ${CLUSTER_DB_HOMES[$db_id]}" >> $TXT_DATA_FILE
+    echo "    Database version: ${CLUSTER_DB_VERSIONS[$db_id]}" >> $TXT_DATA_FILE
+    echo "            Instance: ${CLUSTER_INSTANCE_NAME[$count]}" >> $TXT_DATA_FILE
+    echo "              Status: ${CLUSTER_INSTANCE_STATUS[$count]}" >> $TXT_DATA_FILE
+    echo "              Server: ${CLUSTER_INSTANCE_HOST[$count]}" >> $TXT_DATA_FILE
+    echo "           CPU_COUNT: ${CLUSTER_INSTANCE_CPU_COUNT_NULL}" >> $TXT_DATA_FILE
+    echo "        SGA_MAX_SIZE: ${CLUSTER_INSTANCE_SGA_MAX_SIZE_NULL}" >> $TXT_DATA_FILE
+    echo "PGA_AGGREGATE_TARGET: ${CLUSTER_INSTANCE_PGA_AGGREGATE_TARGET_NULL}" >> $TXT_DATA_FILE
+    echo "   MEMORY_MAX_TARGET: ${CLUSTER_INSTANCE_MEMORY_MAX_TARGET_NULL}" >> $TXT_DATA_FILE
+    echo "     USE_LARGE_PAGES: ${CLUSTER_INSTANCE_USE_LARGE_PAGES_NULL}" >> $TXT_DATA_FILE
+    echo "   ARCHIVE_PR_DAY_MB: ${CLUSTER_INSTANCE_ARCHIVE_PR_DAY_MB_NULL}" >> $TXT_DATA_FILE
+    echo "=============================================================================" >> $TXT_DATA_FILE
+  done
+}
+
+print_pdb_info()
+{
+  for count in ${!CLUSTER_INSTANCE_DB_ID[*]}
+  do
+    #echo "count=$count"
+    echo "${CLUSTER_INSTANCE_PDB_INFO_INSERT_SQL[$count]}" >> $SQL_DATA_FILE
+    echo "${CLUSTER_INSTANCE_SERVICE_INFO_INSERT_SQL[$count]}" >> $SQL_DATA_FILE
+    echo "${CLUSTER_INSTANCE_SERVICE_INFO_PSEUDO_INSERT_SQL[$count]}" >> $SQL_DATA_FILE
+  done
+}
+#
+# create_steering_files
+#
+# Purpose: Used for creating an upload request file for each database in exacapacity_upload.conf
+#
+create_steering_files()
+{
+  # For each entry we request an upload by creating a steering file containing the login information
+  while read dbname connect_string
+  do
+    echo "$connect_string" > ${SQL_DATA_FILE}.${dbname}.steer
+  done < <(sed -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d' $DB_UPLOAD_CONF)
+}
+
+#
+# upload_files
+#
+# Purpose: Used for uploading data to datbases
+#
+upload_files()
+{
+  # For each sql file
+  while read sql_file
+  do
+    #echo "Found SQL file: $sql_file"
+    # Reset steering file found
+    steering_files_found=0
+    # for each steering file
+    #echo "find $PATH_TO_NDCHARGECTL_FILES/upload -path \"${sql_file}.*.steer\""
+    while read steering_file
+    do
+      #echo "Found steering file: $steering_file"
+      # Construct log file name by Removing .steer and add .log
+      logging_file=${steering_file%steer}log
+      # We found steering file, don't delete sql file (not used anymmore as we keep the sql file until it's cleaned up)
+      (( steering_files_found++ ))
+      # GEt connect string from file
+      connect_string=$(<$steering_file)
+      # Now try to upload, if it succeeds remove steering file
+      (export ORACLE_HOME=${GRID_ORACLE_HOME}; ${GRID_ORACLE_HOME}/bin/sqlplus -l -s "$connect_string" @$sql_file </dev/null >> $logging_file 2>>$logging_file )
+      if [ $? -eq 0 ]
+      then
+        echo "SQL load for $steering_file  succeeded" 
+        # Success remove steering file (delete sql file is not used anymmore as we keep the sql file until it's cleaned up)
+        (( steering_files_found-- ))
+        rm $steering_file
+      else
+        echo "SQL load for $steering_file  failed" 
+      fi
+      #echo "export ORACLE_HOME=${GRID_ORACLE_HOME}; ${GRID_ORACLE_HOME}/bin/sqlplus -S \"$connect_string\" @$sql_file"
+      # Ooh how to do that, we have connect desriptor in the file
+    done < <(find $PATH_TO_NDCHARGECTL_FILES/upload -path "${sql_file}.*.steer")
+    # We will leave the SQl files to be deleted later, commenting this out for now as we want to leave the cleanup to the cleanup routine
+    #if [ $steering_files_found -eq 0 ]
+    #then
+    #  echo "We can delete sql file $sql_file"
+    #  rm $sql_file
+    #fi
+  done < <(find $PATH_TO_NDCHARGECTL_FILES/upload -name "ndchargectl-data*.sql")
+}
+
+#
+# clean_files
+#
+# Purpose: Used for cleaning up files. We are tough and clean out nomatter what.
+#          If upload have not succeeded withing given time the steer file is removed
+#
+clean_files()
+{
+  # We newer keep anything for more that 7 days (well can be set in top of script or by a switch to the script).
+  # Even if uploads fails we will delete the requests to keep growth under control
+  # Remove data files
+  find $PATH_TO_NDCHARGECTL_FILES/upload -name "ndchargectl-data*.sql" -mmin +${MINUTES_TO_KEEP_FILES} -exec rm {} \;
+  # Remove data txt files
+  find $PATH_TO_NDCHARGECTL_FILES/upload -name "ndchargectl-data*.txt" -mmin +${MINUTES_TO_KEEP_FILES} -exec rm {} \;
+  # Remove steering files 
+  find $PATH_TO_NDCHARGECTL_FILES/upload -name "ndchargectl-data*.sql.*.steer" -mmin +${MINUTES_TO_KEEP_FILES} -exec rm {} \;
+  # Remove steering log files
+  find $PATH_TO_NDCHARGECTL_FILES/upload -name "ndchargectl-data*.sql.*.log" -mmin +${MINUTES_TO_KEEP_FILES} -exec rm {} \;
+}
+
+# Ok do the stuff
+# Only run if evry node seems to be up
+parse_arguments $*
+check_arguments
+check_ssh
+# The actual work is done here
+build_environment_names
+create_lock_dir
+trap remove_lock_dir EXIT SIGHUP SIGINT SIGTERM
+if [ "$ONLY_UPLOAD" != "Y" ]
+then
+  collect_data
+  #create_empty_sqlite_database
+  # Prepare the sql file
+  echo  "whenever sqlerror exit failure" > $SQL_DATA_FILE
+  echo  "alter session set cursor_sharing=force;" >> $SQL_DATA_FILE
+  echo -n "" > $TXT_DATA_FILE
+  # Get the information into the files
+  print_hosts
+  print_databases
+  print_instances
+  print_total_asm
+  print_database_asm_usage
+  print_pdb_info
+  # finish off the sql file
+  echo  "commit;" >> $SQL_DATA_FILE
+  echo  "exit success" >> $SQL_DATA_FILE
+  # First read in the places to upload to and make "steering" files for each. If we fail upload we can try them later then
+  create_steering_files
+fi
+# Should we upload data
+if [ "$SKIP_UPLOADING" != "Y" ]
+then
+  # Now we have to handle the upload
+  # Now find all SQL files and then for each steering file upload it and remove steering file if no steering file exists remove sql file
+  upload_files
+  # keep only those younger than x minutes
+  clean_files
+fi

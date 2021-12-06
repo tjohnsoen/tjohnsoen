@@ -1,0 +1,342 @@
+#!/usr/bin/python
+# This script is used to collect audit information in xml files and cocatenate it to various files
+# 1.0.0   2017-05-18 asger.solvang@nordea.com     Initial version
+# 1.0.1   2017-05-18 asger.solvang@nordea.com     Changing parameters default and enabled deletion
+# 1.0.2   2017-06-01 asger.solvang@nordea.com     Cleaned up code that is not used
+# 1.0.3   2017-06-07 asger.solvang@nordea.com     Check that input and output paths exist, fixed that file is opened if it's not written to
+# 1.0.4   2017-06-30 asger.solvang@nordea.com     Adding dev/test/preprod/prod to filename
+# 1.0.5   2017-06-30 asger.solvang@nordea.com     Fixed that after initial write to file it was newer opened for writing again
+# 1.0.6   2017-12-22 asger.solvang@nordea.com     Updated default days to keep logs on ZFS to 7 days (10080 minuttes)
+# 1.0.7   2020-10-01 asger.solvang@nordea.com     Now deletes leftover .lastlineread files
+SVERSION="1.0.7"
+import os
+import glob
+import pwd
+import socket
+import time
+import datetime
+import sys
+#import optparse
+import argparse
+import re
+# Handle parameters to script
+
+description = "This command will collect xml files from adump catalogs and combine them into one outputfile pr. database/plugable database"
+epilog = "Take care out there"
+parser = argparse.ArgumentParser(description=description, epilog=epilog)
+parser.add_argument('action',
+                  help="Action to perform",
+                  choices=['collect']
+                  )
+parser.add_argument('object',
+                  help="On which object should action be performed",
+                  choices=['audit']
+                  )
+parser.add_argument('--deltaMinutes',
+                  action="store",
+                  dest="delta_minutes",
+                  default=360,
+                  type=int,
+                  help="Number of minutes between rotating the output file"
+                  )
+parser.add_argument('--retainMinutes',
+                  dest="retain_minutes",
+                  default=10080,
+                  type=int,
+                  help="Number of minutes to save rotated output files"
+                  )
+parser.add_argument('--inputDirectory',
+                  dest="rootdir",
+                  default='/u01/app/oracle/admin',
+                  help="Directory from where we will search for adump directories"
+                  )
+parser.add_argument('--outputDirectory',
+                  dest="outputdir",
+                  default='/zfssa/auditstage/splunk/auditstage',
+                  help="Directory where we will write output files to"
+                  )
+options=parser.parse_args()
+# We currenly only support action=collect and object=audit so we don't check on these
+
+# Minuttes since epoch
+seconds_since_epoch=int(time.time())
+# What directory to look for xml files in
+rootdir = options.rootdir
+# Minutes between rolling xml files
+minutes_between_rolling_files=options.delta_minutes
+# Here we use modolus to quantize the time for use in generating the output files
+print ("   INFO: "+os.path.basename(__file__)+' version '+SVERSION+' started at %s' % datetime.datetime.now().isoformat() )
+output_time_stamp=datetime.datetime.fromtimestamp(seconds_since_epoch / (minutes_between_rolling_files*60) * minutes_between_rolling_files *60)
+# Number of xml file vesrion to save
+minutes_to_save_rolling_files=options.retain_minutes
+# File to append xml files to
+outputdir = options.outputdir
+auditrecordstartstring='<AuditRecord>'
+auditrecordendstring='</AuditRecord>'
+auditendstring='</Audit>'
+myhostname=socket.gethostname()
+# Who am i
+runningasuser=pwd.getpwuid(os.getuid())[0]
+#print(runningasuser)
+# Should probably check that values given are ok (e.g. the paths) 
+# Do a simple check on if path exists
+if not os.path.isdir(outputdir):
+     print(' ERROR: Output path (' + outputdir + ') does not exist')
+     sys.exit(1)
+# Do a simple check on if path exists
+if not os.path.isdir(rootdir):
+     print(' ERROR: Input path (' + rootdir + ') does not exist')
+     sys.exit(2)
+# Calculate cleanup path, only cleanup my own created files (e.g. hostname is included)
+output_file_name_match = os.path.join(outputdir,'*_*_*_' + myhostname + '_*.xml')
+for roll_name in glob.glob(output_file_name_match):
+    #print(roll_name)
+    # Here we have files that ends on _<date>.xml (_20170517155825.xml)
+    # Extract the date from the file name
+    m = re.search('.*_([0-9]*)\.xml', roll_name)
+    # Did we get a match, otherwise it's probably sme other file type
+    if m:
+        #print(m.group(1))
+        #Convert the text timestamp to a rela timestamp
+        roll_time = datetime.datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+        #print(roll_time)
+        # decide if the date is older than what we want to keep and if it is then delete it
+        if datetime.timedelta(minutes=minutes_to_save_rolling_files) < datetime.datetime.now() - roll_time:
+             print('   INFO: Deleting old file: ' + roll_name)
+             # Here do the delete
+             os.remove(roll_name)
+# Now loop over all files in directory
+for subdir, dirs, files in os.walk(rootdir):
+    # Let's get the last 3 directories, to figure out if this is some directory where we expect audit files to be
+    # Structure under here should be
+    # <database name>/audit
+    # <database name>/audit/<plugable id>
+    lastdir=os.path.abspath(subdir).split(os.sep)[-1]
+    middir=os.path.abspath(subdir).split(os.sep)[-2]
+    firstdir=os.path.abspath(subdir).split(os.sep)[-3]
+    # Figure out if we are at all interested in this directory
+    # Is is a regular data/audit kombination?
+    if lastdir=='adump':
+        # A normal or container database
+        database_name=middir
+        plugable_name='#'
+    elif middir=='adump':
+        # A plugable datbase
+        database_name=firstdir
+        plugable_name=lastdir
+    else:
+        # Probably not something we are interested in, take next directory
+        continue
+    # Open output file for append
+    # Uhh we need to know first the first part of the audit file name that is the instance name, so have to postphone the opening
+    file_opened=False
+    for filename in files:
+        #print(os.path.join(subdir, filename))
+        # Let's first check if we have a lastlineread without an xml file. If yes remove it
+        if filename.endswith(".xml.lastlineread"):
+            # Let's get the xml file name
+            xml_filename=filename[:-13]
+            if not os.path.isfile(os.path.join(subdir, xml_filename)):
+                # It might have been deleted already ignore and continue
+                try:
+                    #print("Remove file as no xml file is there")
+                    os.remove(os.path.join(subdir, filename))
+                except OSError:
+                    pass
+        # We will take all xml files, filter everything else out by skipping them
+        if filename.endswith(".xml"):
+            # Check if we have write access to the file - e.g we can delete the file afterwards.
+            # Only handle it if we can do that
+            if not os.access(os.path.join(subdir, filename), os.W_OK):
+                # If we have no os access (write) then skip this specific file as we will get into truble later
+                continue
+            # We have os access(write)
+            # We will now check if the file have been written to earlier
+            # If thats te case we have file with te same name and extension .lastlineread that holds
+            # the line number we successfully have written
+            # Assume we find the fle
+            counter_file_found=True
+            try:        
+                status_file = open(os.path.join(subdir, filename)+".lastlineread", "r")
+                string_from_line = status_file.readline()
+                from_line = int(string_from_line.strip())
+            except IOError as e:
+                #print "I/O error({0}): {1}".format(e.errno, e.strerror)
+                # Probably the file is not there
+                # lets start with line 0
+                from_line=0
+                # and remember we did not find the file
+                counter_file_found=False
+            except ValueError:
+                #print "Could not convert data to an integer."
+                # Somebody fiddled with the data, lets start from 0 again
+                from_line=0
+                # And keep the idea of the file .lastlineread file is there
+            #print("Will start reading from line="+str(from_line))
+            # Now start reading the real file
+            # When we reach the line number lastlineread then read in lines in buffer and increment a temp lastlineread
+            # If the line contains (End of audit record) then write buffer to outputfile and increment the real lastlineread.
+            # Start a new loop on reading in next record from file
+            # If we end the reading while we have not reached (End of audit record) then update file with extenion .lastlineread with last line written
+            # and continue
+            # Open file
+            aud_file=open(os.path.join(subdir, filename),'r')
+            # Get the whole file
+            lines=aud_file.readlines()
+            aud_file.close()
+            # Used for holding individual audit records found along the way, will be reset between audit records
+            auditrecordbuffer=''
+            # Here we collect the XML Header, so we can eject it together with new audit records found
+            headerbuffer=''
+            # This holds the accumulation of audit records for the file that should be sent on
+            outputbuffer=''
+            # Used to keep track of which line we are working on
+            line_counter=0
+            # Used to keep the state during the parsing of the file.
+            # rh=Read Header
+            # ra=Read Audit Record
+            # raf=Read Audit Record Finished
+            # fin=Read the final audit end tag, so we assume we're done wit the whole file
+            # Begin with state Read Header
+            state='rh'
+            for line in lines:
+                #print("State="+state)
+                #print("line_conunter="+str(line_counter))
+                if state=='rh':
+                    # We are bufering header
+                    # Did we find the begin adit record tag?
+                    position_found_auditstartrecord=line.find(auditrecordstartstring)
+                    if position_found_auditstartrecord<0:
+                        # No tag found, we will keep acummulating header info
+                        headerbuffer+=line
+                    else:
+                        # Now we reached the audit record
+                        # Save the line we found the beginning of the audit record
+                        audit_record_start_line=line_counter
+                        # Initiate the buffer we keep the individual audit records in to the line just read
+                        auditrecordbuffer=line
+                        # Switch state to Read Audit Record
+                        state='ra'
+                elif state=='ra':
+                    # We are reading auditrecords
+                    # Add the line to the buffer
+                    auditrecordbuffer+=line
+                    # Is this the end of an audit record
+                    position_found_auditendrecord=line.find(auditrecordendstring)
+                    if position_found_auditendrecord>=0:                    
+                        # End of audit record, are we interested in printing out
+                        #print("..line_counter="+str(line_counter))
+                        #print("..from_line="+str(from_line))
+                        # Now check if we actually printed out these lines before if we have we will skip the line
+                        if audit_record_start_line>from_line:
+                            # No we haven't printed this before
+                            # We will print, by adding it to outputbuffer
+                            outputbuffer+=auditrecordbuffer
+                            # Save position of where we came, in case we need to write it to the
+                            # file where we keep track of where we are
+                            from_line=line_counter
+                        # Set state to that we finished reading record
+                        state='raf'
+                elif state=='raf':
+                    # We finished reading audit record. What's next?
+                    # Is this the start of a new auditrecord
+                    position_found_auditstartrecord=line.find(auditrecordstartstring)
+                    if position_found_auditstartrecord>=0:
+                        # Now we reached a new audit record, save the line in buffer
+                        auditrecordbuffer=line
+                        # Save the line we found to the beginning of the audit record
+                        audit_record_start_line=line_counter
+                        # Set state to reading Audit Records
+                        state='ra'
+                    else:
+                        # It was not the start of a new audit record
+                        # Did We reach the end of the audit file
+                        position_found_auditendstring=line.find(auditendstring)
+                        if position_found_auditendrecord>=0:
+                            # This was the end of audit, update from_line - probably not needed as we will delete the file holding this information anyhow
+                            from_line=line_counter
+                            # Did we find any new auditrecords, then add it otherwise ignore the single </Audit> tag
+                            if outputbuffer!='':
+                                outputbuffer+=line
+                            state='fin'
+                        else:
+                            print('WARNING: We should probably not have been here - something is wrong - no start of audit record or end of audit file found filename='+filename)
+                # Increment line counter before reading next line
+                line_counter+=1
+            # We have finished working on the file, do we need to print something to the audit collector file?
+            # Have we stored anyting for output - e.g. outputbufer is not empty, the we should print it out
+            if outputbuffer!='':
+                # Write it to log
+                # Is file name open? If not open
+                # Is output file is not open, then picking the instance name from the xml file and open it - only done once pr. loop
+                if not file_opened:
+                    # June 30, 2017 have to find out if we are a dev,test,preprod or prod database
+                    # We will have to look at the name of the database. Probably this is going to be complex as we have numerous naming standards
+                    # Method
+                    category_short=""
+                    # Is it an Exadata/sop database, then it ends on c=CB, h=hh or o=oe, it might have number as second last
+                    # and then the category will come
+                    dbnamematch = re.search('^.*([stdp])[0-9]?[cho]$', database_name, re.I)
+                    # Did we get at match
+                    if dbnamematch:
+                        #print('  DEBUG: Matched Exadata/SOP')
+                        # We have a match extract the category found
+                        category_short=dbnamematch.group(1)
+                        #print('  DEBUG: category_short='+category_short)
+                    else:
+                        # Not an Exadata/SOP, what about the old fashion with prod type at the end
+                        dbnamematch = re.search('^.*([pdts])$', database_name, re.I)
+                        # Did we get at match
+                        if dbnamematch:
+                            #print('  DEBUG: Matched old standard')
+                            # It's and old type extract the category
+                            category_short=dbnamematch.group(1)
+                            #print('  DEBUG: category_short='+category_short)
+                    # Now decide catagory                        
+                    if category_short=="s":
+                        category="dev"
+                    elif category_short=="t":
+                        category="test"
+                    elif category_short=="d":
+                        category="preprod"
+                    elif category_short=="p":
+                        category="prod"
+                    else:
+                        # No category according to standard so put it as a dev
+                        category="dev"
+                    # Print to check if it decides correct
+                    #print('  DEBUG: Database name: ' + database_name + ' database type:' + category)
+                    # Instance name is first string before _, split only once
+                    instance_name,remaining_name=filename.split('_', 1)
+                    # Calculate name of output file
+                    output_file_name=os.path.join(outputdir, category + '_' + database_name + '_' + instance_name + '_'+ plugable_name + '_'+ myhostname + '_' + output_time_stamp.strftime('%Y%m%d%H%M%S') + '.xml')
+                    # Does the file exists or is it first write
+                    if not os.path.isfile(output_file_name):
+                        print("   INFO: Created new output file: "+output_file_name)
+                    fout = open(output_file_name, 'a')
+                    file_opened=True
+                # First ads comment with filename
+                fout.write('<!-- ' + filename + ' -->\n')
+                fout.write(headerbuffer)
+                fout.write(outputbuffer)
+                # If we did not find </Audit> then add one so we keep the integrity of the XML
+                if state<>'fin':
+                   fout.write(auditendstring)
+            # Did we we find an end audit tag, then we should clean up if we did have a .linenumber file
+            if state=='fin':
+                # Renove steering file if there was one
+                if counter_file_found==True:
+                    os.remove(os.path.join(subdir, filename)+".lastlineread")
+                # Remove XML file - o clean up 
+                os.remove(os.path.join(subdir, filename))
+            else:
+                # If we did not reach the end
+                status_file = open(os.path.join(subdir, filename)+".lastlineread", "w")
+                # Write the line number where we last found a finished audit record
+                status_file.write(str(from_line))
+                status_file.close()
+            continue
+        else:
+            continue
+        fout.close
+print ('   INFO: ended at %s' % datetime.datetime.now().isoformat() )

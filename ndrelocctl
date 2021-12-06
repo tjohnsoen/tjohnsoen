@@ -1,0 +1,1176 @@
+#!/bin/bash
+# This script will handle closing PDB instances that are not running user processes and that are not
+# being running services
+# 
+# 1.0.0   2019-02-22 asger.solvang@nordea.com    Initial version
+# 1.0.1   2019-03-07 asger.solvang@nordea.com    Clean up
+# 1.0.2   2019-03-07 asger.solvang@nordea.com    Better info
+# 1.0.3   2019-05-28 asger.solvang@nordea.com    Added evacuate/revive. Revive replaces old functionality and evacuate adds new possibility to drain a server 
+# 1.0.4   2019-06-11 asger.solvang@nordea.com    Missing export ORACLE_HOME 
+# 1.0.5   2019-06-13 asger.solvang@nordea.com    FOrgot to reset global bash vairables in loopfunction 
+# 1.0.6   2019-09-18 asger.solvang@nordea.com    Added  start/stop standbyservices and install/deinstall on all nodes
+# 1.0.7   2019-09-19 asger.solvang@nordea.com    Added  --verbose and remove a lot of debug
+# 1.0.8   2019-11-22 asger.solvang@nordea.com    Fixed problem in start/stop standbyservices where the action was actually not performed
+# 1.0.9   2020-11-12 asger.solvang@nordea.com    Added function to keep usrco installed when upgrading grid
+# 
+# Use common library
+source /var/lib/ndcommon/ndcommon
+SVERSION="1.0.9"
+# Used for making backup of files and timestamping in general
+NOW_STRING=`date  +%F_%H.%M.%S`
+# Run time information - used f.x. for storing that we we want usrco to be installed, used when updateing grid home to automatically reinstall
+ndrelocctl_var_lib_directory="/var/lib/ndrelocctl"
+# File that are used to mark userco should be installed
+usrco_should_be_installed="${ndrelocctl_var_lib_directory}/usrcostate/usrco_will_be_kept_installed"
+# Short host name
+local_short_hostname=${HOSTNAME%%.*}
+echo "  INFO: Script version $SVERSION (${NOW_STRING})" 
+
+# Associative array to hold information about running nodes
+declare -A global_is_service_running
+declare -A global_service_is_running_on
+declare -A global_preferred_instances
+declare -A global_available_instances
+declare -A global_service_role
+declare -A global_pluggable_database_name
+declare -A global_reason
+declare -A global_database
+declare -A global_instanse
+declare -A global_oracle_home
+
+# Will relocate the services a defined in the decalrative arrays
+relocate_services()
+{
+  local action=$1
+  local VAR_VERBOSE=$2
+  [ "$VAR_VERBOSE" = "YES" ] &&  echo " DEBUG: Entered function: $FUNCNAME"
+  # Loop over each individual service
+  for service in "${!global_is_service_running[@]}"
+  do
+    #echo "global_is_service_running[$service]: ${global_is_service_running[$service]}"
+    #echo "global_service_is_running_on[$service]: ${global_service_is_running_on[$service]} "
+    #echo "global_database[$service]: ${global_database[$service]} "
+    #echo "global_instanse[$service]: ${global_instanse[$service]} "
+    #echo "global_reason[$service]: ${global_reason[$service]} "
+    #echo "global_preferred_instances[$service]: ${global_preferred_instances[$service]} "
+    #echo "global_available_instances[$service]: ${global_available_instances[$service]} "
+    #echo "global_service_role[$service]: ${global_service_role[$service]} "
+    #echo "global_pluggable_database_name[$service]: ${global_pluggable_database_name[$service]} "
+    #echo "global_oracle_home[$service]: ${global_oracle_home[$service]} "
+    echo -n "service=$service" 
+    # Ok Now decide for what to relocate
+    # First figure out if is supposed to run at all - we won't do anything if service is not running already, we are very carefull
+    if [ "${global_is_service_running[$service]}" = "YES" ]
+    then
+      echo -n ";running_on_cluster=yes" 
+      # OK we will handle it
+      if [[ ${global_preferred_instances[$service]} =~ (^|,)"${global_instanse[$service]}"(,|$) ]]
+      then
+        echo -n ";should_run_on_this_instance=yes" 
+        # Ok so does it run here?
+        if [[ ${global_service_is_running_on[$service]} =~ (^|,)"${global_instanse[$service]}"(,|$) ]]
+        then
+          # It runs here do nothing
+          echo -n ";is_running_on_this_instance=yes" 
+        else
+          # it does not run here
+          echo -n ";is_running_on_this_instance=no" 
+          # Ok so what to do, we will have to call relocate, we we need to relocate here, but form where
+          # If available we want to pick an instance from global_service_is_running_on that is not in global_preferred_instances
+          # Loop over all instanses that this service is running on
+          #Reset variable
+          select_instance_to_relocate_from=""
+          for possible_instance_to_relocate_from in $(convert_comma_to_lines "${global_service_is_running_on[$service]}")
+          do
+            echo ";possible_instance_to_move=$possible_instance_to_relocate_from" 
+            if [[ ${global_preferred_instances[$service]} =~ (^|,)"$possible_instance_to_relocate_from"(,|$) ]]
+            then
+              # Ouch it's preferred we really should not do that
+              :
+              #echo "Ouch it's preferred we really should not do that", try again to find anot
+              echo -n ";move_from_instance_selected=NULL" 
+            else
+              # We use this on
+              select_instance_to_relocate_from=$possible_instance_to_relocate_from
+              echo -n ";move_from_instance_selected=$select_instance_to_relocate_from" 
+              # Stop loop
+              break
+            fi
+          done
+          if [ "$select_instance_to_relocate_from" != "" ]
+          then
+            # Ok relocate
+            if [ "$action" = "RUN" ]
+            then 
+              echo -n ";relocating_to_instance=${global_instanse[$service]}" 
+              echo -n ";command_to_execute=${global_oracle_home[$service]}/bin/srvctl relocate service -d ${global_database[$service]}  -s ${service} -oldinst ${select_instance_to_relocate_from} -newinst ${global_instanse[$service]}" 
+              (export ORACLE_HOME=${global_oracle_home[$service]};${global_oracle_home[$service]}/bin/srvctl relocate service -d ${global_database[$service]}  -s ${service} -oldinst ${select_instance_to_relocate_from} -newinst ${global_instanse[$service]})
+            else
+              echo -n ";relocating_to_instance=${global_instanse[$service]}" 
+              echo -n ";command_to_execute=${global_oracle_home[$service]}/bin/srvctl relocate service -d ${global_database[$service]}  -s ${service} -oldinst ${select_instance_to_relocate_from} -newinst ${global_instanse[$service]}" 
+            fi
+          else
+            # We will just start the service as we want it there
+            echo ";move_from_instance_selected=NULL" 
+            if [ "$action" = "RUN" ]
+            then 
+              echo -n ";starting_service_on_instance=${instance_to_move_service_to}" 
+              echo -n ";command_to_execute=${global_oracle_home[$service]}/bin/srvctl start service -d ${global_database[$service]} -s ${service} -instance ${global_instanse[$service]}" 
+              (export ORACLE_HOME=${global_oracle_home[$service]};${global_oracle_home[$service]}/bin/srvctl start service -d ${global_database[$service]} -s ${service} -instance ${global_instanse[$service]})
+            else
+              echo -n ";starting_service_on_instance=${instance_to_move_service_to}" 
+              echo -n ";command_to_execute=${global_oracle_home[$service]}/bin/srvctl start service -d ${global_database[$service]} -s ${service} -instance ${global_instanse[$service]}" 
+            fi               
+          fi
+        fi
+      else
+        echo -n ";should_run_on_this_instance=no" 
+        # We will ignore this as the relevant node(s) comming up should handle this 
+      fi
+    else
+      echo -n ";running_on_cluster=no" 
+    fi
+    echo "" 
+  done  
+}
+
+# Will relocate the services a defined in the decalrative arrays
+empty_services()
+{
+  local action=$1
+  local instance_to_move_away_from=$2
+  local VAR_VERBOSE=$3
+  [ "$VAR_VERBOSE" = "YES" ] &&  echo " DEBUG: Entered function: $FUNCNAME"
+  # Loop over each individual service
+  for service in "${!global_is_service_running[@]}"
+  do
+    #echo "instance_to_move_away_from : $instance_to_move_away_from"
+    #echo "global_is_service_running[$service]: ${global_is_service_running[$service]}"
+    #echo "global_service_is_running_on[$service]: ${global_service_is_running_on[$service]} "
+    #echo "global_database[$service]: ${global_database[$service]} "
+    #echo "global_instanse[$service]: ${global_instanse[$service]} "
+    #echo "global_reason[$service]: ${global_reason[$service]} "
+    #echo "global_preferred_instances[$service]: ${global_preferred_instances[$service]} "
+    #echo "global_available_instances[$service]: ${global_available_instances[$service]} "
+    #echo "global_service_role[$service]: ${global_service_role[$service]} "
+    #echo "global_pluggable_database_name[$service]: ${global_pluggable_database_name[$service]} "
+    #echo "global_oracle_home[$service]: ${global_oracle_home[$service]} "
+    echo -n "service=$service" 
+    # Ok Now decide where we need to relocate services running to
+    # First figure out if is supposed to run at all - we won't do anything if service is not running already, we are very carefull
+    
+    # basicaly we have to find out if the service shuld run at all
+    if [ "${global_is_service_running[$service]}" = "YES" ]    
+    then
+      echo -n ";running_on_cluster=yes" 
+      # OK we will handle it
+      # if yes then we have to move it if it's running here
+      # Ok so does it run here?
+      if [[ ${global_service_is_running_on[$service]} =~ (^|,)"${global_instanse[$service]}"(,|$) ]]
+      then
+        # It runs here we need to relocate it - or ensure that it is running somewhere else already
+        echo -n ";is_running_on_this_instance=yes"
+        # Let's first check if it's running else where
+        # Loop over all running instances
+        # Reset variable
+        service_is_running_somewhere_else="no"
+        for running_instance in $(convert_comma_to_lines "${global_service_is_running_on[$service]}")
+        do
+          # Is it the running instance we want to move away from
+          if [ "${instance_to_move_away_from}" = "$running_instance" ]
+          then
+            # It was we can't use that of course, let's hope we find another one
+            :
+          else
+            # Hey the service is still running somewhere - we are safe to continue without doing something
+            service_is_running_somewhere_else="yes"
+            break
+          fi
+        done
+        #set -x
+        if [ "$service_is_running_somewhere_else" != "yes" ]
+        then
+          # We need to find somewhere we can start the service that is not the current instance
+          echo -n ";service_is_running_somewhere_else=no"
+          # Try to find somewhere we can start it in preferred instances that is not our self
+          for possible_instance_to_relocate_to in $(convert_comma_to_lines "${global_preferred_instances[$service]}")
+          do
+            instance_to_move_service_to=""
+            # Is it the running instance we want to move away from
+            if [ "${possible_instance_to_relocate_to}" = "$running_instance" ]
+            then
+              # It was we can't use that of course, let's hope we find another one
+              :
+            else
+              # Hey the service can be started here, let's do that
+              instance_to_move_service_to="${possible_instance_to_relocate_to}"
+              break
+            fi            
+          done
+          if [ "$instance_to_move_service_to" = "" ]
+          then
+            # We did not find another preferred, then search available
+            for possible_instance_to_relocate_to in $(convert_comma_to_lines "${global_available_instances[$service]}")
+            do
+              instance_to_move_service_to=""
+              # Is it the running instance we want to move away from
+              if [ "${possible_instance_to_relocate_to}" = "$running_instance" ]
+              then
+                # It was we can't use that of course, let's hope we find another one
+                :
+              else
+                # Hey the service can be started here, let's do that
+                instance_to_move_service_to="${possible_instance_to_relocate_to}"
+                break
+              fi            
+            done            
+          fi
+          # No more chances to find a place to relocate to
+          if [ "$instance_to_move_service_to" != "" ]
+          then          
+            # We can start the instance here
+            echo -n ";service_should_be_running_here=$instance_to_move_service_to"
+            # Let's start the service on the instance
+            if [ "$action" = "RUN" ]
+            then 
+              echo -n ";relocating_to_instance=${instance_to_move_service_to}" 
+              echo -n ";command_to_execute=${global_oracle_home[$service]}/bin/srvctl relocate service -d ${global_database[$service]} -s ${service} -oldinst ${instance_to_move_away_from} -newinst ${instance_to_move_service_to}" 
+              (export ORACLE_HOME=${global_oracle_home[$service]};${global_oracle_home[$service]}/bin/srvctl relocate service -d ${global_database[$service]} -s ${service} -oldinst ${instance_to_move_away_from} -newinst ${instance_to_move_service_to}) 
+            else
+              echo -n ";relocating_to_instance=${instance_to_move_service_to}" 
+              echo -n ";command_to_execute=${global_oracle_home[$service]}/bin/srvctl relocate service -d ${global_database[$service]} -s ${service} -oldinst ${instance_to_move_away_from} -newinst ${instance_to_move_service_to}" 
+            fi            
+          else
+            # We can't find a place to start the service
+            echo -n ";service_should_be_running_here=NULL"  
+          fi
+        else
+          echo -n ";service_is_running_somewhere_else=yes"
+          # Then we "just" stop the service here
+          if [ "$action" = "RUN" ]
+          then 
+            echo -n ";stopping_service_on_instance=${instance_to_move_service_to}" 
+            echo -n ";command_to_execute=${global_oracle_home[$service]}/bin/srvctl stop service -d ${global_database[$service]} -s ${service} -instance ${instance_to_move_away_from}" 
+            (export ORACLE_HOME=${global_oracle_home[$service]};${global_oracle_home[$service]}/bin/srvctl stop service -d ${global_database[$service]} -s ${service} -instance ${instance_to_move_away_from}) 
+          else
+            echo -n ";stopping_service_on_instance=${instance_to_move_service_to}" 
+            echo -n ";command_to_execute=${global_oracle_home[$service]}/bin/srvctl stop service -d ${global_database[$service]} -s ${service} -instance ${instance_to_move_away_from}" 
+          fi          
+        fi
+        #set +x
+      else
+        # it does not run here - thats fine we are done as we don't need to move it then
+        echo -n ";is_running_on_this_instance=no"      
+      fi
+    else
+      echo -n ";running_on_cluster=no" 
+    fi
+    echo ""     
+  done  
+}    
+
+# Will start the standby services nomatter what
+handle_standby_services()
+{
+  local VAR_FUNCTION=$1
+  local VAR_DRY_RUN=$2
+  local VAR_VERBOSE=$3
+  [ "$VAR_VERBOSE" = "YES" ] && echo " DEBUG: Entered function: $FUNCNAME"
+  #echo "VAR_FUNCTION=$VAR_FUNCTION"  
+  #echo "VAR_DRY_RUN=$VAR_DRY_RUN"  
+  #echo "VAR_VERBOSE=$VAR_VERBOSE"  
+  for service in "${!global_is_service_running[@]}"
+  do
+    #echo "instance_to_move_away_from : $instance_to_move_away_from"
+    #echo "global_is_service_running[$service]: ${global_is_service_running[$service]}"
+    #echo "global_service_is_running_on[$service]: ${global_service_is_running_on[$service]} "
+    #echo "global_database[$service]: ${global_database[$service]} "
+    #echo "global_instanse[$service]: ${global_instanse[$service]} "
+    #echo "global_reason[$service]: ${global_reason[$service]} "
+    #echo "global_preferred_instances[$service]: ${global_preferred_instances[$service]} "
+    #echo "global_available_instances[$service]: ${global_available_instances[$service]} "
+    #echo "global_service_role[$service]: ${global_service_role[$service]} "
+    #echo "global_pluggable_database_name[$service]: ${global_pluggable_database_name[$service]} "
+    #echo "global_oracle_home[$service]: ${global_oracle_home[$service]} "
+    [ "$VAR_VERBOSE" = "YES" ] && echo -n "service=$service"
+    # ONLY Look for services that are having "PHYSICAL_STANDBY" and not PRIMARY also
+    if string_contain "PHYSICAL_STANDBY" "${global_service_role[$service]}"
+    then
+      [ "$VAR_VERBOSE" = "YES" ] && echo -n ";is_physical_standby=yes"  
+      if  $(string_contain "PRIMARY" "${global_service_role[$service]}")
+      then
+        [ "$VAR_VERBOSE" = "YES" ] && echo -n ";is_also_primary=yes;action=none"         
+      else
+        [ "$VAR_VERBOSE" = "YES" ] && echo -n ";is_also_primary=no"         
+        # Now check if status is correct
+        if [ "${global_is_service_running[$service]}" = "YES" ]
+        then
+          # It's running. Should it be running?
+          [ "$VAR_VERBOSE" = "YES" ] && echo -n ";is_running=yes"
+          if [ "$VAR_FUNCTION" = "start" ]
+          then
+            # Yes it should be running, do nothing
+            [ "$VAR_VERBOSE" = "YES" ] && echo -n ";should_be_running=yes;action=none"          
+          else
+            # Should not be running,
+            # No it should not be running, stop it
+            [ "$VAR_VERBOSE" = "YES" ] && echo -n ";should_be_running=no"
+            # Ok stop service
+            [ "$VAR_VERBOSE" = "YES" ] && echo -n ";action=stop_service" 
+            [ "$VAR_VERBOSE" = "YES" ] && echo -n ";command_to_execute="
+            echo -n "export ORACLE_HOME=${global_oracle_home[$service]};${global_oracle_home[$service]}/bin/srvctl stop service -d ${global_database[$service]}  -s ${service}" 
+            [ "$VAR_VERBOSE" = "YES" ] || echo ""
+            if [ "$VAR_DRY_RUN" != "YES" ]
+            then
+              (export ORACLE_HOME==${global_oracle_home[$service]};${global_oracle_home[$service]}/bin/srvctl stop service -d ${global_database[$service]}  -s ${service})
+            fi
+          fi
+        else
+          # It's not running. Should it be running?
+          [ "$VAR_VERBOSE" = "YES" ] && echo -n ";is_running=no"
+          if [ "$VAR_FUNCTION" = "start" ]
+          then
+            # Yes it should be running, start it
+            [ "$VAR_VERBOSE" = "YES" ] && echo -n ";should_be_running=yes"
+            # Ok start service
+            [ "$VAR_VERBOSE" = "YES" ] && echo -n ";action=start_service" 
+            [ "$VAR_VERBOSE" = "YES" ] && echo -n ";command_to_execute="
+            echo -n "export ORACLE_HOME=${global_oracle_home[$service]};${global_oracle_home[$service]}/bin/srvctl start service -d ${global_database[$service]}  -s ${service}" 
+            [ "$VAR_VERBOSE" = "YES" ] || echo ""
+            if [ "$VAR_DRY_RUN" != "YES" ]
+            then
+              (export ORACLE_HOME==${global_oracle_home[$service]};${global_oracle_home[$service]}/bin/srvctl start service -d ${global_database[$service]}  -s ${service})
+            fi
+          else
+            # No it should not be running, do nothing
+            [ "$VAR_VERBOSE" = "YES" ] && echo -n ";should_be_running=no;action=none"
+          fi
+        fi
+      fi
+    else
+      [ "$VAR_VERBOSE" = "YES" ] && echo -n ";is_physical_standby=no;action=none"  
+    fi
+    [ "$VAR_VERBOSE" = "YES" ] && echo ""
+  done
+}    
+
+
+loop_database()
+{
+  local VAR_FUNCTION=$1
+  local VAR_DRY_RUN=$2
+  local VAR_VERBOSE=$3
+  [ "$VAR_VERBOSE" = "YES" ] && echo " DEBUG: Entered function: $FUNCNAME"
+  #echo "VAR_FUNCTION=$VAR_FUNCTION"  
+  #echo "VAR_DRY_RUN=$VAR_DRY_RUN"  
+  #echo "VAR_VERBOSE=$VAR_VERBOSE"  
+  local GRID_HOME=$(find_grid_home)
+  while read db_name db_home db_version; do
+    #echo "db_name=$db_name"  
+    #echo "db_home=$db_home"  
+    #echo "db_version=$db_version"  
+    # Analyze the pdb_service
+    # OK we need to do whatever have to be done  
+    echo "  INFO: Will $VAR_FUNCTION standbyservices on database $db_name"
+    #Reset global variables
+    unset global_is_service_running
+    unset global_service_is_running_on
+    unset global_preferred_instances
+    unset global_available_instances
+    unset global_service_role
+    unset global_pluggable_database_name
+    unset global_reason
+    unset global_database
+    unset global_instanse
+    unset global_oracle_home
+    # Associative array to hold information about running nodes
+    declare -A global_is_service_running
+    declare -A global_service_is_running_on
+    declare -A global_preferred_instances
+    declare -A global_available_instances
+    declare -A global_service_role
+    declare -A global_pluggable_database_name
+    declare -A global_reason
+    declare -A global_database
+    declare -A global_instanse
+    declare -A global_oracle_home
+    case $VAR_FUNCTION in
+      start)
+        start_standbyservices "$db_name" "$db_home" "$VAR_DRY_RUN" "$VAR_VERBOSE";;
+      stop)
+        stop_standbyservices "$db_name" "$db_home" "$VAR_DRY_RUN" "$VAR_VERBOSE";;
+    esac
+  done < <($GRID_HOME/bin/srvctl config database -verbose)  
+}
+
+loop_node()
+{
+  local VAR_FUNCTION=$1
+  local VAR_NODE_NAME=$2
+  local VAR_DRY_RUN=$3
+  local VAR_VERBOSE=$4
+  [ "$VAR_VERBOSE" = "YES" ] && echo " DEBUG: Entered function: $FUNCNAME"
+  local GRID_HOME=$(find_grid_home)
+  #echo "VAR_FUNCTION=$VAR_FUNCTION"  
+  #echo "VAR_NODE_NAME=$VAR_NODE_NAME"  
+  #echo "VAR_DRY_RUN=$VAR_DRY_RUN"   
+  while read db_name db_home db_version; do
+    #echo "db_name=$db_name"  
+    #echo "db_home=$db_home"  
+    #echo "db_version=$db_version"
+    while read db_node db_instance db_instance_running
+    do
+      #echo "db_node=$db_node"  
+      #echo "db_instance=$db_instance"  
+      #echo "db_instance_running=$db_instance_running"     
+      # OK we now have information needed. Check if the node name is the same and that an instanse is running
+      if [ "$VAR_NODE_NAME" = "$db_node" -a "$db_instance_running" = "running" ]
+      then
+        # OK we need to do whatever have to be done  
+        echo "  INFO: Will $VAR_FUNCTION services on database $db_name, instance $db_instance"
+        #Reset global variables
+        unset global_is_service_running
+        unset global_service_is_running_on
+        unset global_preferred_instances
+        unset global_available_instances
+        unset global_service_role
+        unset global_pluggable_database_name
+        unset global_reason
+        unset global_database
+        unset global_instanse
+        unset global_oracle_home
+        # Associative array to hold information about running nodes
+        declare -A global_is_service_running
+        declare -A global_service_is_running_on
+        declare -A global_preferred_instances
+        declare -A global_available_instances
+        declare -A global_service_role
+        declare -A global_pluggable_database_name
+        declare -A global_reason
+        declare -A global_database
+        declare -A global_instanse
+        declare -A global_oracle_home    
+        case $VAR_FUNCTION in
+          revive)
+            revive_services "$db_name" "$db_instance" "" "$db_home" "$VAR_DRY_RUN" "$VAR_VERBOSE";;
+          evacuate)
+            evacuate_services "$db_name" "$db_instance" "" "$db_home" "$VAR_DRY_RUN" "$VAR_VERBOSE";;
+        esac
+      fi
+    done < <(export ORACLE_HOME=${db_home};${db_home}/bin/srvctl status database -d ${db_name} | sed -e "s/Instance \([^ ]*\) is \(.*\) on node \(.*\)/\3 \1 \2/")
+  done < <($GRID_HOME/bin/srvctl config database -verbose)  
+}
+
+revive_services()
+{
+  local VAR_DATABASE=$1
+  local VAR_INSTANCE=$2
+  local VAR_REASON=$3
+  local VAR_DATABASE_HOME=$4
+  local VAR_DRY_RUN=$5
+  local VAR_VERBOSE=$6
+  [ "$VAR_VERBOSE" = "YES" ] &&  echo " DEBUG: Entered function: $FUNCNAME"
+  #echo "VAR_DATABASE=$VAR_DATABASE"  
+  #echo "VAR_SERVICES=$VAR_INSTANCE"  
+  #echo "VAR_REASON=$VAR_REASON"  
+  #echo "VAR_DATABASE_HOME=$VAR_DATABASE_HOME"
+  #echo "VAR_DRY_RUN=$VAR_DRY_RUN"
+  #echo "VAR_VERBOSE=$VAR_VERBOSE"
+  # Analyze the pdb_service
+  analyze_services "$VAR_DATABASE" "$VAR_INSTANCE" "$VAR_REASON" "$VAR_DATABASE_HOME" "$VAR_VERBOSE"
+  # Relocate
+  if [ "$VAR_DRY_RUN" = "YES" ]
+  then
+    relocate_services "DRYRUN" "$VAR_VERBOSE"
+  else
+    relocate_services "RUN" "$VAR_VERBOSE"
+  fi  
+}
+
+evacuate_services()
+{
+  local VAR_DATABASE=$1
+  local VAR_INSTANCE=$2
+  local VAR_REASON=$3
+  local VAR_DATABASE_HOME=$4
+  local VAR_DRY_RUN=$5
+  local VAR_VERBOSE=$6
+  [ "$VAR_VERBOSE" = "YES" ] &&  echo " DEBUG: Entered function: $FUNCNAME"
+  #echo "VAR_DATABASE=$VAR_DATABASE"  
+  #echo "VAR_SERVICES=$VAR_INSTANCE"  
+  #echo "VAR_REASON=$VAR_REASON"  
+  #echo "VAR_DATABASE_HOME=$VAR_DATABASE_HOME"
+  #echo "VAR_DRY_RUN=$VAR_DRY_RUN"
+  #echo "VAR_VERBOSE=$VAR_VERBOSE"
+  # Analyze the pdb_service
+  analyze_services "$VAR_DATABASE" "$VAR_INSTANCE" "$VAR_REASON" "$VAR_DATABASE_HOME" "$VAR_VERBOSE"
+  # Relocate
+  if [ "$VAR_DRY_RUN" = "YES" ]
+  then
+    empty_services "DRYRUN" "$VAR_INSTANCE" "$VAR_VERBOSE"
+  else
+    empty_services "RUN" "$VAR_INSTANCE" "$VAR_VERBOSE"
+  fi  
+}
+
+start_standbyservices()
+{
+  local VAR_DATABASE=$1
+  local VAR_DATABASE_HOME=$2
+  local VAR_DRY_RUN=$3
+  local VAR_VERBOSE=$4
+  [ "$VAR_VERBOSE" = "YES" ] &&  echo " DEBUG: Entered function: $FUNCNAME"
+  #echo "VAR_DATABASE=$VAR_DATABASE"  
+  #echo "VAR_DATABASE_HOME=$VAR_DATABASE_HOME"  
+  #echo "VAR_DRY_RUN=$VAR_DRY_RUN"
+  #echo "VAR_VERBOSE=$VAR_VERBOSE"
+  # Analyze the pdb_service
+  analyze_services "$VAR_DATABASE" "dummy" "$no reason" "$VAR_DATABASE_HOME" "$VAR_VERBOSE"
+  # start physical_standby services
+  if [ "$VAR_DRY_RUN" = "YES" ]
+  then
+    handle_standby_services "start" "YES" "$VAR_VERBOSE"
+  else
+    handle_standby_services "start" "" "$VAR_VERBOSE"
+  fi  
+}
+
+stop_standbyservices()
+{
+  local VAR_DATABASE=$1
+  local VAR_DATABASE_HOME=$2
+  local VAR_DRY_RUN=$3
+  local VAR_VERBOSE=$4
+  [ "$VAR_VERBOSE" = "YES" ] &&  echo " DEBUG: Entered function: $FUNCNAME"
+  #echo "VAR_DATABASE=$VAR_DATABASE"  
+  #echo "VAR_DATABASE_HOME=$VAR_DATABASE_HOME"  
+  #echo "VAR_DRY_RUN=$VAR_DRY_RUN"
+  #echo "VAR_VERBOSE=$VAR_VERBOSE"
+  # Analyze the pdb_service
+  analyze_services "$VAR_DATABASE" "dummy" "$no reason" "$VAR_DATABASE_HOME" "$VAR_VERBOSE"
+  # stop physical_standby services
+  if [ "$VAR_DRY_RUN" = "YES" ]
+  then
+    handle_standby_services "stop" "YES" "$VAR_VERBOSE"
+  else
+    handle_standby_services "stop" "" "$VAR_VERBOSE"
+  fi  
+}
+
+
+store_service()                
+{
+  local service=$4
+  global_database[$service]="$1"
+  global_instanse[$service]="$2"
+  global_reason[$service]="$3"
+  global_preferred_instances[$service]="$5"
+  global_available_instances[$service]="$6"
+  global_service_role[$service]="$7"
+  global_pluggable_database_name[$service]="$8"
+  global_oracle_home[$service]="$9"
+  #echo "global_database[$service]: ${global_database[$service]} "
+  #echo "global_instanse[$service]: ${global_instanse[$service]} "
+  #echo "global_reason[$service]: ${global_reason[$service]} "
+  #echo "global_preferred_instances[$service]: ${global_preferred_instances[$service]} "
+  #echo "global_available_instances[$service]: ${global_available_instances[$service]} "
+  #echo "global_service_role[$service]: ${global_service_role[$service]} "
+  #echo "global_pluggable_database_name[$service]: ${global_pluggable_database_name[$service]} "
+  #echo "global_oracle_home[$service]: ${global_oracle_home[$service]} "
+}
+
+
+# will check if services should be running on the instance specified
+# will fill out declarative arrays with needed information that can later be used for relocating
+analyze_services()
+{
+  #set -x
+  local VAR_DATABASE=$1
+  local VAR_INSTANCE=$2
+  local VAR_REASON=$3
+  local VAR_DATABASE_HOME=$4
+  local VAR_DEBUG=$5
+  [ "$VAR_VERBOSE" = "YES" ] &&  echo " DEBUG: Entered function: $FUNCNAME"
+  #echo "VAR_DATABASE=$VAR_DATABASE"  
+  #echo "VAR_SERVICES=$VAR_INSTANCE"  
+  #echo "VAR_REASON=$VAR_REASON"  
+  #echo "VAR_DATABASE_HOME=$VAR_DATABASE_HOME"
+  # Get the static information for the services first. The status we will pick up later as some
+  # services might have started in the mean time if called from the CRS INSTANCE UP call out.
+  # We risk not getting evrything right here - but no harm done as things will keep working just
+  # not as ressource optimized as wished!
+  # Initiate the state machine to that no service have been found
+  new_service="NO"  
+  # Get all the services for the CDB, mix of CDB and PDB services
+  #set -x
+  SERVICES_CONFIG="$(export ORACLE_HOME=$VAR_DATABASE_HOME;$VAR_DATABASE_HOME/bin/srvctl config service -d $VAR_DATABASE)"
+  # Now read the service information and extract relevant stuff, when all information found call store_service to ad
+  # the found service to the BASH Declarative arrays
+  while read -r service_line
+  do
+    #echo "$service_line"
+    # Look for relevant information to be used 
+    case $service_line in
+      "Service name:"*)
+        # This marks the beginning of a new record
+        # Are we in the state machine at a point where we have data (YES) or is it the first record (NO)
+        if [ "$new_service" = "YES" ]
+        then
+          # Store the record found
+          store_service "$VAR_DATABASE" "$VAR_INSTANCE" "$VAR_REASON" "$read_service_name" "$read_preferred_instances" "$read_available_instances" "$read_service_role" "$read_pluggable_database_name" "$VAR_DATABASE_HOME"
+        else
+          # Make sure we remember that we now know that we have read a new service entry and should store it next time
+          new_service="YES"
+        fi
+        # Save new service name found
+        read_service_name="$( echo ${service_line#*:})"
+        # Reset values found for previous service entry
+        read_preferred_instances=""
+        read_available_instances=""
+        read_service_role=""
+        read_pluggable_database_name=""
+        ;;
+      "Preferred instances:"*)
+        # Save information
+        read_preferred_instances="$( echo ${service_line#*:})"
+        ;;
+      "Available instances:"*)
+        # Save information
+        read_available_instances="$( echo ${service_line#*:})"
+        ;;
+      "Service role:"*)
+        # Save information
+        read_service_role="$( echo ${service_line#*:})"
+        ;;
+      "Pluggable database name:"*)
+        # Save information
+        read_pluggable_database_name="$( echo ${service_line#*:})"
+        ;;
+    esac
+  done <<< "$SERVICES_CONFIG"  
+  # Store the last record found
+  store_service "$VAR_DATABASE" "$VAR_INSTANCE" "$VAR_REASON" "$read_service_name" "$read_preferred_instances" "$read_available_instances" "$read_service_role" "$read_pluggable_database_name" "$VAR_DATABASE_HOME"
+  # Now Get the current status of services in database. We can be cheaten here if
+  # not all services have started up, we will have to live with that for now as mentioend earlier
+  # The above statements takes a long time to do though, so we should probably be OK
+  #set -x
+  SERVICE_STATUS=$(find_database_services_status $VAR_DATABASE)
+  # Now fill out global_is_service_running with status of running services
+  # and wher service is running global_service_is_running_on 
+  while read -r service_text service remain 
+  do
+    #echo "service_text=$service_text"
+    #echo "service=$service"
+    #echo "remain=$remain"
+    # Now parse lines like the following
+    # Service oracle_sr_test_2 is running on instance(s) s9002s1o2
+    # Service rman_s9002s1o is running on instance(s) s9002s1o1,s9002s1o2
+    # Service s9002s is running on instance(s) s9002s1o1,s9002s1o2
+    # Service s9002s_ro is not running.
+    case $remain in
+      "is running"*)
+        global_is_service_running[$service]="YES"  
+        global_service_is_running_on[$service]=${remain##* }
+        ;;
+      "is not running"*)
+        global_is_service_running[$service]="NO"  
+        global_service_is_running_on[$service]=""
+        ;;
+    esac
+    #echo "global_is_service_running[$service]: ${global_is_service_running[$service]} "
+    #echo "global_service_is_running_on[$service]: ${global_service_is_running_on[$service]} "
+  done <<< "$SERVICE_STATUS"
+  #set +x
+}
+
+
+write_usage()
+{
+  cat << EOF
+$0 is used by dba's to do various checks or fix tasks that might involvel escalating privileges to
+root.
+
+Usage:
+  $script_name reduce pdbinstances
+    [--databaseUniqueName <unique name of database>]
+    [--thisHostOnly]
+  $script_name analyze pdbinstances
+    [--databaseUniqueName <unique name of database>]
+    [--thisHostOnly]
+  $script_name evacuate services
+    [--databaseUniqueName <unique name of database>
+     --instanceName <unique name of database>]
+    |--nodeName <node name> ]
+    [--dryRun ]
+    [--verbose ]
+    [--reason <text describing reason> ]
+  $script_name revive services
+    [--databaseUniqueName <unique name of database>
+     --instanceName <unique name of database>]
+    |--nodeName <node name> 
+    [--dryRun ]
+    [--verbose ]
+    [--reason <text describing reason> ]
+  $script_name start standbyservices
+    [--databaseUniqueName <unique name of database>]
+    [--dryRun ]
+    [--verbose ]
+  $script_name stop standbyservices
+    [--databaseUniqueName <unique name of database>]
+    [--dryRun ]
+    [--verbose ]
+  $script_name install usrco
+  $script_name deinstall usrco   
+  $script_name checkandfix usrco 
+    [--forceLocalNode]]
+  $script_name  -h|--help
+    Will show this help    
+EOF
+}
+
+#
+# parse_arguments
+#
+# Purpose: Parses all the arguments received on command line
+# first argument is always action and second is component/object
+#
+parse_arguments()
+{
+  if [ $# -eq 0 ]
+  then
+    write_usage
+    exit
+  fi
+  # First check action is one we know off
+  VALID_ACTION_LIST="start stop reduce analyze evacuate revive install deinstall checkandfix -h --help "
+  if string_contain "$1 " "$VALID_ACTION_LIST"
+  then
+    ACTION=$1
+  else
+    echo "   ERROR: Action parameter \"$1\" given to script not recognized"
+    exit 1
+  fi
+  if [ "$ACTION" = "-h" -o "$ACTION" = "--help" ]
+  then
+    write_usage
+    exit
+  fi
+  shift
+  if [ $# -eq 0 ]
+  then
+    echo "   ERROR: Action parameter \"$ACTION\" given to script needs to be followed by an object"
+    exit 1
+  fi
+  # Depending on action various objects might be specified
+  case $1 in
+    standbyservices) OBJECT="standbyservices";VALID_ACTION_LIST="start stop ";;
+    usrco) OBJECT="usrco";VALID_ACTION_LIST="install deinstall checkandfix ";;
+    pdbinstances) OBJECT="pdbinstances";VALID_ACTION_LIST="analyze reduce ";;
+    services) OBJECT="services";VALID_ACTION_LIST="revive evacuate ";;
+    *)            echo "   ERROR: Object parameter $1 given to script not recognized";exit 1;;
+  esac;
+  shift
+  # first check if we support combination
+  if ! string_contain  "$ACTION " "$VALID_ACTION_LIST" 
+  then
+    echo "   ERROR: The action \"$ACTION\" is not not supported for object \"$OBJECT\". Actions allowed is \"$VALID_ACTION_LIST\""
+    exit 1
+  fi
+  
+  # Now we for each action/object checks the parameters, we use getopt for that in case there are some parameters
+  case $OBJECT in
+    standbyservices)
+      case $ACTION in
+        start|stop)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" --long databaseUniqueName:,dryRun,verbose -- "$@"`
+          if [ $? -ne 0 ]
+          then
+            echo "  ERROR: Parameter parsing error"
+            exit 1
+          fi
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --databaseUniqueName) DATABASE_UNIQUE_NAME="$2";shift 2 ;;
+            --dryRun) DRY_RUN="YES";shift 1 ;;              
+            --verbose) VERBOSE="YES";shift 1 ;;              
+            --) shift ; break ;;
+             *) echo "  ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          # Check database name eists if specified
+          if [ "${DATABASE_UNIQUE_NAME}" != "" ]
+          then
+            # Check that database unique name exists
+            DATABASE_HOME=$(find_database_home $DATABASE_UNIQUE_NAME)
+            #echo "DATABASE_HOME=$DATABASE_HOME"
+            if [ "$DATABASE_HOME" = "" ]
+            then
+              echo "  ERROR: Database $DATABASE_UNIQUE_NAME does not exist on cluster"
+              exit 1
+            fi
+          fi
+          ;;
+      esac;;
+    usrco)
+      case $ACTION in
+        install|deinstall)
+          # No parameters allowed
+          if [ $# -gt 0 ]
+          then
+            echo "   ERROR: The action \"$ACTION\" and object \"$OBJECT\" takes no parameters"
+            exit
+          fi
+          ;;
+        checkandfix)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" --long forceLocalNode -- "$@"`
+          if [ $? -ne 0 ]
+          then
+            echo "  ERROR: Parameter parsing error"
+            exit 1
+          fi
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --forceLocalNode) INPUT_FORCE_LOCAL_NODE="YES";shift;; 
+              --) shift ; break ;;
+               *) echo "  ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;              
+    services)
+      case $ACTION in
+        revive|evacuate)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" --long nodeName:,databaseUniqueName:,instanceName:,reason:,dryRun,verbose -- "$@"`
+          if [ $? -ne 0 ]
+          then
+            echo "  ERROR: Parameter parsing error"
+            exit 1
+          fi
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --databaseUniqueName) DATABASE_UNIQUE_NAME="$2";shift 2 ;;
+            --instanceName) INSTANCE_NAME="$2";shift 2 ;;
+            --nodeName) NODE_NAME="$2";shift 2 ;;
+            --reason) REASON="$2";shift 2 ;;
+            --dryRun) DRY_RUN="YES";shift 1 ;;              
+            --verbose) VERBOSE="YES";shift 1 ;;              
+            --) shift ; break ;;
+             *) echo "  ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "${NODE_NAME}" != "" ]
+          then
+            # Ok, he specified node, check that nothing else is specified
+            if [ "${DATABASE_UNIQUE_NAME}" != "" -o "$INSTANCE_NAME" != "" ]
+            then
+              echo "  ERROR: -nodeName can not be specied together with either --databaseUniqueName or --instanceName"
+              exit 1
+            fi              
+          else
+            # No Node name have been specified
+            if [ "${DATABASE_UNIQUE_NAME}" != "" ]
+            then
+              # Check that database unique name exists
+              DATABASE_HOME=$(find_database_home $DATABASE_UNIQUE_NAME)
+              #echo "DATABASE_HOME=$DATABASE_HOME"
+              if [ "$DATABASE_HOME" = "" ]
+              then
+                echo "  ERROR: Database $DATABASE_UNIQUE_NAME does not exist on cluster"
+                exit 1
+              fi
+            else
+              echo "  ERROR: parameter  --databaseUniqueName or --nodeName has to be specified"
+              exit 1
+            fi
+            if [ "${INSTANCE_NAME}" != "" ]
+            then
+              # Check that database instance name exists and is running
+              # TBD
+              :
+            else
+              echo "  ERROR: parameter  --instanceName has to be specified"
+              exit 1
+            fi
+          fi
+          ;;
+      esac;;  
+    pdbinstances)
+      case $ACTION in
+        analyze|reduce)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" --long databaseUniqueName:,thisHostOnly -- "$@"`
+          if [ $? -ne 0 ]
+          then
+            echo "  ERROR: Parameter parsing error"
+            exit 1
+          fi
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --databaseUniqueName) DATABASE_UNIQUE_NAMES="$(convert_comma_to_lines $2)";shift 2 ;;
+            --thisHostOnly) NODE_NUMBER_TO_WORK_ON=$(get_local_node_number);shift 1 ;;
+            --) shift ; break ;;
+             *) echo "  ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "${DATABASE_UNIQUE_NAMES}" != "" ]
+          then
+            # Check that all database unique names exists on cluster
+            for DATABASE_UNIQUE_NAME in ${DATABASE_UNIQUE_NAMES}
+            do
+              #echo "DATABASE_UNIQUE_NAME=$DATABASE_UNIQUE_NAME"
+              DATABASE_HOME=$(find_database_home $DATABASE_UNIQUE_NAME)
+              #echo "DATABASE_HOME=$DATABASE_HOME"
+              if [ "$DATABASE_HOME" = "" ]
+              then
+                echo "  ERROR: Database $DATABASE_UNIQUE_NAME does not exist on cluster"
+                exit 1
+              fi
+            done
+          else
+            # No uniqe names given, find all
+            DATABASE_UNIQUE_NAMES=$(find_databases)
+          fi
+          ;;
+      esac;;
+    *)
+      echo "  ERROR: $OBJECT not handled - internal error"
+      exit 1
+      ;;        
+  esac
+}
+
+#
+# handle_request
+#
+# Purpose: handles the request after arguments have been analyzed checked
+#DRY_RUN
+handle_request()
+{
+  case $OBJECT in
+    standbyservices)
+      case $ACTION in
+        start)
+          if [ "$DATABASE_UNIQUE_NAME" != "" ]
+          then
+            start_standbyservices "$DATABASE_UNIQUE_NAME" "$DATABASE_HOME" "$DRY_RUN" "$VERBOSE"
+          else
+            loop_database "start" "$DRY_RUN" "$VERBOSE"
+          fi;;
+        stop)
+          if [ "$DATABASE_UNIQUE_NAME" != "" ]
+          then
+            stop_standbyservices "$DATABASE_UNIQUE_NAME" "$DATABASE_HOME" "$DRY_RUN" "$VERBOSE"
+          else
+            loop_database "stop" "$DRY_RUN" "$VERBOSE"
+          fi;;
+      esac
+      ;;
+    usrco)
+      case $ACTION in
+        install)
+          install_usrco ;;
+        deinstall)
+          deinstall_usrco ;;
+        checkandfix)
+          checkandfix_usrco "$INPUT_FORCE_LOCAL_NODE";;
+      esac
+      ;;
+    services)
+      case $ACTION in
+        revive)
+          if [ "$NODE_NAME" = "" ]
+          then
+            revive_services "$DATABASE_UNIQUE_NAME" "$INSTANCE_NAME" "$REASON" "$DATABASE_HOME" "$DRY_RUN" "$VERBOSE"
+          else
+            loop_node "revive" "$NODE_NAME" "$DRY_RUN" "$VERBOSE"
+          fi;;
+        evacuate)
+          if [ "$NODE_NAME" = "" ]
+          then
+            evacuate_services "$DATABASE_UNIQUE_NAME" "$INSTANCE_NAME" "$REASON" "$DATABASE_HOME" "$DRY_RUN" "$VERBOSE"
+          else
+            loop_node "evacuate" "$NODE_NAME" "$DRY_RUN" "$VERBOSE"
+          fi;;
+      esac
+      ;;      
+    pdbinstances)
+      case $ACTION in
+        analyze)
+          analyze_pdbinstances "$DATABASE_UNIQUE_NAMES" "$NODE_NUMBER_TO_WORK_ON";;
+        reduce)
+          reduce_pdbinstances "$DATABASE_UNIQUE_NAMES" "$NODE_NUMBER_TO_WORK_ON";;
+      esac
+      ;;
+  esac
+}
+
+analyze_pdbinstances()
+{
+  echo " DEBUG: Entered function: $FUNCNAME"  
+  local DATABASE_UNIQUE_NAMES="$1"
+  local NODE_NUMBER_TO_WORK_ON="$2"
+  if [ "$NODE_NUMBER_TO_WORK_ON" != "" ]
+  then
+    P_INSTANCE_NUMBER_WHERE="where inst_id=${NODE_NUMBER_TO_WORK_ON} ";
+  else
+    P_INSTANCE_NUMBER_WHERE="";
+  fi  
+  local run_sql="set serveroutput on
+set heading on
+set feedback off
+COLUMN CON_NAME HEADING \\\"Container name\\\"
+COLUMN INST_ID HEADING \\\"Instance name\\\"
+COLUMN CON_NAME FORMAT A30
+COLUMN INST_ID FORMAT \$99999
+select CON_NAME, INST_ID
+from C##NORDEASYSTEM.PDB_INSTANCES_TO_BE_CLOSED
+${P_INSTANCE_NUMBER_WHERE};
+"  
+  for DATABASE_UNIQUE_NAME in ${DATABASE_UNIQUE_NAMES}
+  do
+    echo -n "PDB Instances that can be closed on database $DATABASE_UNIQUE_NAME"
+    if [ "$NODE_NUMBER_TO_WORK_ON" = "" ]
+    then
+      echo ""
+    else
+      echo " and node number $NODE_NUMBER_TO_WORK_ON"
+    fi    
+    local DB_ORACLE_HOME=$(find_database_home $DATABASE_UNIQUE_NAME)
+    local node_selected=$(find_database_run_node $DATABASE_UNIQUE_NAME)
+    local sid_selected=$(find_database_run_sid $DATABASE_UNIQUE_NAME)
+    ssh $node_selected "export ORACLE_HOME=$DB_ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"${run_sql}\" | $DB_ORACLE_HOME/bin/sqlplus -S / as sysdba"  
+  done    
+}
+
+reduce_pdbinstances()
+{
+  echo " DEBUG: Entered function: $FUNCNAME"  
+  local DATABASE_UNIQUE_NAMES="$1"
+  local NODE_NUMBER_TO_WORK_ON="$2"
+  if [ "$NODE_NUMBER_TO_WORK_ON" != "" ]
+  then
+    P_INSTANCE_NUMBER_ARG="p_instance_number=>$NODE_NUMBER_TO_WORK_ON";
+  else
+    P_INSTANCE_NUMBER_ARG="";
+  fi
+ local run_sql="set serveroutput on
+SET LINESIZE 132; 
+set heading on
+set feedback off
+BEGIN
+  C##NORDEASYSTEM.DBMGMT.CLOSE_UNUSED_PDB_INSTANCES(${P_INSTANCE_NUMBER_ARG});
+END;
+/
+"
+  for DATABASE_UNIQUE_NAME in ${DATABASE_UNIQUE_NAMES}
+  do
+    echo -n "Closing unnessecacy PDB Instances on database $DATABASE_UNIQUE_NAME"
+    if [ "$NODE_NUMBER_TO_WORK_ON" = "" ]
+    then
+      echo ""
+    else
+      echo " and node number $NODE_NUMBER_TO_WORK_ON"
+    fi
+    local DB_ORACLE_HOME=$(find_database_home $DATABASE_UNIQUE_NAME)
+    local node_selected=$(find_database_run_node $DATABASE_UNIQUE_NAME)
+    local sid_selected=$(find_database_run_sid $DATABASE_UNIQUE_NAME)
+    ssh $node_selected "export ORACLE_HOME=$DB_ORACLE_HOME;export ORACLE_SID=$sid_selected; echo -e \"${run_sql}\" | $DB_ORACLE_HOME/bin/sqlplus -S / as sysdba"  
+  done    
+}
+
+checkandfix_usrco()
+{
+  echo " DEBUG: Entered function: $FUNCNAME"
+  # Here we basically check if usrco should be installel
+  # Then depending on if it's installed or not we will fix
+  # Find the grid home first
+  local FORCE_LOCAL_NODE="$1"
+  local nodes
+  FOUND_GRID_HOME=$(find_grid_home)
+  if [ "$INPUT_FORCE_LOCAL_NODE" == "YES" ]
+  then
+    nodes="$local_short_hostname"
+  else
+    nodes=$(get_nodes)
+  fi
+  for node in $nodes
+  do
+    echo "  INFO: Checking RAC User callout script on $node" 
+    # Check if it should be installed
+    ssh $node [ -f ${usrco_should_be_installed} ]
+    if [ -$? -eq 0 ]
+    then
+      echo "  INFO: File ${usrco_should_be_installed} exists"
+      ssh $node [ -f $FOUND_GRID_HOME/racg/usrco/ndreloc ]
+      if [ -$? -ne 0 ]
+      then
+        echo "WARNING: $FOUND_GRID_HOME/racg/usrco/ndreloc is missing - fixing"
+        ssh $node cp /var/lib/ndrelocctl/grid_home/racg/usrco/ndreloc $FOUND_GRID_HOME/racg/usrco
+        ssh $node chmod 775 $FOUND_GRID_HOME/racg/usrco/ndreloc
+      else
+        echo "    OK: $FOUND_GRID_HOME/racg/usrco is there"        
+      fi
+    else
+      echo "  INFO: File ${usrco_should_be_installed} does not xists"
+      ssh $node [ -f $FOUND_GRID_HOME/racg/usrco/ndreloc ]
+      if [ -$? -eq 0 ]
+      then
+        echo "WARNING: $FOUND_GRID_HOME/racg/usrco and it should not be there - fixing"
+        ssh $node rm $FOUND_GRID_HOME/racg/usrco/ndreloc
+      else
+        echo "    OK: $FOUND_GRID_HOME/racg/usrco is not there"        
+      fi
+    fi
+  done
+}
+
+install_usrco()
+{
+  echo " DEBUG: Entered function: $FUNCNAME"
+  # Here we basically copy the callout file
+  # Find the grid home first
+  FOUND_GRID_HOME=$(find_grid_home)
+  local nodes=$(get_nodes)
+  for node in $nodes
+  do
+    echo "  INFO: Installing RAC User callout script on $node" 
+    ssh $node cp /var/lib/ndrelocctl/grid_home/racg/usrco/ndreloc $FOUND_GRID_HOME/racg/usrco
+    ssh $node chmod 775 $FOUND_GRID_HOME/racg/usrco/ndreloc
+    # Make sure we remember it should be installed
+    ssh $node touch ${usrco_should_be_installed}
+    ssh $node chmod 775 ${usrco_should_be_installed}
+  done
+}
+
+deinstall_usrco()
+{
+  echo " DEBUG: Entered function: $FUNCNAME"  
+  # Here we basically delete the callout file
+  # Find the grid home first
+  FOUND_GRID_HOME=$(find_grid_home)
+  local nodes=$(get_nodes)
+  for node in $nodes
+  do  
+    echo "  INFO: Deinstalling RAC User callout script on $node" 
+    ssh $node rm $FOUND_GRID_HOME/racg/usrco/ndreloc
+    # Make sure we remember it should be deinstalled
+    ssh $node rm -f ${usrco_should_be_installed}
+  done
+}
+
+
+
+# Script really starts here
+check_for_permission "oracle,grid"
+# Parse arguments (and check)
+parse_arguments "$@"
+# Handle the request
+
+handle_request

@@ -1,0 +1,454 @@
+#/bin/bash
+# Script to do various operations in conjunction with patching with linux patching   
+# 
+# 1.0.1   2019-06-21 asger.solvang@nordea.com     First version
+# 1.0.5   2020-10-27 asger.solvang@nordea.com     Removed tfactl as it's now a seprate component and enable evacuate (and revive)
+
+# Source the common functions
+source /var/lib/ndcommon/ndcommon
+SVERSION="1.0.5"
+echo "   INFO: Script version $SVERSION (`date  +%F_%H.%M.%S`)"#
+# Date timestamp used for data and log files etc
+# f.x. 2016-12-21_23-12-56
+NOW_STRING=`date  +"%F_%H-%M-%S"`
+
+write_usage()
+{
+  cat << EOF
+$0 is used to do various linux maintenance task typically in conjunction with 
+patching of the linux operating system. This script can only operate on one node
+as patching is typically done rolling.
+
+Usage:
+  $script_name evacuate services      # Use this at least 1 day in advance to patching
+                                      # linux on node. Only do this on one node at a time
+                                      # on a cluster
+  $script_name deactivate processes   # Use this just before patching shuld start. This will 
+                                      # stop and disable oracle processes to avoid
+                                      # issues with autostart on unlinked oracle Software
+  $script_name relink software        # Use this after the linux have been patched 
+                                      # Will relink oracle binaries in grid and oracle home
+  $script_name activate processes     # Use this just after relink have been done. This
+                                      # will enable all oracle processes and start them
+  $script_name revive services        # Use this just after "activate software"  have been
+                                      # done. Will bring back the evacuated services from other nodes
+                                      # typically the setup we have will already do this automatically
+                                      # so normally not needed
+  -h|--help
+    Will show this help    
+EOF
+}
+
+find_oracle_homes()
+{
+  # Where is the file that tells us where the oracle inventory is
+  local ORAINST_LOC="/etc/oraInst.loc"
+  # If the file is there we can try to find the ASM home
+  if [ -f $ORAINST_LOC ]
+  then
+    # Look up the oracle inventory location
+    local ORAINVENTORY_LOCATION=`cat $ORAINST_LOC 2>>/dev/null | sed -n -e 's/inventory_loc=\(.*\)/\1/p' 2>>/dev/null`
+    if [ "$ORAINVENTORY_LOCATION" != "" ]
+    then
+      # If we wound the oracle inventory location look for oracle homes
+      #ORACLE_HOMES=`grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null | sed -n -e '/<HOME NAME=.*CRS="true"/s/.*LOC=\"\([^\"]*\)\".*CRS="true".*/\1/p' 2>>/dev/null`
+      ORACLE_HOMES=`grep -v ".*REMOVED=\"T\"\|.*CRS=\"true\"" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null 2>>/dev/null| sed -n -e '/<HOME NAME=.*/s/.*LOC=\"\([^\"]*\)\".*/\1/p' 2>>/dev/null`
+    fi
+  fi
+  if [ "$ORACLE_HOMES" != "" ]
+  then
+    echo "$ORACLE_HOMES"
+  fi
+}
+
+evacuate_services()
+{
+  echo "  DEBUG: Entered function: $FUNCNAME"
+  # We will just call the ndrelocctl program from here
+  local GRID_ORACLE_HOME=$(find_grid_home)
+  local_node=$(${GRID_ORACLE_HOME}/bin/olsnodes -l)
+  if [ $? -ne 0 ]
+  then 
+    echo "  ERROR: Can't find nodename errortext $local_node"
+    exit 1
+  fi  
+  ndrelocctl evacuate services --nodeName $local_node
+}
+
+revive_services()
+{
+  echo "  DEBUG: Entered function: $FUNCNAME"  
+  # We will just call the ndrelocctl program from here
+  local GRID_ORACLE_HOME=$(find_grid_home)
+  local_node=$(${GRID_ORACLE_HOME}/bin/olsnodes -l)
+  if [ $? -ne 0 ]
+  then 
+    echo "  ERROR: Can't find nodename errortext $local_node"
+    exit 1
+  fi  
+  ndrelocctl revive services --nodeName $local_node
+}
+
+deactivate_processes()
+{
+  echo "  DEBUG: Entered function: $FUNCNAME"
+  local errors_found=0
+  local GRID_ORACLE_HOME=$(find_grid_home)
+  # crsctl disable crs
+  sudo ${GRID_ORACLE_HOME}/bin/crsctl disable crs
+  local error=$?;
+  if [ $error -ne 0 ]
+  then 
+    echo "  ERROR: crsctl disable crs failed with error $error"
+    (( errors_found++ ))
+  fi
+  # crsctl stop crs
+  sudo ${GRID_ORACLE_HOME}/bin/crsctl stop crs
+  local error=$?;
+  if [ $error -ne 0 ]
+  then 
+    echo "WARNING: crsctl stop crs failed with error $error - try with force"
+    # crsctl stop crs -f
+    sudo ${GRID_ORACLE_HOME}/bin/crsctl stop crs -f
+    local error=$?;
+    if [ $error -ne 0 ]
+    then 
+      echo "  ERROR: crsctl disable crs -f failed with error $error"
+      (( errors_found++ ))
+    fi
+  fi  
+  # Now tfa is a seprate component so remove
+  # stop tfa also and disable it
+  ##sudo ${GRID_ORACLE_HOME}/bin/tfactl disable
+  #local error=$?;
+  #if [ $error -ne 0 ]
+  #then 
+  #  echo "  ERROR: tfactl disable failed with error $error"
+  #  (( errors_found++ ))
+  #fi  
+  #sudo ${GRID_ORACLE_HOME}/bin/tfactl stop
+  #local error=$?;
+  #if [ $error -ne 0 ]
+  #then 
+  #  echo "  ERROR: tfactl stop failed with error $error"
+  #  (( errors_found++ ))
+  #fi  
+  if [ $errors_found -gt 0 ]
+  then
+  	exit 1
+  fi
+}
+
+activate_processes()
+{
+  echo "  DEBUG: Entered function: $FUNCNAME"
+  local GRID_ORACLE_HOME=$(find_grid_home)
+  # crsctl enable crs
+  # crsctl start crs
+  # Enable tfa
+  local errors_found=0
+  local GRID_ORACLE_HOME=$(find_grid_home)
+  # Now tfa is a seprate component so remove
+  #sudo ${GRID_ORACLE_HOME}/bin/tfactl enable 
+  #local error=$?;  
+  #if [ $error -ne 0 ]
+  #then 
+  #  echo "  ERROR: tfactl enable failed with error $error"
+  #  (( errors_found++ ))
+  #fi    
+  ## Start tfa also and disable it
+  #sudo ${GRID_ORACLE_HOME}/bin/tfactl start
+  #local error=$?;
+  #if [ $error -ne 0 ]
+  #then 
+  #  echo "  ERROR: tfactl start failed with error $error"
+  #  (( errors_found++ ))
+  #fi  
+  # crsctl enable crs
+  sudo ${GRID_ORACLE_HOME}/bin/crsctl enable crs
+  local error=$?;
+  if [ $error -ne 0 ]
+  then 
+    echo "  ERROR: crsctl enable crs failed with error $error"
+    (( errors_found++ ))
+  fi
+  # crsctl start crs
+  sudo ${GRID_ORACLE_HOME}/bin/crsctl start crs
+  local error=$?;
+  if [ $error -ne 0 ]
+  then 
+    echo "WARNING: crsctl start crs failed with error $error"
+    (( errors_found++ ))
+  fi 
+  if [ $errors_found -gt 0 ]
+  then
+  	exit 1
+  fi  
+}
+
+relink_software()
+{
+  echo "  DEBUG: Entered function: $FUNCNAME"
+  # Run relink for all Oracle omes owned by the user wh runs this
+  local errors_found=0
+  ORACLE_HOMES=$(find_oracle_homes)
+  for ORACLE_HOME in $ORACLE_HOMES
+  do
+    #echo "Oracle_Home=$ORACLE_HOME"
+    # Check owner, only handle owner with current user
+    ORACLE_HOME_OWNER=$(stat -c "%U" ${ORACLE_HOME})
+    if [ $ORACLE_HOME_OWNER = `id -un` ]
+    then
+      echo "   INFO: $ORACLE_HOME is owned by user running script"
+      # Check that relink file exists
+      if [ -f ${ORACLE_HOME}/bin/relink ]
+      then
+        # We can relink
+        # Should check that all oracle processes are "down"
+        lsof | grep -q "$ORACLE_HOME"
+        local error=$?;
+        if [ $error -eq 0 ]
+        then 
+          echo "ERROR: Relink $ORACLE_HOME can't be done while running proceses exists in home"
+          (( errors_found++ ))
+        else
+          (export ORACLE_HOME=${ORACLE_HOME};${ORACLE_HOME}/bin/relink all)
+          local error=$?;
+          if [ $error -ne 0 ]
+          then 
+            echo "ERROR: Relink $ORACLE_HOME failed with error=$error"
+            (( errors_found++ ))          
+          fi  
+        fi
+      else
+        echo "WARNING: ${ORACLE_HOME}/bin/relink not found - probably not an oracle DB home"        
+      fi
+    else
+      :
+      #echo "   INFO: Skipping $ORACLE_HOME as not owned by $(id -un)"
+    fi
+  done
+  # Now handle grid home
+  local GRID_ORACLE_HOME=$(find_grid_home)
+  # Get owner as we will need to run as home
+  GRID_HOME_OWNER=$(stat -c "%U" ${GRID_ORACLE_HOME}/oraInst.loc)
+  # Should check that all grid processes are "down"
+  lsof | grep -q "$GRID_ORACLE_HOME"
+  local error=$?;
+  if [ $error -eq 0 ]
+  then 
+    echo "ERROR: Relink $GRID_ORACLE_HOME can't be done while running proceses exists in home"
+    (( errors_found++ ))
+  else
+    # Now unlock Oracle Home
+    sudo $GRID_ORACLE_HOME/crs/install/rootcrs.sh -unlock
+    local error=$?
+    if [ $error -ne 0 ]
+    then 
+      echo "ERROR: rootcrs.sh -unlock failed with error=$error - can't relink"
+      (( errors_found++ ))
+    else
+      # Then as grid
+      #/u01/app/19.3.0.0/grid/bin/relink
+      sudo -u ${GRID_HOME_OWNER}  ORACLE_HOME="$GRID_ORACLE_HOME" ${GRID_ORACLE_HOME}/bin/relink all
+      if [ $error -ne 0 ]
+      then 
+        echo "ERROR: relink all failed "
+        (( errors_found++ ))
+      fi
+      # Lock home as root
+      #/u01/app/19.3.0.0/grid/crs/install/rootcrs.sh -lock  
+      sudo $GRID_ORACLE_HOME/crs/install/rootcrs.sh -lock
+      if [ $error -ne 0 ]
+      then 
+        echo "ERROR: rootcrs.sh -lock failed with error=$error - can't relink"
+        (( errors_found++ ))
+      fi
+    fi
+  fi
+  if [ $errors_found -gt 0 ]
+  then
+  	exit 1
+  fi
+}
+
+
+
+#
+# parse_arguments
+#
+# Purpose: Parses all the arguments received on command line
+# first argument is always action and second is component/object
+#
+parse_arguments()
+{
+  if [ $# -eq 0 ]
+  then
+    write_usage
+    exit
+  fi
+  # First check action is one we know off
+  VALID_ACTION_LIST="evacuate deactivate relink activate revive -h --help "
+  if string_contain "$1 " "$VALID_ACTION_LIST"
+  then
+    ACTION=$1
+  else
+    echo "   ERROR: Action parameter \"$1\" given to script not recognized"
+    exit 1
+  fi
+  if [ "$ACTION" = "-h" -o "$ACTION" = "--help" ]
+  then
+    write_usage
+    exit
+  fi
+  shift
+  if [ $# -eq 0 ]
+  then
+    echo "   ERROR: Action parameter \"$ACTION\" given to script needs to be followed by an object"
+    exit 1
+  fi
+  # Depending on action various objects might be specified
+  case $1 in
+    services) OBJECT="services";VALID_ACTION_LIST="evacuate revive ";;
+    processes) OBJECT="processes";VALID_ACTION_LIST="deactivate activate ";;
+    software) OBJECT="software";VALID_ACTION_LIST="relink ";;
+    *)            echo "   ERROR: Object parameter $1 given to script not recognized";exit 1;;
+  esac;
+  shift
+  # first check if we support combination
+  if ! string_contain  "$ACTION " "$VALID_ACTION_LIST" 
+  then
+    echo "   ERROR: The action \"$ACTION\" is not not supported for object \"$OBJECT\". Actions allowed is \"$VALID_ACTION_LIST\""
+    exit 1
+  fi
+  
+  # Now we for each action/object checks the parameters, we use getopt for that in case there are some parameters
+  case $OBJECT in
+    services)
+      case $ACTION in
+        evacuate)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+        revive)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac
+      ;;
+    processes)
+      case $ACTION in
+        deactivate)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+        activate)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;          
+      esac
+      ;;
+    software)
+      case $ACTION in
+        relink)
+          # Now we checked that combination of object/action is valid parameters
+          TEMP=`getopt -o "" --name "$0" -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+            --) shift ; break ;;
+             *) echo "   ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          ;;
+      esac;;          
+    *)
+      echo "   ERROR: $OBJECT not handled - internal error"
+      exit 1
+      ;;        
+  esac
+}
+
+#
+# handle_request
+#
+# Purpose: handles the request after arguments have been analyzed checked
+#
+handle_request()
+{
+  case $OBJECT in
+    services)
+      case $ACTION in
+        evacuate)
+          evacuate_services;;
+        revive)
+          revive_services;;
+      esac
+      ;;
+    processes)
+      case $ACTION in
+        deactivate)
+          deactivate_processes;;
+        activate)
+          activate_processes;;
+      esac
+      ;;
+    software)
+      case $ACTION in
+        relink)
+          relink_software;;
+      esac
+      ;;
+  esac
+}
+
+#
+# build_environment_names
+#
+# Purpose: Build some environment names based on parameters
+#          given to script plus other variables needed
+#
+build_environment_names()
+{
+  DOMAIN_NAME=${HOSTNAME#*.}
+  SHORT_HOST_NAME=${HOSTNAME%%.*}
+}
+
+
+# Script really starts here
+check_for_permission oracle
+# Parse arguments (and check)
+parse_arguments "$@"
+# Build some standard environment stuff
+build_environment_names
+# Handle the request
+handle_request
+echo "  INFO: Script finished ($(date +"%F_%T"))"

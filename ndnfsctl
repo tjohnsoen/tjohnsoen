@@ -1,0 +1,1559 @@
+#!/bin/bash
+# This script is used to help setup the the nordea configuration on exadata
+# machines 
+# 1.0.0   2016-11-10 asger.solvang@nordea.com     Initial version
+# 1.0.1   2016-12-22 asger.solvang@nordea.com     First version that seems to work a lot of changes
+# 1.0.2   2016-12-27 asger.solvang@nordea.com     Changed ownership of /etc/oranfstab
+# 1.0.3   2016-12-27 asger.solvang@nordea.com     Added possibility to only use fstab and mount read only
+# 1.0.4   2016-12-29 asger.solvang@nordea.com     Changed for packaging as rpm and changed name
+# 1.0.5   2017-01-02 asger.solvang@nordea.com     Wrong paths and other small changes
+# 1.0.6   2017-01-03 asger.solvang@nordea.com     add_nfs_mount did not detect correctly existing mount and now updates nordea_environment.conf
+# 1.0.7   2017-01-03 asger.solvang@nordea.com     made it possible to also specif --readonly to dnfs mountpoints (only in fstab)
+# 1.0.8   2017-01-25 asger.solvang@nordea.com     Updated version string
+# 1.0.9   2017-01-25 asger.solvang@nordea.com     Added creation of auditbackup
+# 1.0.10  2017-06-29 asger.solvang@nordea.com     Now also handle missing local properly and added possiblity to refresh content in oranfstab (for cleanup of local: property errors)
+# 1.0.11  2017-12-31 asger.solvang@nordea.com     END had spaces after it, fixed --auditbackup in getopt
+# 1.0.12  2018-08-24 asger.solvang@nordea.com     Moved the ssh access check to only be called when run against mutiple nodes and changed the way grid home is found
+# 1.0.13  2018-09-13 asger.solvang@nordea.com     More END SPaces removed
+# 1.0.14  2020-03-05 asger.solvang@nordea.com     Added that /etc/oranfstab is owned by oracle
+# 1.0.15  2020-03-23 asger.solvang@nordea.com     Now tries to handle SOP more transparent
+# 1.0.16  2020-06-19 asger.solvang@nordea.com     Added nfs version handling
+# 1.0.17  2020-11-25 asger.solvang@nordea.com     Default nfsv=3
+SVERSION="1.0.17"
+# Used for timestamps in files etc
+now=$(date +"%F_%T")
+echo "   INFO: Script version $SVERSION (${now})"
+#set -x
+# TBD rpcinfo -u 127.0.0.1 nfs 3
+# Nordea environment file
+NORDEA_ENVIRONMENT_FILE="/etc/nordea_environment.conf"
+# name of the script
+script_name=${0##*/}
+#Short host name
+local_short_hostname=${HOSTNAME%%.*}
+# Run time information - used f.x. for creating database files
+ndnfsctl_var_run_directory="/var/run/ndnfsctl"
+# Librarys for the tool. Her we have standard setups and also save backup of files we change
+ndnfsctl_var_lib_directory="/var/lib/ndnfsctl"
+# If we log something do it to this file, currently we don't log anything
+ndnfsctl_log_file="/var/log/ndnfsctl.log"
+# Nfs test mount directory
+nfs_test_mount_dir=/tmp/testmount
+# Name of fstab file
+fstab_file="/etc/fstab"
+# Name of oranfstab file
+oranfstab_file="/etc/oranfstab"
+# Name of new oranfstab file
+oranfstab_file_new="/etc/oranfstab.new"
+# The sqllite schema creation sql, used for creating the schema that is used to handle access.conf
+sql_schema_file="${ndnfsctl_var_lib_directory}/sql/ndnfsctl.sql"
+# The SQL Schema for handling access.conf location
+sql_database_file_directory="$ndnfsctl_var_run_directory/sql"
+# The sqllite database
+sql_database_file="${sql_database_file_directory}/ndnfsctl.sqlite3"
+# The sqllite schema creation sql, used for creating the schema
+sql_data_file="${sql_database_file_directory}/ndnfsctl-data.sql"
+# Whitespace
+whitespace=$(printf '\n\t ')
+
+get_nfs_mount_options()
+{
+  local INPUT_NFS_VERSION="$1"
+  local INPUT_READ_STATE="$2"
+  local INPUT_TEST="$3"
+  local NFS_VERSION_NUMBER
+  local READ_STATE
+  case $INPUT_NFS_VERSION in
+      "nfsv3")
+        NFS_VERSION_NUMBER=3
+        ;;
+      "nfsv4")
+        NFS_VERSION_NUMBER=4
+        ;;
+      "nfsv4.1")
+        NFS_VERSION_NUMBER=4.1
+        ;;
+      *)
+        NFS_VERSION_NUMBER=3
+        ;;
+  esac
+  if [ "$INPUT_READ_STATE" == "" ]
+  then 
+    READ_STATE=rw
+  else
+    READ_STATE=$INPUT_READ_STATE
+  fi
+  if [ "$INPUT_TEST" == "test" ]
+  then
+    echo "${READ_STATE},fg,soft,nointr,retry=0,tcp,nfsvers=${NFS_VERSION_NUMBER},actimeo=0,timeo=50"
+  else
+    echo "${READ_STATE},bg,hard,nointr,rsize=1048576,wsize=1048576,tcp,nfsvers=${NFS_VERSION_NUMBER},actimeo=0,timeo=600"
+  fi
+}
+
+
+trim()
+{
+  local var="$*"
+  var1="${var%%[![:space:]]*}"   # remove leading whitespace characters
+  var="${var#${var1}}"   # remove leading whitespace characters
+  var1="${var##*[![:space:]]}"   # remove trailing whitespace characters
+  var="${var%${var1}}"   # remove trailing whitespace characters
+  echo -n "$var"
+}
+
+#
+# set_grid_home
+#
+# Purpose: Will find the GRID home of the cluster
+#
+# Environment output
+#          GRID_ORACLE_SID, GRID_ORACLE_HOME
+set_grid_home()
+{
+  local ORAINST_LOC="/etc/oraInst.loc"
+  if [ -f $ORAINST_LOC ]
+  then
+    local ORAINVENTORY_LOCATION=`cat $ORAINST_LOC 2>>/dev/null | sed -n -e 's/inventory_loc=\(.*\)/\1/p' 2>>/dev/null`
+    if [ "$ORAINVENTORY_LOCATION" != "" ]
+    then
+      GRID_ORACLE_HOME=`grep -v ".*REMOVED=\"T" ${ORAINVENTORY_LOCATION}/ContentsXML/inventory.xml 2>>/dev/null | sed -n -e '/<HOME NAME=.*CRS="true"/s/.*LOC=\"\([^\"]*\)\".*CRS="true".*/\1/p' 2>>/dev/null`
+    fi
+  fi
+  # Get ASM Instance on this box
+  GRID_ORACLE_SID=`ps -ef | grep pmon_+ASM | grep asm_ | sed -n "s/.*\(+ASM[0123456789][0123456789]*\)/\1/p"`
+}
+
+
+
+#
+# get_nodes
+#
+# Purpose: Return a list of nodes in the cluster. Typicaly
+#          called in a sub shell like: nodes=$(get_nodes)
+#
+# Text output
+#          All nodes in the cluster - one on each line
+get_nodes()
+{
+  set_grid_home
+  su - grid -c "$GRID_ORACLE_HOME/bin/olsnodes"
+}
+
+#
+# get_count_of_nodes
+#
+# Purpose: Return the number of nodes in the cluster. Typicaly
+#          called in a sub shell like: nodes=$(get_count_of_nodes)
+#
+# Text output
+#          Numer of nodes in the cluster
+get_count_of_nodes()
+{
+  set_grid_home
+  su - grid -c "$GRID_ORACLE_HOME/bin/olsnodes | wc -l"
+}
+
+#
+# get_localinterconnect_ips
+#
+# Purpose: Return a list of interconnect IP's in the cluster. Typicaly
+#          called in a sub shell like: nodes=$(get_localinterconnect_ips)
+#
+# Arguments:
+#          Number ip's wanted back, default the number that there is in the cluster
+# Text output
+#          All IP's of interconnects in the cluster - one on each line
+
+get_localinterconnect_ips()
+{
+  local number_of_ips
+  local all_interconnect_ips
+  local number_of_ips_found
+  local array_all_interconnect_ips
+  set_grid_home
+  nodes_in_cluster=$( get_nodes )   
+  all_interconnect_ips=$(su - grid -c "$GRID_ORACLE_HOME/bin/olsnodes -l -p | sed -e \"s/^.*[[:space:]]\+\\\(.*\\\)/\1/\" -e \"s/,/ /g\"")
+  array_all_interconnect_ips=($all_interconnect_ips)
+  number_of_ips_found=${#array_all_interconnect_ips[@]}
+  if [ "$1" == "" ]
+  then
+    number_of_ips=$number_of_ips_found
+  else
+    number_of_ips=$1
+  fi
+  if [ $number_of_ips_found -gt 0 ]
+  then
+    for ((index=1 ; index<=$number_of_ips; index++))
+    do
+      echo ${array_all_interconnect_ips[$(($index % $number_of_ips_found))]}
+    done
+  fi
+}
+
+
+delete_configuration_parameter()
+{
+  local parameter="$1"
+  sed -i "/^${parameter}[[:space:]]*=.*/d" ${NORDEA_ENVIRONMENT_FILE}     
+}
+
+update_configuration_parameter()
+{
+  local parameter="$1"
+  local value="$2"
+  grep "^${parameter}=" ${NORDEA_ENVIRONMENT_FILE} >>${ndnfsctl_log_file} 2>&1 && sed -i "s/^${parameter}.*/${parameter}=${value//\//\\/}/" ${NORDEA_ENVIRONMENT_FILE} || echo "${parameter}=${value}" >> ${NORDEA_ENVIRONMENT_FILE}     
+}
+
+get_configuration_parameter()
+{
+  local parameter="$1"
+  grep "^${parameter}=" ${NORDEA_ENVIRONMENT_FILE} >>${ndnfsctl_log_file} 2>&1 && sed -n "s/^${parameter}[[:space:]]*=[[:space:]]*\(.*\)/\1/p" ${NORDEA_ENVIRONMENT_FILE} || echo ""     
+}
+
+
+
+check_node_access()
+{
+  local nodes_to_check
+  if [ "$1" != "" ]
+  then
+    # We supplied a list use that
+    nodes_to_check=$1
+  else
+    # Check all
+    set_grid_home
+    nodes_to_check=$( get_nodes )
+  fi
+  for node in $nodes_to_check
+  do
+    # Create exadata command
+    cmd_exa="date >>$ndnfsctl_log_file 2>&1"
+    # Create sop command
+    printf -v cmd_sop '%q' "sudo bash -c \"$cmd_exa\""
+    # Check ssh access
+    # If we are on SOP we need to use sopsetup for doing the ssh
+    # Check for user sopsetup - hack
+    grep -q '^sopsetup:' /etc/passwd
+    if [ $? -eq 0 ]
+    then
+      # ON SOP, use sopsetup
+      su  -l sopsetup -c "timeout 5 ssh $node ${cmd_sop}"
+    else
+      # ON Exadata just ssh directly
+      timeout 5 ssh $node ${cmd_exa}
+    fi
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't reach node $node"
+      exit 1
+    fi      
+  done
+}
+
+get_nodes_to_run_on()
+{
+  local runon_nodes
+  local runon_allnodes
+  local runon_localnode 
+  local nodes_to_check
+  runon_nodes="$1"
+  runon_allnodes="$2"
+  runon_localnode="$3"
+  if [[ "$runon_nodes" != "" &&  "$runon_allnodes" = "YES" ]] || [[ "$runon_localnode" = "YES" &&  "$runon_allnodes" = "YES" ]] ||  [[ "$runon_nodes" != "" &&  "$runon_localnode" = "YES" ]]
+  then
+    echo " ERROR: Can only specify one of --localnode, --allnodes and --nodes=\"<space separated list of nodes>\""
+    exit 1
+  fi
+  if [ "$runon_nodes" != "" ]
+  then
+    # A list was specified - use that
+    nodes_to_check="$runon_nodes"  
+  fi
+  if [ "$runon_allnodes" = "YES" ]
+  then
+    # Get all nodes and use that
+    nodes_to_check=$( get_nodes )  
+  fi
+  if [ "$runon_localnode" = "YES" ]
+  then
+    # Get local node
+    nodes_to_check=${local_short_hostname}  
+  fi
+  # Return the nodes
+  echo "$nodes_to_check"
+}
+
+#
+# create_empty_sqlite_database
+#
+# Purpose: Will create an empty sqlite3 database with tables/views etc. 
+# Arguments: none
+# Return: 0 if ok 1 otherwise
+#
+create_empty_sqlite_database()
+{
+  # make sure the catalog is there
+  mkdir -p ${sql_database_file_directory}
+  chmod 700 ${sql_database_file_directory}
+  #echo " DEBUG: Entered function: $FUNCNAME"
+  rm -f $sql_database_file || { echo " ERROR: Can't rm -f $sql_database_file"; return 1; }
+  rm -f $sql_data_file || { echo " ERROR: Can't rm -f $sql_data_file"; return 1; }
+  touch $sql_data_file
+  chmod 600 $sql_data_file
+  sqlite3 $sql_database_file < $sql_schema_file
+  if [ $? -ne 0 ]
+  then
+    echo " ERROR: Can't create sqlite3 database $sql_database_file"
+    exit 1
+  fi
+  # Make it read only to only root TBD remove 666 to 600
+  chmod 666 $sql_database_file  
+}
+
+parse_fstab()
+{
+  # TBD needs to use the followung instead of cat : findmnt -s -c -n -t nfs 
+  #cat ./fndmnt | sed -e  "s/\([^ \t]*\)[[:space:]]*\([^:]*\):\([^ \t]*\)[[:space:]]*nfs[[:space:]]*\(.*\)/INSERT INTO fstabnfs(mount,host,export,options) VALUES('\1','\2','\3','\4');/"  >> $sql_data_file
+  sed -n -e "s/\([^:]*\)\(:\)\([^ \t]*\)\([[:space:]]*\)\([^ \t]*\)\([[:space:]]*\)\(nfs\)\([[:space:]]*\)\(.*\)/INSERT INTO fstabnfs(mount,host,export,options) VALUES('\5','\1','\3','\9');/p" $fstab_file >> $sql_data_file
+}
+
+delete_fstab()
+{
+  local INPUT_MOUNT
+  INPUT_MOUNT=$1
+  sed -i_$now -e  "/[^:]*:[^ \t]*[[:space:]]*${INPUT_MOUNT//\//\\/}[[:space:]]*nfs[[:space:]]*.*/d" $fstab_file
+}
+
+add_fstab()
+{
+  local INPUT_SERVER
+  local INPUT_EXPORT
+  local INPUT_MOUNT
+  local INPUT_OPTIONS
+  INPUT_SERVER="$1"
+  INPUT_EXPORT="$2"
+  INPUT_MOUNT="$3"
+  INPUT_OPTIONS="$4"
+  cp -p ${fstab_file}  ${fstab_file}_$now
+  echo -e "${INPUT_SERVER}:${INPUT_EXPORT}\t${INPUT_MOUNT}\tnfs\t${INPUT_OPTIONS}" >> $fstab_file 
+}
+
+update_fstab()
+{
+  local INPUT_SERVER
+  local INPUT_EXPORT
+  local INPUT_MOUNT
+  local INPUT_OPTIONS
+  INPUT_SERVER="$1"
+  INPUT_EXPORT="$2"
+  INPUT_MOUNT="$3"
+  INPUT_OPTIONS="$4"
+  sed -e -i_${now} "s/\([^:]*\)\(:\)\([^ \t]*\)\([[:space:]]*\)\([^ \t]*\)\([[:space:]]*\)\(nfs\)\([[:space:]]*\)\(.*\)/${INPUT_SERVER}\2${INPUT_EXPORT//\//\\/}\4${INPUT_MOUNT//\//\\/}\6\7\8${INPUT_OPTIONS}/" $fstab_file 
+}
+
+
+parse_oranfstab()
+{
+  #set -x
+  #path_group=0
+  # Is it there or is it first run
+  if [ ! -f "$oranfstab_file" ]
+  then
+    # Assume it's in analready created directory
+    touch "$oranfstab_file"
+    chmod 640 "$oranfstab_file"
+  fi
+  current_type=""
+  while read line; do
+    #echo "$line"
+    case $line in 
+      server:*)
+        #echo "SERVER"
+        parse_start="${line#server:}"
+        server=$(trim $parse_start)
+        #echo "server=>$server<"
+        echo "insert into servers( name )" >> $sql_data_file   
+        echo "values ('${server}');" >> $sql_data_file        
+        #(( path_group++ ))
+        #echo "insert into path_groups( id,island_name )" >> $sql_data_file   
+        #echo "values ($path_group, '${server}');" >> $sql_data_file    
+        current_type="server"
+        ;;
+      nfs_version:*)
+        #echo "SERVER"
+        parse_start="${line#nfs_version:}"
+        nfs_version=$(trim $parse_start)
+        #echo "nfs_version=>$nfs_version<"
+        echo "update servers" >> $sql_data_file   
+        echo "set nfs_version='${nfs_version}'" >> $sql_data_file        
+        echo "where name='${server}';" >> $sql_data_file        
+        current_type="nfs"
+        ;;
+      local:*)
+        #echo "LOCAL"
+        parse_start="${line#local:}"
+        parse_start="${parse_start%path:*}"
+        local=$(trim ${parse_start})
+        #echo "local=>$local<"
+        # OK path must be there to
+        parse_start="${line#*path:}"
+        path=$(trim ${parse_start})
+        #echo "path=>$path<"
+        if [ "$local" = "" ]
+        then
+          # Empty local
+          echo "insert into paths( local,path,server_name )" >> $sql_data_file   
+          echo "values (null,'$path','${server}');" >> $sql_data_file        
+        else
+          # Local address given
+          echo "insert into paths( local,path,server_name )" >> $sql_data_file   
+          echo "values ('$local','$path','${server}');" >> $sql_data_file
+        fi
+        current_type="path"
+        ;;
+      path:*)
+        #echo "PATH"
+        #if [ "$current_type" = "export" ]
+        #then
+        #  (( path_group++ ))
+        #  echo "insert into path_groups( id,island_name )" >> $SQL_DATA_FILE   
+        #  echo "values ($path_group, '${server}');" >> $SQL_DATA_FILE      
+        #fi
+        parse_start="${line#path:}"
+        path=$(trim $parse_start)
+        #echo "path=>$path<"
+        echo "insert into paths( local,path,server_name )" >> $sql_data_file   
+        echo "values (null,'$path','${server}');" >> $sql_data_file        
+        current_type="path"
+        ;;
+      export:*)
+        #echo "EXPORT"
+        parse_start="${line#export:}"
+        parse_start="${parse_start%mount:*}"
+        export=$(trim ${parse_start})
+        #echo "export=>$export<"
+        # OK mount must be there to
+        parse_start="${line#*mount:}"
+        mount=$(trim ${parse_start})
+        #echo "mount=>$mount<"
+        echo "insert into mounts( export,mount,server_name )" >> $sql_data_file   
+        echo "values ('$export','$mount','${server}');" >> $sql_data_file      
+        current_type="export"
+        ;;
+      *[!$whitespace]*)
+        # There is non whitespace charecters in the line
+        echo "UNKNOWN line in $oranfstab_file >$line<"
+        ;;
+      *)
+        # Only whitespace ignore it
+        :
+        ;;
+    esac
+  done < <( cat $oranfstab_file )
+}
+
+
+#
+# write_oranfstab
+#
+# Purpose: Will write new oranfstab file and create backups if needed
+#
+write_oranfstab()
+{
+  access_conf_new_content=`sqlite3 $sql_database_file "select text from oranfstab_file;"` 2>&1 
+  if [ $? -ne 0 ]
+  then
+    echo " ERROR: Can't get new oranfstab_content"
+    exit 1
+  fi
+  
+  echo "$access_conf_new_content" > ${oranfstab_file_new}
+  cmp -s ${oranfstab_file} ${oranfstab_file_new}
+  if [ $? -ne 0 ]
+  then
+    # They were different
+    # Make sure catalog is there
+    #mkdir -p ${access_conf_backup_file_directory}
+    # backup and cat it to the org file
+    cp -p ${oranfstab_file} ${oranfstab_file}_${now}
+    cat ${oranfstab_file_new}  > ${oranfstab_file}
+    # Ensure owner is "oracle" and access is right
+    chown oracle:oinstall ${oranfstab_file}
+    chmod 660 ${oranfstab_file}
+    
+  fi
+  # Remove temporary file
+  rm -f ${oranfstab_file_new}
+}
+
+#
+# load_sqlite_database
+#
+# Purpose: Will load the generated sql file into the sqlite3 database
+# Arguments: none
+# Return: 0 if ok 1 otherwise
+#
+load_sqlite_database()
+{
+  #echo " DEBUG: Entered function: $FUNCNAME"
+  sqlite3 $sql_database_file < $sql_data_file
+  if [ $? -ne 0 ]
+  then
+    echo " ERROR: Can't load sqlite3 database $sql_database_file"
+    exit 1
+  fi
+}
+
+write_usage()
+{
+  echo "$0 is used for configuring various components during the install "
+  echo "and setup of a new Exadata machine"
+  echo ""
+  echo "Usage"
+  echo "  $script_name show dnfsserver NODEOPTIONS"
+  echo "               [--server=\"<a logical server name>\"]>"
+  echo "  $script_name add dnfsserver NODEOPTIONS"
+  echo "               --server=\"<a logical server name>\">"
+  echo "               [--nfs_version=\"[nfsv3|nfsv4|nfsv4.1]\">] # Default nfsv3"
+  echo "               [[--local[1-4]=\"<local IP>\"]|[--guesslocalinterconnect]]"
+  echo "               --remote[1-4]=\"<remote IP>\""
+  echo "  $script_name remove dnfsserver NODEOPTIONS"
+  echo "               --server=\"<a logical server name>\">"
+  echo "  $script_name show dnfsmount NODEOPTIONS"
+  echo "               [--server=\"<a logical server name>\"]>"
+  echo "  $script_name add dnfsmount NODEOPTIONS"
+  echo "               --server=\"<a logical server name>\">"
+  echo "               --export=\"<remote file system>\"" 
+  echo "               --mount=\"<local file system>\"" 
+  echo "               [--readonly]"   
+  echo "  $script_name remove dnfamount NODEOPTIONS"
+  echo "               --mount=\"<local file system>\"" 
+  echo "  $script_name show nfsmount NODEOPTIONS"
+  echo "               [--host=\"<a host name>\"]>"
+  echo "  $script_name add nfsmount NODEOPTIONS"
+  echo "               --host=\"<a host name>\">"
+  echo "               --export=\"<remote file system>\"" 
+  echo "               --mount=\"<local file system>\"" 
+  echo "               [--nfs_version=\"[nfsv3|nfsv4|nfsv4.1]\">] # Default nfsv3"
+  echo "               [--readonly]" 
+  echo "               [--fsbkupprivate|--fsbkuppublic|--tmpwork|--auditbackup]" 
+  echo "  $script_name remove nsfmount NODEOPTIONS"
+  echo "               --mount=\"<local file system>\""
+  echo "  $script_name loadandwrite oranfstab NODEOPTIONS"  
+  echo "  $script_name --help"
+  echo ""
+  echo " NODEOPTIONS = --allnodes|--nodes=\"space separated list of nodes\"|--localnode"
+  
+}
+
+#
+# Purpose: We only want root to run this
+#
+check_for_permission()
+{
+  if [ `id -u` -ne 0 ]
+  then
+    echo " ERROR: No access rights. Need to be run as root"
+    exit 1
+  fi
+}
+
+#
+# string_contain
+#
+# Purpose: Will check if string argument 1 is in argument2
+# Arguments: The section part to print
+# Return: 0 if ok 1 otherwise
+#
+string_contain()
+{
+  [ -z "${2##*$1*}" ] && [ -z "$1" -o -n "$2" ]
+}
+
+
+add_dnfsserver()
+{
+  local INPUT_SERVER
+  local INPUT_LOCAL_1
+  local INPUT_LOCAL_2
+  local INPUT_LOCAL_3
+  local INPUT_LOCAL_4
+  local INPUT_REMOTE_1
+  local INPUT_REMOTE_2
+  local INPUT_REMOTE_3
+  local INPUT_REMOTE_4
+  local INPUT_LOCAL_INTERCONNECT_GUESS
+  local INPUT_NFS_VERSION
+  INPUT_SERVER=$1
+  INPUT_LOCAL_1=$2
+  INPUT_LOCAL_2=$3
+  INPUT_LOCAL_3=$4
+  INPUT_LOCAL_4=$5
+  INPUT_REMOTE_1=$6
+  INPUT_REMOTE_2=$7
+  INPUT_REMOTE_3=$8
+  INPUT_REMOTE_4=$9
+  INPUT_LOCAL_INTERCONNECT_GUESS=${10}
+  INPUT_NFS_VERSION=${11}
+  # TBD HOW TO HANFDLE GUESS
+  if [ "${INPUT_LOCAL_INTERCONNECT_GUESS}" = "YES" ]
+  then
+    # OK Now fill out INPUT_LOCAL_x for the ones that have INPUT_REMOTE_x set
+    # Let's get 4 numbers and assign them
+    array_local_ips=($(get_localinterconnect_ips 4))
+    INPUT_LOCAL_1=${array_local_ips[1]}
+    INPUT_LOCAL_2=${array_local_ips[2]}
+    INPUT_LOCAL_3=${array_local_ips[3]}
+    INPUT_LOCAL_4=${array_local_ips[4]}
+  fi
+  # First check if INPUT_SERVER exists already
+  number_of_servers_found=`sqlite3 $sql_database_file "select count(name) from servers where name='$INPUT_SERVER';"`  || { echo "  ERROR: Can't execute select count(name) from servers where name='$INPUT_SERVER';"; exit 1; }
+  if [ $number_of_servers_found -gt 0 ]
+  then  
+    # Only one can be specified
+    echo " ERROR: Server $INPUT_SERVER already exists"
+    exit 1
+  fi  
+  #Ok server does not exists. What about the IP's?
+  # First check if remote IP's are not used already, if names are used we can still be fooled - as we don't handle that yet.
+  number_of_paths_found=`sqlite3 $sql_database_file "select count(path) from paths where server_name IN ('$INPUT_REMOTE_1','$INPUT_REMOTE_2','$INPUT_REMOTE_3','$INPUT_REMOTE_4');"`  || { echo "  ERROR: Can't execute select count(path) from paths where server_name IN ('$INPUT_REMOTE_1','$INPUT_REMOTE_2','$INPUT_REMOTE_3','$INPUT_REMOTE_4');"; exit 1; }
+  if [ $number_of_paths_found -gt 0 ]
+  then  
+    # Only one can be specified
+    echo " ERROR: Some of the --remote[1-4] IP's alreaday is used for a server"
+    exit 1
+  fi
+  if [ "$INPUT_NFS_VERSION" == "" ]
+  then
+  # Now we should be ready to add - first to server
+    sqlite3 $sql_database_file << END
+INSERT INTO servers(name)
+VALUES ('$INPUT_SERVER');
+END
+  else
+  # Now we should be ready to add - first to server
+    sqlite3 $sql_database_file << END
+INSERT INTO servers(name,nfs_version)
+VALUES ('$INPUT_SERVER','$INPUT_NFS_VERSION');
+END
+  fi
+  if [ $? -ne 0 ]
+  then
+    echo " ERROR: Can't add server $INPUT_SERVER into server table"
+    exit 1
+  fi
+  # Now try to add all the remote servers that are not null
+  if [ "${INPUT_REMOTE_1}" != "" ]
+  then
+    if [ "${INPUT_LOCAL_1}" = "" ]
+    then
+      # Empty local
+      sqlite3 $sql_database_file << END
+INSERT INTO paths(local,path,server_name)
+VALUES (null,'${INPUT_REMOTE_1}','$INPUT_SERVER');
+END
+    else
+      # Local address given
+      sqlite3 $sql_database_file << END
+INSERT INTO paths(local,path,server_name)
+VALUES ('${INPUT_LOCAL_1}','${INPUT_REMOTE_1}','$INPUT_SERVER');
+END
+    fi
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't add remote up $INPUT_REMOTE_1 into paths table"
+      exit 1
+    fi
+  fi
+  if [ "${INPUT_REMOTE_2}" != "" ]
+  then
+    if [ "${INPUT_LOCAL_2}" = "" ]
+    then
+      # Empty local
+      sqlite3 $sql_database_file << END
+INSERT INTO paths(local,path,server_name)
+VALUES (null,'${INPUT_REMOTE_2}','$INPUT_SERVER');
+END
+    else
+      # Local address given
+      sqlite3 $sql_database_file << END
+INSERT INTO paths(local,path,server_name)
+VALUES ('${INPUT_LOCAL_2}','${INPUT_REMOTE_2}','$INPUT_SERVER');
+END
+    fi
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't add remote up $INPUT_REMOTE_2 into paths table"
+      exit 1
+    fi
+  fi
+  if [ "${INPUT_REMOTE_3}" != "" ]
+  then
+    if [ "${INPUT_LOCAL_3}" = "" ]
+    then
+      # Empty local
+      sqlite3 $sql_database_file << END
+INSERT INTO paths(local,path,server_name)
+VALUES (null,'${INPUT_REMOTE_3}','$INPUT_SERVER');
+END
+    else
+      # Local address given
+      sqlite3 $sql_database_file << END
+INSERT INTO paths(local,path,server_name)
+VALUES ('${INPUT_LOCAL_3}','${INPUT_REMOTE_3}','$INPUT_SERVER');
+END
+    fi
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't add remote up $INPUT_REMOTE_3 into paths table"
+      exit 1
+    fi
+  fi
+  if [ "${INPUT_REMOTE_4}" != "" ]
+  then
+    if [ "${INPUT_LOCAL_4}" = "" ]
+    then
+      # Empty local
+      sqlite3 $sql_database_file << END
+INSERT INTO paths(local,path,server_name)
+VALUES (null,'${INPUT_REMOTE_4}','$INPUT_SERVER');
+END
+    else
+      # Local address given
+      sqlite3 $sql_database_file << END
+INSERT INTO paths(local,path,server_name)
+VALUES ('${INPUT_LOCAL_4}','${INPUT_REMOTE_4}','$INPUT_SERVER');
+END
+    fi
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't add remote up $INPUT_REMOTE_4 into paths table"
+      exit 1
+    fi
+  fi
+  write_oranfstab
+}
+
+remove_dnfsmount()
+{
+  #set -x
+  local INPUT_MOUNT
+  INPUT_MOUNT=$1
+  # Does it exist
+  number_of_mounts_found=`sqlite3 $sql_database_file "select count(mount) from fstabnfs where mount='$INPUT_MOUNT';"`  || { echo "  ERROR: Can't execute select count(mount) from fstabnfs where mount='$INPUT_MOUNT';"; exit 1; }
+  #echo "number_of_mounts_found=$number_of_mounts_found"
+  if [ $number_of_mounts_found -gt 0 ]
+  then
+    # Try to get the stuff unmounted, if is already we ignore that
+    umount ${INPUT_MOUNT}
+    if [ $? -eq 16  ]
+    then
+      # Something blocking - show some hints
+      echo " ERROR: Can't unmount $INPUT_MOUNT. Probbaly something is accessing the share"
+      lsof ${INPUT_MOUNT}
+      exit 1
+    fi
+  fi
+  if [ $number_of_mounts_found -eq 0 ]
+  then
+    echo "  INFO: No entry found for mount ${INPUT_MOUNT} in ${fstab_file}"
+  else
+    sqlite3 $sql_database_file << END
+    delete from fstabnfs
+    where mount='$INPUT_MOUNT';
+END
+    # Write changes to disk
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't remove mount point from fstabnfs table"
+      exit 1
+    fi
+  fi
+  number_of_mounts_found=`sqlite3 $sql_database_file "select count(mount) from mounts where mount='$INPUT_MOUNT';"`  || { echo "  ERROR: Can't execute select count(mount) from mounts where mount='$INPUT_MOUNT';"; exit 1; }
+  if [ $number_of_mounts_found -eq 0 ]
+  then
+    echo "  INFO: No entry for mount ${INPUT_MOUNT} found in ${oranfstab_file}"
+  else
+    sqlite3 $sql_database_file << END
+    delete from mounts
+    where mount='$INPUT_MOUNT';
+END
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't remove mount point from mounts table"
+      exit 1
+    fi
+  fi
+  rmdir ${INPUT_MOUNT}
+  delete_fstab "$INPUT_MOUNT"
+  write_oranfstab 
+}
+
+remove_nfsmount()
+{
+  #set -x
+  local INPUT_MOUNT
+  INPUT_MOUNT=$1
+  local ndbuctl_mount_point_private
+  local ndbuctl_mount_point_public
+  # Is it also an dnfsmount because then quit
+  number_of_mounts_found=`sqlite3 $sql_database_file "select count(mount) from mounts where mount='$INPUT_MOUNT';"`  || { echo "  ERROR: Can't execute select count(mount) from mounts where mount='$INPUT_MOUNT';"; exit 1; }
+  if [ $number_of_mounts_found -ne 0 ]
+  then
+    echo " ERROR: Can't remove mount point ${INPUT_MOUNT} from $fstab_file as it's also in $oranfstab_file"
+    exit 1
+  fi
+  # Does it exist in fstab?
+  number_of_mounts_found=`sqlite3 $sql_database_file "select count(mount) from fstabnfs where mount='$INPUT_MOUNT';"`  || { echo "  ERROR: Can't execute select count(mount) from fstabnfs where mount='$INPUT_MOUNT';"; exit 1; }
+  #echo "number_of_mounts_found=$number_of_mounts_found"
+  if [ $number_of_mounts_found -gt 0 ]
+  then
+    # Try to get the stuff unmounted, if is already we ignore that
+    umount ${INPUT_MOUNT}
+    if [ $? -eq 16  ]
+    then
+      # Something blocking - show some hints
+      echo " ERROR: Can't unmount $INPUT_MOUNT. Probbaly something is accessing the share"
+      lsof ${INPUT_MOUNT}
+      exit 1
+    fi
+  fi
+  if [ $number_of_mounts_found -eq 0 ]
+  then
+    echo "  INFO: No entry found for mount ${INPUT_MOUNT} in ${fstab_file}"
+  else
+    sqlite3 $sql_database_file << END
+    delete from fstabnfs
+    where mount='$INPUT_MOUNT';
+END
+    # Write changes to disk
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't remove mount point from fstabnfs table"
+      exit 1
+    fi
+  fi
+  rmdir ${INPUT_MOUNT}
+  delete_fstab "$INPUT_MOUNT"
+  write_oranfstab 
+  # Is the mount point we delete a backup moint point? 
+  ndbuctl_mount_point_private=$(get_configuration_parameter "ndbuctl_mount_point_private")
+  ndbuctl_mount_point_public=$(get_configuration_parameter "ndbuctl_mount_point_public")
+  if [ "${INPUT_MOUNT}" = "$ndbuctl_mount_point_private" ]
+  then
+    delete_configuration_parameter "ndbuctl_mount_point_private"
+  fi
+  if [ "${INPUT_MOUNT}" = "$ndbuctl_mount_point_public" ]
+  then
+    delete_configuration_parameter "ndbuctl_mount_point_public"
+  fi
+}
+
+
+add_dnfsmount()
+{
+  #set -x
+  local INPUT_SERVER
+  local INPUT_EXPORT
+  local INPUT_MOUNT
+  local INPUT_READONLY
+  local server_nfs_version
+  INPUT_SERVER=$1
+  INPUT_EXPORT=$2
+  INPUT_MOUNT=$3
+  INPUT_READONLY=$4
+  # Find what nfs version the server runs
+  server_nfs_version=`sqlite3 $sql_database_file "select nfs_version from servers where name = '${INPUT_SERVER}';"`  || { echo "  ERROR: Can't execute select nfs_version from servers where name = '${INPUT_SERVER}';"; exit 1; }
+  if [ "$INPUT_READONLY" = "YES" ]
+  then
+    nfs_mount_options=$(get_nfs_mount_options "${server_nfs_version}" "ro" "")
+  else
+    nfs_mount_options=$(get_nfs_mount_options "${server_nfs_version}" "rw" "")
+  fi   
+  #echo " DEBUG: Entered function: $FUNCNAME"
+  # First check if we can add the entry in oranfstab
+  sqlite3 $sql_database_file << END
+  insert into mounts (server_name,export,mount)
+  values('$INPUT_SERVER','$INPUT_EXPORT','$INPUT_MOUNT');
+END
+  return_code=$?
+  if [ $return_code -ne 0 ]
+  then
+    echo " ERROR: Can't add mount point . Probably it exists already in ${oranfstab_file}"
+    exit 1
+  fi
+  # Now we have to update it in fstabnfs 
+  # Can we add to it to fstab
+  number_of_mounts_found=`sqlite3 $sql_database_file "select count(mount) from fstabnfs where mount='$INPUT_MOUNT';"`  || { echo "  ERROR: Can't execute select count(mount) from fstabnfs where mount='$INPUT_MOUNT';"; exit 1; }
+  #echo "number_of_mounts_found=$number_of_mounts_found"
+  if [ $number_of_mounts_found -eq 0 ]
+  then
+    #echo "insert"
+    # Insert new record
+    # First get number of paths for the server
+    number_of_paths=`sqlite3 $sql_database_file "select count(path) from paths where server_name='$INPUT_SERVER';"`  || { echo "  ERROR: Can't execute select count(patch) from paths where server_name='$INPUT_SERVER';"; exit 1; }
+    if [ $number_of_paths -eq 0 ]
+    then
+      echo " ERROR: Can't find path that can be used for mount"
+    fi
+    # Then generate a random number to pick the path we want
+    chosen_path=$( echo $(( ( RANDOM % number_of_paths ) )) )
+    sqlite3 $sql_database_file << END
+INSERT INTO fstabnfs (host,export,mount,options)
+VALUES (
+    (select path from paths where server_name='${INPUT_SERVER}' order by path limit 1 offset $chosen_path),
+    '$INPUT_EXPORT',
+    '$INPUT_MOUNT',
+    '$nfs_mount_options'
+);
+END
+    if [ $? -ne 0 ]
+    then
+      # we should have seen this before - so proably newer get here
+      echo " ERROR: Can't create fstab entry. Probably it exists already"
+      exit 1
+    fi
+  else
+    # We can't Update the record
+    if [ $number_of_paths -eq 0 ]
+    then
+      echo " ERROR: mount point $INPUT_MOUNT already exists in $fstab_file "
+    fi
+  fi
+  # Let's first check if the export can be mounted
+  selected_path=`sqlite3 $sql_database_file "select host from fstabnfs where mount='$INPUT_MOUNT';"`  || { echo "  ERROR: Can't execute select host from fstabnfs where moount='$INPUT_MOUNT';"; exit 1; }
+  echo "  INFO: Will try if the following export ${selected_path}:$INPUT_EXPORT can be mounted."
+  echo "        Will try for 5 seconds - standby"
+  mkdir -p ${nfs_test_mount_dir}
+  umount -f ${nfs_test_mount_dir} >/dev/null 2>&1 
+  timeout 5 mount.nfs ${selected_path}:${INPUT_EXPORT} ${nfs_test_mount_dir} -o $(get_nfs_mount_options "${server_nfs_version}" "ro" "test")
+  if [ $? -eq 0 ]
+  then
+    echo "    OK: Can connect"
+    umount -f ${nfs_test_mount_dir} >/dev/null 2>&1
+    write_oranfstab
+    add_fstab  "$selected_path" "$INPUT_EXPORT" "$INPUT_MOUNT" "$nfs_mount_options"
+  else
+    umount -f ${nfs_test_mount_dir} >/dev/null 2>&1
+    echo " ERROR: Seems like we can't mount export ${selected_path}:$INPUT_EXPORT" 
+  fi
+  mkdir -p ${INPUT_MOUNT}
+  #TBD mount it for real
+  mount  ${INPUT_MOUNT}
+}
+       
+
+
+add_nfsmount()
+{
+  #set -x
+  local INPUT_HOST
+  local INPUT_EXPORT
+  local INPUT_MOUNT
+  local INPUT_READONLY
+  local FSBKUP_TYPE
+  local INPUT_NFS_VERSION
+  local NFS_VERSION_NUMBER
+  INPUT_HOST=$1
+  INPUT_EXPORT=$2
+  INPUT_MOUNT=$3
+  INPUT_READONLY=$4
+  FSBKUP_TYPE=$5
+  INPUT_NFS_VERSION=$6
+  if [ "$INPUT_READONLY" = "YES" ]
+  then
+    nfs_mount_options=$(get_nfs_mount_options "${INPUT_NFS_VERSION}" "ro" "")
+  else
+    nfs_mount_options=$(get_nfs_mount_options "${INPUT_NFS_VERSION}" "rw" "")
+  fi   
+  #echo " DEBUG: Entered function: $FUNCNAME"
+  # Can we add to it to fstab
+  number_of_mounts_found=`sqlite3 $sql_database_file "select count(mount) from fstabnfs where mount='$INPUT_MOUNT';"`  || { echo "  ERROR: Can't execute select count(mount) from fstabnfs where mount='$INPUT_MOUNT';"; exit 1; }
+  echo "number_of_mounts_found=$number_of_mounts_found"
+  if [ $number_of_mounts_found -eq 0 ]
+  then
+    #echo "insert"
+    sqlite3 $sql_database_file << END
+INSERT INTO fstabnfs (host,export,mount,options)
+VALUES (
+    '$INPUT_HOST',
+    '$INPUT_EXPORT',
+    '$INPUT_MOUNT',
+    '$nfs_mount_options'
+);
+END
+    if [ $? -ne 0 ]
+    then
+      # we should have seen this before - so proably newer get here
+      echo " ERROR: Can't create fstab entry. Probably it exists already"
+      exit 1
+    fi
+  else
+    # We can't Update the record
+    echo " ERROR: mount point $INPUT_MOUNT already exists in $fstab_file "
+    exit 1
+  fi
+  # Let's first check if the export can be mounted
+  selected_path=`sqlite3 $sql_database_file "select host from fstabnfs where mount='$INPUT_MOUNT';"`  || { echo "  ERROR: Can't execute select host from fstabnfs where moont='$INPUT_MOUNT';"; exit 1; }
+  echo "  INFO: Will try if the following export ${selected_path}:$INPUT_EXPORT can be mounted."
+  echo "        Will try for 5 seconds - standby"
+  mkdir -p ${nfs_test_mount_dir}
+  umount -f ${nfs_test_mount_dir} >/dev/null 2>&1 
+  timeout 5 mount.nfs ${selected_path}:${INPUT_EXPORT} ${nfs_test_mount_dir} -o $(get_nfs_mount_options "${INPUT_NFS_VERSION}" "ro" "test")
+  if [ $? -eq 0 ]
+  then
+    echo "    OK: Can connect"
+    umount -f ${nfs_test_mount_dir} >/dev/null 2>&1
+    add_fstab  "$selected_path" "$INPUT_EXPORT" "$INPUT_MOUNT" "$nfs_mount_options"
+  else
+    umount -f ${nfs_test_mount_dir} >/dev/null 2>&1
+    echo " ERROR: Seems like we can't mount export ${selected_path}:$INPUT_EXPORT" 
+  fi
+  mkdir -p ${INPUT_MOUNT}
+  #TBD mount it for real
+  mount  ${INPUT_MOUNT}
+  # Should we update the configuration file
+  case $FSBKUP_TYPE in
+  PRIVATE)
+    update_configuration_parameter "ndbuctl_mount_point_private" "${INPUT_MOUNT}"
+    ;;
+  PUBLIC)
+    update_configuration_parameter "ndbuctl_mount_point_public" "${INPUT_MOUNT}"
+    ;;
+  TMP_WORK)
+    update_configuration_parameter "nordea_tmpwork" "${INPUT_MOUNT}"
+    ;;
+  AUDIT)
+    update_configuration_parameter "ndlogctl_mount_point_auditbackup" "${INPUT_MOUNT}"
+    mountpoint ${INPUT_MOUNT}
+    if [ $? -eq 0 ]
+    then
+      # It's a mount point use it
+      mkdir -p ${INPUT_MOUNT}/auditbackup
+      chown oracle:oinstall ${INPUT_MOUNT}/auditbackup
+      chmod 775 ${INPUT_MOUNT}/auditbackup
+    else
+      echo "WARNING: ${INPUT_MOUNT} is not a mountpoint is NFS mounted?, can't create auditbackup"
+    fi   
+    ;;
+  esac  
+}
+
+loadandwrite_oranfstab()
+{
+  # Just Write changes to disk immediately
+  write_oranfstab   
+}
+
+
+show_nfsmount()
+{
+  local INPUT_HOST
+  INPUT_HOST=$1
+  #echo " DEBUG: Entered function: $FUNCNAME"
+  if [ "$INPUT_HOST" = "" ]
+  then
+    sqlite3 $sql_database_file << END
+--.separator "\t"
+.header on
+.mode column
+.width 20 50 50
+select host,export,mount from fstabnfs;
+END
+  else
+    sqlite3 $sql_database_file << END
+--.separator "\t"
+.header on
+.mode column
+.width 20 50 50
+select host,export,mount from fstabnfs where host = '$INPUT_HOST';
+END
+  fi
+  if [ $? -ne 0 ]
+  then
+    echo " ERROR: Can't get server $INPUT_HOST"
+    exit 1
+  fi
+}
+
+
+show_dnfsmount()
+{
+  local INPUT_SERVER
+  INPUT_SERVER=$1
+  #echo " DEBUG: Entered function: $FUNCNAME"
+  if [ "$INPUT_HOST" = "" ]
+  then
+    sqlite3 $sql_database_file << END
+--.separator "\t"
+--.header on
+--.mode column
+--.width 120
+select text from mount_parts;
+END
+  else
+    sqlite3 $sql_database_file << END
+--.separator "\t"
+--.header on
+--.mode column
+--.width 120
+select text from mount_parts where name = '$INPUT_SERVER';
+END
+  fi
+  if [ $? -ne 0 ]
+  then
+    echo " ERROR: Can't get server $INPUT_SERVER"
+    exit 1
+  fi
+}
+
+show_dnfsserver()
+{
+  local INPUT_SERVER
+  INPUT_SERVER=$1
+  #echo " DEBUG: Entered function: $FUNCNAME"
+  if [ "$INPUT_SERVER" == "" ]
+  then
+    # --server is not specified
+    sqlite3 $sql_database_file << END
+--.separator "\t"
+--.header on
+--.mode column
+--.width 0
+select name from servers;
+END
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't get information about all servers"
+      exit 1
+    fi
+  else
+    #--server is specified    
+    sqlite3 $sql_database_file << END
+--.separator "\t"
+--.header on
+--.mode column
+--.width 0
+select text from server_parts where name = '$INPUT_SERVER';
+END
+    if [ $? -ne 0 ]
+    then
+      echo " ERROR: Can't get info for server $INPUT_SERVER"
+      exit 1
+    fi
+  fi
+}
+
+
+
+remove_dnfsserver()
+{
+  # select count(*) from mount_parts  where name='is-zfs00hh1s' and text is not null;
+  local INPUT_SERVER
+  INPUT_SERVER=$1
+  #echo " DEBUG: Entered function: $FUNCNAME"
+  # Find if any mounts are defined on the server
+  number_of_mounts_found=`sqlite3 $sql_database_file "select count(mount) from mounts where server_name='$INPUT_SERVER';"`  || { echo "  ERROR: Can't execute select count(mount) from mounts where mount='$INPUT_SERVER';"; exit 1; }
+  if [ $number_of_mounts_found -ne 0 ]
+  then
+    echo " ERROR: ${INPUT_server} has mounts defined and can't be deleted - remove mounts first"
+    exit 1
+  fi
+  sqlite3 $sql_database_file << END
+  delete from paths
+  where server_name='$INPUT_SERVER';
+  delete from servers
+  where name='$INPUT_SERVER';
+END
+  if [ $? -ne 0 ]
+  then
+    echo " ERROR: Can't remove server $INPUT_server from /etc/oranfstab"
+    exit 1
+  fi
+  # Write changes to disk
+  write_oranfstab   
+}
+
+
+#
+# handle_request
+#
+# Purpose: handles the request after arguments have been analyzed checked
+#
+handle_request()
+{
+  case $OBJECT in
+    oranfstab)
+      create_empty_sqlite_database
+      parse_oranfstab
+      parse_fstab
+      load_sqlite_database      
+      case $ACTION in
+        loadandwrite)
+          loadandwrite_oranfstab;;
+      esac
+      ;;    
+    dnfsserver)
+      create_empty_sqlite_database
+      parse_oranfstab
+      parse_fstab
+      load_sqlite_database
+      case $ACTION in
+        show)
+          show_dnfsserver "$INPUT_SERVER";;
+        remove)
+          remove_dnfsserver "$INPUT_SERVER";;
+        add)
+          add_dnfsserver  "$INPUT_SERVER" "$INPUT_LOCAL_1" "$INPUT_LOCAL_2" "$INPUT_LOCAL_3" "$INPUT_LOCAL_4" "$INPUT_REMOTE_1" "$INPUT_REMOTE_2" "$INPUT_REMOTE_3" "$INPUT_REMOTE_4" "${INPUT_LOCAL_INTERCONNECT_GUESS}" "$INPUT_NFS_VERSION"
+          ;;
+      esac  
+      ;;      
+    dnfsmount)
+      create_empty_sqlite_database
+      parse_oranfstab
+      parse_fstab
+      load_sqlite_database
+      case $ACTION in
+        show)
+          show_dnfsmount "$INPUT_SERVER";;
+        add)
+          add_dnfsmount "$INPUT_SERVER" "$INPUT_EXPORT" "$INPUT_MOUNT" "$INPUT_READONLY";;
+        remove)
+          remove_dnfsmount "$INPUT_MOUNT";;
+      esac  
+      ;;         
+    nfsmount)
+      create_empty_sqlite_database
+      parse_fstab
+      parse_oranfstab
+      load_sqlite_database
+      case $ACTION in
+        show)
+          show_nfsmount "$INPUT_HOST";;
+        add)
+          add_nfsmount "$INPUT_HOST" "$INPUT_EXPORT" "$INPUT_MOUNT" "$INPUT_READONLY" "$FSBKUP_TYPE" "$INPUT_NFS_VERSION";;
+        remove)
+          remove_nfsmount "$INPUT_MOUNT";;
+      esac  
+      ;;         
+  esac
+}
+
+
+#
+# parse_arguments
+#
+# Purpose: Parses all the arguments received on command line
+# first argument is always action and second is component/object
+#
+parse_arguments()
+{
+  if [ $# -eq 0 ]
+  then
+    write_usage
+    exit
+  fi
+  # First check action is one we know off
+  VALID_ACTION_LIST="show add remove loadandwrite -h --help "
+  if string_contain "$1 " "$VALID_ACTION_LIST"
+  then
+    ACTION=$1
+  else
+    echo " ERROR: Action parameter \"$1\" given to script not recognized"
+    exit 1
+  fi
+  if [ "$ACTION" = "-h" -o "$ACTION" = "--help" ]
+  then
+    write_usage
+    exit
+  fi
+  shift
+  if [ $# -eq 0 ]
+  then
+    echo " ERROR: Action parameter \"$ACTION\" given to script needs to be followed by an object"
+    exit 1
+  fi
+  # Depending on action various objects might be specified
+  case $1 in
+    oranfstab) OBJECT="oranfstab";VALID_ACTION_LIST="loadandwrite ";;
+    dnfsserver) OBJECT="dnfsserver";VALID_ACTION_LIST="add remove show ";;
+    dnfsmount) OBJECT="dnfsmount";VALID_ACTION_LIST="add remove show ";;
+    nfsmount) OBJECT="nfsmount";VALID_ACTION_LIST="add remove show ";;
+    *)            echo " ERROR: Object parameter $1 given to script not recognized";exit 1;;
+  esac;
+  shift
+  # first check if we support combination
+  if ! string_contain  "$ACTION " "$VALID_ACTION_LIST" 
+  then
+    echo " ERROR: The action \"$ACTION\" is not not supported for object \"$OBJECT\". Actions allowed is \"$VALID_ACTION_LIST\""
+    exit 1
+  fi
+  # Parse options
+  TEMP=`getopt -o "" --name "$0" --long nfs_version:,tmpwork,auditbackup,fsbkupprivate,fsbkuppublic,forcelocalnode,localnode,allnodes,nodes:,server:,local1:,local2:,local3:,local4:,remote1:,remote2:,remote3:,remote4:,guesslocalinterconnect,export:,mount:,host:,readonly  -- "$@"`
+  eval set -- "$TEMP"
+  while true ; do
+    case "$1" in
+      --forcelocalnode) runon_forcelocalnode="YES";shift;;
+      --localnode) runon_localnode="YES";shift;;
+      --allnodes) runon_allnodes="YES";shift;;
+      --nodes) runon_nodes="$2";shift 2 ;;
+      --server) INPUT_SERVER=$2; shift 2 ;;
+      --nfs_version) INPUT_NFS_VERSION="$2"; shift 2 ;;
+      --local1) INPUT_LOCAL_1=$2; shift 2 ;;
+      --local2) INPUT_LOCAL_2=$2; shift 2 ;;
+      --local3) INPUT_LOCAL_3=$2; shift 2 ;;
+      --local4) INPUT_LOCAL_4=$2; shift 2 ;;
+      --remote1) INPUT_REMOTE_1=$2; shift 2 ;;
+      --remote2) INPUT_REMOTE_2=$2; shift 2 ;;
+      --remote3) INPUT_REMOTE_3=$2; shift 2 ;;
+      --remote4) INPUT_REMOTE_4=$2; shift 2 ;;
+      --guesslocalinterconnect) INPUT_LOCAL_INTERCONNECT_GUESS="YES"; shift 1;;
+      --export) INPUT_EXPORT=$2; shift 2 ;;
+      --mount) INPUT_MOUNT=$2; shift 2 ;;
+      --host) INPUT_HOST=$2; shift 2 ;;
+      --readonly) INPUT_READONLY="YES"; shift 1;;
+      --fsbkupprivate) FSBKUP_PRIVATE="YES"; shift 1;;
+      --fsbkuppublic) FSBKUP_PUBLIC="YES"; shift 1;;
+      --auditbackup) AUDIT_BACKUP="YES"; shift 1;;        
+      --tmpwork) TMP_WORK="YES"; shift 1;;
+      --) shift ; break ;;
+       *) echo " ERROR: Internal error!" ; exit 1 ;;
+    esac
+  done
+  if [ "${runon_forcelocalnode}" != "YES" ]
+  then
+    # We should only run on local node nomatter what
+    NODES_TO_RUN_ON=$(get_nodes_to_run_on "$runon_nodes" "$runon_allnodes" "$runon_localnode" )
+    if [ "$NODES_TO_RUN_ON" = "" ]
+    then
+      echo " ERROR: One of --allnodes|--nodes=\"space separated list of nodes\"|--localnode needs to be specified"
+      exit 1            
+    fi
+    if [ "$runon_localnode" != "YES" ]
+    then
+      check_node_access "$NODES_TO_RUN_ON"
+    fi
+  else
+    NODES_TO_RUN_ON="${local_short_hostname}"
+  fi
+  # Check that nfs_version is supported
+  if [ "$INPUT_NFS_VERSION" != "" ]
+  then
+    case $INPUT_NFS_VERSION in
+      "nfsv3"|"nfsv4"|"nfsv4.1")
+        :
+        ;;
+      *)
+        echo " ERROR: --nfs_version needs to be one of [nfsv3|nfsv4|nfsv4.1]"
+        exit 1
+      ;;
+    esac
+  fi
+  # Now we checked that combination of object/action is valid
+  # Now we for each action/object checks the parameters, we use getopt for that in case there are some parameters
+  case $OBJECT in
+    oranfstab)
+      case $ACTION in
+        loadandwrite)
+          :
+          ;;
+      esac
+      ;;
+    dnfsserver)
+      #set -x
+      #echo "$@"
+      case $ACTION in
+        show)
+          :
+          ;;
+        remove)
+          if [ "$INPUT_SERVER" == "" ]
+          then
+            echo " ERROR: --server needs to be specified"
+            exit 1
+          fi
+          ;;
+        add)
+          if [ "$INPUT_SERVER" == "" ]
+          then
+            echo " ERROR: --server needs to be specified"
+            exit 1
+          fi
+          #if [ "${INPUT_LOCAL_1}${INPUT_LOCAL_2}${INPUT_LOCAL_3}${INPUT_LOCAL_4}" == "" ]
+          #then
+          #  echo " ERROR: at least one --local[1-4] needs to be specified"
+          #  exit 1
+          #fi
+          if [ "${INPUT_REMOTE_1}${INPUT_REMOTE_2}${INPUT_REMOTE_3}${INPUT_REMOTE_4}${INPUT_LOCAL_INTERCONNECT_GUESS}" == "" ]
+          then
+            echo " ERROR: at least one of --remote[1-4] or --guesslocalinterconnect needs to be specified"
+            exit 1
+          fi
+          if [ "${INPUT_LOCAL_1}" != "" -a "${INPUT_REMOTE_1}" == "" -o "${INPUT_LOCAL_2}" != "" -a "${INPUT_REMOTE_2}" == "" -o "${INPUT_LOCAL_3}" != "" -a "${INPUT_REMOTE_3}" == "" -o "${INPUT_LOCAL_4}" != "" -a "${INPUT_REMOTE_4}" == "" ]
+          then
+            echo " ERROR: when --local[1-4] is specified a coresponding --remote[1-4] needs to be specified"
+            exit 1
+          fi
+          ;;
+      esac
+      ;;
+    dnfsmount)
+      #set -x
+      #echo "$@"
+      case $ACTION in
+        show)
+          :
+          #if [ "$INPUT_SERVER" == "" ]
+          #then
+          #  echo " ERROR: --server needs to be specified"
+          #  exit 1
+          #fi
+          ;;
+        remove)
+          TEMP=`getopt -o "" --name "$0" --long mount: -- "$@"`
+          eval set -- "$TEMP"
+          while true ; do
+            case "$1" in
+              --mount) INPUT_MOUNT=$2; shift 2 ;;
+              --) shift ; break ;;
+               *) echo " ERROR: Internal error!" ; exit 1 ;;
+            esac
+          done
+          if [ "$INPUT_MOUNT" == "" ]
+          then
+            echo " ERROR: --mount needs to be specified"
+            exit 1
+          fi
+          ;;
+        add)
+          if [ "$INPUT_SERVER" == "" ]
+          then
+            echo " ERROR: --server needs to be specified"
+            exit 1
+          fi
+          #if [ "${INPUT_LOCAL_1}${INPUT_LOCAL_2}${INPUT_LOCAL_3}${INPUT_LOCAL_4}" == "" ]
+          #then
+          #  echo " ERROR: at least one --local[1-4] needs to be specified"
+          #  exit 1
+          #fi
+          if [ "${INPUT_EXPORT}" == "" ]
+          then
+            echo " ERROR: --export needs to be specified"
+            exit 1
+          fi
+          if [ "${INPUT_MOUNT}" == "" ]
+          then
+            echo " ERROR: --mount needs to be specified"
+            exit 1
+          fi
+          ;;
+      esac
+      ;;
+    nfsmount)
+      #set -x
+      #echo "$@"
+      case $ACTION in
+        show)
+          :
+          #if [ "$INPUT_HOST" == "" ]
+          #then
+          #  echo " ERROR: --host needs to be specified"
+          #  exit 1
+          #fi
+          ;;
+        remove)
+          :
+          if [ "$INPUT_MOUNT" == "" ]
+          then
+            echo " ERROR: --mount needs to be specified"
+            exit 1
+          fi
+          ;;
+        add)
+          if [ "$INPUT_HOST" == "" ]
+          then
+            echo " ERROR: --host needs to be specified"
+            exit 1
+          fi
+          # Not correct - but have no time to fix - dont catch all problems
+          if [ "${AUDIT_BACKUP}" = "YES" -a  "${FSBKUP_PRIVATE}" = "YES" -a "${FSBKUP_PUBLIC}" = "YES" -a "${TMP_WORK}" = "YES" ]
+          then
+            echo " ERROR: at most one of --fsbkupprivate, --fsbkuppublic, --tmpwork can to be specified"
+            exit 1
+          else
+            if [ "${TMP_WORK}" = "YES" ]
+            then
+              FSBKUP_TYPE="TMP_WORK"
+            fi
+            if [ "${FSBKUP_PRIVATE}" = "YES" ]
+            then
+              FSBKUP_TYPE="PRIVATE"
+            fi
+            if [ "${FSBKUP_PUBLIC}" = "YES" ]
+            then
+              FSBKUP_TYPE="PUBLIC"
+            fi
+            if [ "${AUDIT_BACKUP}" = "YES" ]
+            then
+              FSBKUP_TYPE="AUDIT"
+            fi
+          fi
+          if [ "${INPUT_EXPORT}" == "" ]
+          then
+            echo " ERROR: --export needs to be specified"
+            exit 1
+          fi
+          if [ "${INPUT_MOUNT}" == "" ]
+          then
+            echo " ERROR: --mount needs to be specified"
+            exit 1
+          fi
+          ;;
+      esac        
+      #set +x
+      ;;      
+  esac
+  # Now all parameters that should be there are there. We have not yet checked for
+  # that the values make sense. We do this when we handle the individual request 
+}
+
+
+
+# Script really starts here
+check_for_permission
+
+
+# Parse arguments (and check)
+parse_arguments "$@"
+# Handle the request
+# OK Now we have checked everything. If we have more than one node defined than call the nodes with the
+# script and only local node specified
+for node_to_run_on in $NODES_TO_RUN_ON
+do
+  if [ "$node_to_run_on" == "$local_short_hostname" ]
+  then
+    echo "  INFO: Running on node: $node_to_run_on"
+    handle_request
+  else
+    # Create exadata command
+    cmd_exa="${script_name} $@ --forcelocalnode"
+    # Create sop command
+    printf -v cmd_sop '%q' "sudo bash -c \"$cmd_exa\""
+    #echo "Run it on $node_to_run_on"
+    # add option --forecelocalnode
+    # If we are on SOP we need to use sopsetup for doing the ssh
+    # Check for user sopsetup - hack
+    grep -q '^sopsetup:' /etc/passwd
+    if [ $? -eq 0 ]
+    then
+      # ON SOP, use sopsetup
+      su  -l sopsetup -c "ssh $node_to_run_on ${cmd_sop}"
+    else
+      # ON Exadata just ssh directly
+      ssh $node_to_run_on ${cmd_exa}
+    fi
+    # Maybe check for errors TBD
+  fi
+done
+
